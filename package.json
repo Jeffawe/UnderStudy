@@ -1,0 +1,41 @@
+{
+  "name": "understudy",
+  "version": "0.1.0",
+  "description": "An agent that learns your app from browser recordings and stores that knowledge as queryable memory in CockroachDB.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "understudy": "./dist/entry/cli.js"
+  },
+  "files": [
+    "dist",
+    "db/schema.sql",
+    "db/00-enable-vector.sql"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "db:start": "./scripts/db-start.sh",
+    "db:sql": "./scripts/db.sh",
+    "db:schema": "./scripts/apply-schema.sh",
+    "embedder:check": "tsx src/adapters/embedder/check.ts",
+    "recall:check": "tsx src/core/recall-check.ts",
+    "sig:check": "tsx src/core/sig-check.ts",
+    "explore:check": "tsx src/core/explore-check.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.7.6",
+    "dotenv": "^17.2.3",
+    "pg": "^8.16.3",
+    "playwright": "^1.62.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.9",
+    "@types/pg": "^8.15.6",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
