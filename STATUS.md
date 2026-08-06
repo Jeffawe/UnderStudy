@@ -64,6 +64,30 @@ fixture corpus with a real one.
 (1234) — the cached 1194/1228 from the sibling repo are not compatible.
 `npx playwright install chromium`.
 
+**CLI built — `src/entry/cli.ts`, dependency-free arg parsing.**
+`understudy explore <slug>` · `recall <slug> <goal>` · `record` / `test` (both
+exit 2 with the specific reason they're blocked, rather than being hidden from
+`--help` — a missing command should be discoverable, not invisible).
+`npm run build` produces `dist/entry/cli.js` with the shebang intact and the
+`bin` target resolves, so the package is installable and runnable now.
+Base URL is remembered per app after the first `--url`. Verified against the
+built artifact, not just `tsx`.
+
+**Cloud proven end to end (2026-08-06).** `TARGET=cloud npm run explore:check`
+wrote a full corpus to `spunky-faerie` — 8 pages · 33 edges · 15 selectors ·
+13 facts · 13 chunks — and `recall()` against it returns distances **identical
+to local** (`logout` 0.7374, `add to cart` 0.7315). Same embedder, same vector
+space, both stores. Mode A's storage layer is no longer theoretical.
+
+**Wiring gaps found and closed by audit:**
+- `ensureMeta()` was only called by *check scripts* — the embedder guard was
+  not on the real path. `explore()` now calls it before the first embed.
+- `tx()` existed, typechecked, and was **never called**. Facts and their chunks
+  were two separate statements; a crash between them leaves a fact `recall()`
+  can never return — invisible, permanent, and nothing reports it missing. Now
+  written in one transaction, with the embed OUTSIDE it so a slow model call
+  doesn't hold a transaction open into 40001 territory.
+
 **`explore` writes NO executable chunks — by design.** Every recall against the
 explored corpus returns `bindable=0`, `topDistance=null`, `gap=YES`. Context
 retrieval is good (0.76–0.78 on relevant facts); there is simply nothing to run.
@@ -77,6 +101,13 @@ refuses a wrong embedder id and wrong dims, and accepts the correct pair.
 queries rank the right segment first; kind filtering doesn't leak.
 
 ---
+
+## Not built at all
+
+- **No recorder, distiller, reasoner, or executor.** The entire upper half. The
+  memory plane is done; nothing yet writes segments into it or reads them out.
+- **Titan embedder** throws `not implemented` (intended — local ONNX is the
+  decision for both modes).
 
 ## Next, in order
 
@@ -131,26 +162,53 @@ queries rank the right segment first; kind filtering doesn't leak.
   given run may miss facts. Snapshot to `.understudy/fixtures/` when the time
   comes; don't chase determinism in the crawler.
 
-- **Facts are emitted per PAGE; only `pages` is per-sig.** Sig sensitivity was
-  leaking into the corpus: one structure fact per sig gave **5 near-identical
-  "the /inventory.html page offers…" statements for 2 real pages**, differing
-  only by menu-open or cart-non-empty. Not exact duplicates, so statement
-  dedupe could not catch them, and they crowded retrieval — `"add something to
-  the cart"` spent 2 of 3 context slots on variants of one fact.
-  Now: controls are unioned across all states of a `url_pattern` and emitted as
-  **one** fact. 5 → 2, and each is richer than any single state's list.
-  Retrieval now returns 3 distinct facts for that query.
-  **This resolves the sig-sensitivity worry for facts** — pages stay
-  state-granular (edges need that, and it's how `Logout` behind a menu is found
-  at all) while facts sit at page granularity.
+- **Facts are now ONE PER CLAIM, keyed and merged on that key.** Three
+  granularity mistakes were fixed in sequence, each exposed by reading the data
+  rather than the code:
 
-- **Structure facts merge cumulatively across runs.** The control union is
-  run-scoped, so a shallower run would build a shorter list, miss the
-  exact-statement match, and insert a near-duplicate. Structure facts therefore
-  re-observe on `scope->>'url_pattern'`, union into the stored `scope.controls`,
-  and re-embed **only if the set actually grew**. Verified: a `maxPages=2` run
-  after a `maxPages=10` run added 0 rows and left control counts at 7 and 17
-  rather than shrinking them.
+  1. *per-sig* → 5 near-identical "the /inventory.html page offers…" statements
+     for 2 real pages. Not exact duplicates, so statement-dedupe missed them.
+  2. *per-page* → one blob averaging 17 unrelated control names into a single
+     embedding. Measured: `"where is the logout option"` scored **1.0111**
+     against a statement literally containing the word Logout — past
+     `GAP_DISTANCE`, so the system claimed ignorance of its own memory.
+  3. *sourced from `sig.names`* → a hash input, alphabetically sorted and
+     truncated to `TOP_N`. Opening a menu pushed real controls out of the
+     page's own description. A fingerprint and a description want opposite
+     things.
+
+  Now: the full aria snapshot is read, grouped into claims
+  (`#list-add-to-cart`, `#actions`, `#navigation`, `#external`), each carrying
+  a stable `scope.key`. Facts merge on that key, restating in place and
+  **re-embedding only when the text actually changed**. Verified: repeat runs
+  add 0 rows, 8 re-observed, 0 embed calls.
+
+  Retrieval after the split: `"logout"` **0.7374 KNOWN** (was 1.0111 gap),
+  `"add a product to my cart"` 0.7315, `"social media"` 0.7130.
+
+  **The claim grouping is a heuristic placeholder for the reasoner**; the claim
+  KEYS and the merge are not — they exist so the reasoner's statements can be
+  revised in place without duplicating rows.
+
+- **A URL identifies a document, not a state.** Re-navigating to
+  `current.url` before reading a queued state reloads it, which closes any menu
+  — so revealed states became permanently unreachable and four consecutive runs
+  found **zero** new facts. The frontier now carries `via: {role, name}`, the
+  control to re-click after landing, and reveals are replayed.
+
+- **In-page reveals need a settle delay before fingerprinting.**
+  `waitForLoadState('domcontentloaded')` returns instantly when no navigation
+  occurs, so the sig was taken mid-animation, matched the pre-click state, and
+  the reveal was discarded as "changed nothing". That single race is why
+  `Logout` never entered the corpus.
+  Fixed with `waitForAriaStable()` — poll the accessibility tree until two
+  consecutive reads match, instead of sleeping a constant sized for the worst
+  case, so a click that reveals nothing costs one poll. The settled snapshot is
+  passed to `computeSig(page, known)` so the tree isn't recomputed a third time
+  per click.
+  **Cost: ~60s, from 5s before any settling and 73s with a flat 600ms sleep.**
+  Run-to-run variance is ±5s, so network latency to saucedemo now dominates and
+  further tuning of the wait isn't worth it.
 
 - **How sensitive should `sig()` be? UNSETTLED, and it matters now.** Adding an
   item to the cart flips a button label `Add to cart → Remove`, which changes
