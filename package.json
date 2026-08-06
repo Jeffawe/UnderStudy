@@ -24,7 +24,8 @@
     "embedder:check": "tsx src/adapters/embedder/check.ts",
     "recall:check": "tsx src/core/recall-check.ts",
     "sig:check": "tsx src/core/sig-check.ts",
-    "explore:check": "tsx src/core/explore-check.ts"
+    "explore:check": "tsx src/core/explore-check.ts",
+    "understudy": "tsx src/entry/cli.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.7.6",
