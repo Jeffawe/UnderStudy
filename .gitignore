@@ -1,0 +1,30 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Secrets — connection strings, AWS creds, app credentials
+.env
+.env.*
+!.env.example
+
+# Local artifacts: traces are ~40MB each and never leave this machine
+.understudy/tmp/
+.understudy/traces/
+.understudy/shots/
+
+# Distiller cache, keyed by recording hash — regenerable, but expensive to lose
+.understudy/cache/
+
+# Local cockroach data dir
+cockroach-data/
+
+# Playwright
+playwright/.auth/
+test-results/
+playwright-report/
+
+# Cloudflare Tunnel credentials
+.cloudflared/
+*.tunnel.json
+
+.DS_Store
