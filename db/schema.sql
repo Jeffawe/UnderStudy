@@ -93,7 +93,12 @@ CREATE TABLE IF NOT EXISTS selectors (
   name          STRING,
   test_id       STRING,
   css           STRING,
-  frame_hint    STRING,                    -- iframe matched by id SUFFIX, never exact
+  -- '' means the main frame. NOT NULL is load-bearing, not tidiness: a NULL
+  -- component makes UNIQUE(app_id, role, name, frame_hint) inert, because SQL
+  -- never treats NULL as equal to NULL. With NULLs the dedupe silently did
+  -- nothing and one element became many rows, splitting its health score.
+  -- See db/02-selector-frame-hint-not-null.sql.
+  frame_hint    STRING NOT NULL DEFAULT '', -- iframe matched by id SUFFIX, never exact
   fallbacks     JSONB NOT NULL DEFAULT '[]',
   fragility     STRING NOT NULL DEFAULT 'unknown'
                 CHECK (fragility IN ('stable','positional','hashed','unknown')),

@@ -129,8 +129,46 @@ Two things replay found immediately:
   disambiguates via the captured test id, and records
   `ambiguousByName` — which is exactly what `selectors.fragility` needs.
 
-**Not yet built:** mechanical ingest (recording → `flows`/`steps` rows). Nothing
-is bindable yet; `recall()` still returns `bindable=0` for every query.
+**Mechanical ingest built — `understudy ingest <hash>`. `recall()` NOW RETURNS
+`bindable=1`, for the first time.**
+Replay-then-write in one command: one `flow` (`source='recorded'`), its `steps`,
+`flow_steps` membership, selector dedupe, and one embedded chunk.
+
+```
+"log in to the app"   top=0.8425   verdict: known — would bind and run
+BINDABLE (1)  [flow] Recorded flow on saucedemo: Go to …; Fill the textbox …
+```
+
+- **The gate holds:** a recording that fails replay gets a flow row with
+  `needs_review=true` and **no chunk**, so `recall()` can never surface it.
+  `--force` writes it anyway and it stays unbindable.
+- **Idempotent** on `recording_hash` — re-ingesting updates in place; 1 flow,
+  5 flow_steps, 1 chunk after repeated runs.
+- **Selectors are shared with explore**: an element explore only *observed*
+  becomes `observed_only=false` once a replayed step *proves* it.
+- **Chunk text is enumerative, not intentional** — "Recorded flow on saucedemo:
+  Go to …; Fill the textbox "Username"…". Mechanical ingest knows what a flow
+  *does*, not what it is *for*; claiming "log in as a member" would be inventing
+  intent. The distiller replaces this text and re-embeds in place.
+- Credentials stay references: `steps.value_ref = SECRET.password`, literal
+  values live in `steps.args`.
+
+**`UNIQUE (app_id, role, name, frame_hint)` WAS INERT — fixed in
+`db/02-selector-frame-hint-not-null.sql`, applied to both targets.**
+`frame_hint` was NULL for nearly every element, and SQL never treats NULL as
+equal to NULL, so the unique index constrained almost nothing and
+`ON CONFLICT DO UPDATE` never fired. Observed: "Add to cart" x3, "Login" x2,
+"Username" x2. That silently breaks the property the whole health model rests
+on — one row per element. Split across duplicates, a failing element never
+reaches the quarantine threshold and never heals consistently.
+`frame_hint` is now `NOT NULL DEFAULT ''` ('' = main frame), duplicates merged
+with references repointed, and explore/ingest both write `''`. Verified: 0
+duplicate groups after a full explore + ingest cycle.
+**Migration ordering matters** — normalize AFTER deduping, or setting `''`
+creates the very collision it is trying to remove.
+
+**Not yet built:** distillation (segments, intent, lessons, corrections). Mode B
+with the host agent is next, then Bedrock.
 
 **CLI built — `src/entry/cli.ts`, dependency-free arg parsing.**
 `understudy explore <slug>` · `recall <slug> <goal>` · `record` / `test` (both
@@ -169,6 +207,76 @@ refuses a wrong embedder id and wrong dims, and accepts the correct pair.
 queries rank the right segment first; kind filtering doesn't leak.
 
 ---
+
+## OPEN CHALLENGE — embeddings do not represent polarity
+
+Deliberately parked, not blocked. Revisit against a real corpus.
+
+**The problem, one root cause with two faces:**
+
+```
+binding    "sign in to the app"          -> binds to "Log out"      (0.9077 vs 0.9201)
+retrieval  "what should I avoid clicking" -> returns "you can click…" (0.8836)
+```
+
+Both are polarity. A single-vector bi-encoder compresses meaning into one
+vector, and the polarity token is a rounding error on top of the shared content:
+"log in" and "log out" differ in one word out of two; "avoid clicking" and
+"clicking" differ in a word the model barely weights.
+
+**Measured (2026-08-07), against the live saucedemo corpus:**
+
+| query | top hit | right? |
+|---|---|---|
+| `what should I avoid clicking` | ACTIONS 0.8836 | **no** |
+| `what is unsafe to click` | ACTIONS 0.9040 | **no** |
+| `what did exploration refuse` | BOUNDARY 0.9345 | yes |
+| `which controls are dangerous` | BOUNDARY 1.0966 | yes, but all >1.09 → correctly a gap |
+| `what can I click` | ACTIONS 0.7978 | yes |
+
+Row 1 vs row 5 is the proof: the *negated* and *positive* forms land on the
+SAME document. Row 3 is the tell — it works only because the query happens to
+use the corpus's own word ("refuse").
+
+**The failure shape is what makes it dangerous.** 0.8836 is well under
+`GAP_DISTANCE`, so the system does not say "I don't know" — it answers
+confidently with the opposite. Row 4 shows the healthy contrast: everything
+beyond the threshold, so it reports a gap instead.
+
+### Why this is safe to defer — blast radius of each fix
+
+The containment is structural, not luck: polarity is a RETRIEVAL concern, and
+retrieval sits behind one function with a fixed return shape. Nothing
+downstream of `recall()` knows how ranking happened; it consumes `bindable`,
+`context`, `topDistance`, `margin`. Distillation is UPSTREAM and emits
+polarity-agnostic output (intent, preconditions, outcome, kind) — a fix
+*consumes* those fields, it never redefines them.
+
+| option | touches | schema | re-embed |
+|---|---|---|---|
+| vocabulary-grounded `decompose` | goal phrasing, before recall | none | no |
+| `start_state`/`preconditions` filter at bind | binding + a recall option | none — columns exist, ingest fills them | no |
+| `kind` filter for polarity questions | the caller | none — already supported | no |
+| cross-encoder reranker | recall's re-rank stage only | none | no |
+| hybrid lexical + vector | recall + one index | one index migration | no |
+
+**The edges — where it stops being free:**
+- **Changing chunk TEXT** (e.g. folding `outcome`/`preconditions` into segment
+  chunks so "outcome: authenticated" separates from "outcome: session ended")
+  is not a rewrite but IS a full re-embed, ~$1.20. The `meta` guard and
+  `recording_hash` cache exist to make that safe.
+- **Multi-vector / late-interaction retrieval** would be an actual rewrite —
+  different vector shape, different index, everything re-embedded. Ruled out;
+  nothing here justifies it.
+
+**Invariant to protect:** as long as what goes INTO the chunk text is unchanged,
+every option above is confined to `recall()` and `decompose()`. Keep it that way
+and this stays freely explorable.
+
+**First things to try, cheapest first:** `kind` filtering (free, already
+supported) → `start_state`/`preconditions` at bind (free, deterministic, fails
+closed) → vocabulary grounding via `decompose` → reranker only if those are
+insufficient.
 
 ## Not built at all
 
