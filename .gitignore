@@ -12,6 +12,11 @@ dist/
 .understudy/traces/
 .understudy/shots/
 
+# Raw recordings. Credentials are redacted to value_refs at capture, but the
+# events still carry whatever was typed into ordinary fields — on a real app
+# that is customer data. Opt in per recording by force-adding a fixture.
+.understudy/recordings/
+
 # Distiller cache, keyed by recording hash — regenerable, but expensive to lose
 .understudy/cache/
 

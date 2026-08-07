@@ -25,18 +25,20 @@
     "recall:check": "tsx src/core/recall-check.ts",
     "sig:check": "tsx src/core/sig-check.ts",
     "explore:check": "tsx src/core/explore-check.ts",
-    "understudy": "tsx src/entry/cli.ts"
+    "understudy": "tsx src/entry/cli.ts",
+    "vendor:accname": "node scripts/vendor-accname.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.7.6",
+    "dom-accessibility-api": "^0.7.1",
     "dotenv": "^17.2.3",
     "pg": "^8.16.3",
-    "playwright": "^1.62.1"
+    "playwright": "^1.62.1",
+    "typescript": "^5.9.3"
   },
   "devDependencies": {
     "@types/node": "^22.18.9",
     "@types/pg": "^8.15.6",
-    "tsx": "^4.20.6",
-    "typescript": "^5.9.3"
+    "tsx": "^4.20.6"
   }
 }

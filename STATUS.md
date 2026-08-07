@@ -64,6 +64,47 @@ fixture corpus with a real one.
 (1234) — the cached 1194/1228 from the sibling repo are not compatible.
 `npx playwright install chromium`.
 
+**Recorder (capture half) built and verified.**
+`understudy record <slug>` opens a headed browser, captures via an injected DOM
+listener, and writes `.understudy/recordings/<hash>.json`.
+`understudy recordings [slug]` lists them. Persistence is content-hashed, so
+re-saving an identical recording reports `existed: true` — that IS the
+distillation cache CLAUDE.md asks for on day one.
+Verified: round trip preserves the hash, **no credential reaches disk**
+(passwords become `valueRef: SECRET.password`), an empty recording is refused
+rather than saved (exit 2), and `.understudy/recordings/` is gitignored because
+ordinary field values on a real app are customer data.
+
+Captured on saucedemo: `goto → fill Username → fill Password → click Login →
+click Add to cart → select`, with names matching `ariaSnapshot` ground truth.
+
+**Script import built — `understudy import <slug> <file>`.**
+Reads an existing Playwright script (codegen output OR a hand-written
+`.spec.ts`) into the same `RawRecording` contract, via the **TypeScript
+compiler AST** rather than regex — hand-written suites split chains across
+lines, put parentheses in strings, and mix TS syntax in, none of which a regex
+survives. (`typescript` moved from dev to runtime deps for this.)
+
+Verified against the real sibling repo: `weight-loss-intake.spec.ts` → **76
+events, 0 warnings**; `hair-loss-intake.spec.ts` → 75 events. Codegen-shaped
+input → 11/11 including `getByTestId`, `locator(css)`, `selectOption`, `check`,
+and correctly ignoring `expect(...)`.
+
+Two things it gets right that matter:
+- **`fill(MEMBER.email)` becomes `valueRef: 'MEMBER.email'`** — a non-literal
+  argument is already the parameterised IR shape, for free.
+- **A literal `secret_sauce` in a committed test is redacted** to
+  `SECRET.password` before it can reach the corpus.
+
+**A chain is scope + target, not one merged element.**
+`page.getByRole('navigation').getByText('Login')` first flattened to
+`role=navigation name="Login"` — an element that does not exist and a locator
+that would never resolve on replay. The target is now the last addressing link;
+earlier links are kept as `hints.scope`.
+
+**Not yet built:** replay + tracing, and turning a recording into
+`flows`/`steps` rows. A recording currently lands on disk and stops there.
+
 **CLI built — `src/entry/cli.ts`, dependency-free arg parsing.**
 `understudy explore <slug>` · `recall <slug> <goal>` · `record` / `test` (both
 exit 2 with the specific reason they're blocked, rather than being hidden from
@@ -241,6 +282,53 @@ queries rank the right segment first; kind filtering doesn't leak.
   ingest-time decision: changing it later means re-embedding the corpus.
 
 ---
+
+- **Accessible names ARE resolved authoritatively at capture time — in-page.**
+  The first attempt resolved from Node after the event and lost a race it could
+  not win: clicking usually destroys what you clicked ("Add to cart" becomes
+  "Remove"; a submit re-renders), and an async `exposeBinding` call cannot block
+  the page's default action. Pre-resolving on `mousedown` did not help either.
+
+  The fix is what `playwright codegen` does: compute role and name **in the
+  page, synchronously, at event time**. `dom-accessibility-api` is bundled to a
+  13 KB IIFE (`npm run vendor:accname` → `accname-bundle.ts`, a committed
+  constant so it works identically under `tsx`, in `dist`, and for anyone who
+  installs the package) and injected ahead of the listener.
+
+  **Playwright is the ground truth, not the spec** — these names are fed back to
+  `getByRole(role, {name})` on replay. The library and Playwright disagree in
+  exactly two measured places, and both are shimmed:
+  - `input[type=password]` — ARIA gives it no implicit role so `getRole`
+    returns null; Playwright calls it `textbox`
+  - placeholder-only names — `computeAccessibleName` returns `""`; Playwright
+    falls back to the placeholder. Without this, **every placeholder-labelled
+    field in every recording would be unaddressable on replay.**
+
+  **Verified 69/69** against `ariaSnapshot` across five saucedemo page states
+  (login, inventory, menu-open, checkout, cart). Every recorded event now
+  reports `resolution: 'accname'`; zero approximations.
+
+## Recorder gotchas (each cost a debugging cycle)
+
+- **`addInitScript` must take a STRING, never a TS closure.** esbuild/tsx
+  rewrites functions to preserve names via a `__name()` helper, which gets
+  serialized into the page and dies as `ReferenceError: __name is not defined`.
+  It fails **silently** — zero events, nothing logged, unless a `pageerror`
+  listener happens to be attached. Related: **backticks inside comments** in the
+  injected script terminate the template literal.
+- **`change` on a text input fires on BLUR.** Filling a login form emitted the
+  username only when the password field took focus, and emitted the password
+  **never** — nothing blurs the last field before submit. The final field of
+  every form was silently dropped. Fixed with `input` + explicit flush (on blur,
+  before any click, before Enter, and from Node before close).
+- **The `name` ATTRIBUTE is not an accessible name.** It recorded saucedemo's
+  Login button as `"login-button"`. And `textContent` of a `<select>` is every
+  option concatenated — it produced `"Name (A to Z)Name (Z to A)Price (low to
+  high)…"` as an element name.
+- **saucedemo's login is a SAME-DOCUMENT navigation.** The init script does not
+  re-run, so the in-page stamp counter continues across what look like separate
+  pages. Stamps are per-document-lifetime, not per-URL — do not assume a fresh
+  page means fresh stamps.
 
 ## Gotchas found today (not in the master plan)
 
