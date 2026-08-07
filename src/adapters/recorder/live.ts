@@ -44,6 +44,7 @@ interface WireEvent {
   resolvedBy?: 'accname' | 'heuristic';
   css?: string;
   testId?: string;
+  testIdAttr?: string;
   inputType?: string;
   frameHint?: string;
   value?: string;
@@ -148,6 +149,7 @@ export async function recordLive(opts: LiveRecordOptions): Promise<RawRecording>
       ...valued,
       ...(wire.css ? { css: wire.css } : {}),
       ...(wire.testId ? { testId: wire.testId } : {}),
+      ...(wire.testIdAttr ? { testIdAttr: wire.testIdAttr } : {}),
       ...(wire.frameHint ? { frameHint: wire.frameHint } : {}),
       url: wire.url,
       resolution,

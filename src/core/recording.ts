@@ -70,6 +70,15 @@ export interface RawEvent {
   /** Fallback addressing when role+name isn't available. */
   css?: string;
   testId?: string;
+  /**
+   * Which attribute the test id came from — `data-testid`, `data-test`, …
+   *
+   * Playwright's getByTestId only looks at `data-testid` unless reconfigured
+   * globally. saucedemo uses `data-test`, so a recording that stored the bare
+   * value replayed against nothing. Storing the attribute makes the locator
+   * self-describing instead of dependent on ambient config.
+   */
+  testIdAttr?: string;
   /** Matched by id SUFFIX, never exact — iframe ids are often generated. */
   frameHint?: string;
 

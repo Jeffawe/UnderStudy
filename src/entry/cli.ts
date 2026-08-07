@@ -21,6 +21,8 @@ import { recall, isGap, GAP_DISTANCE, type ChunkKind } from '../core/recall.js';
 import { recordLive } from '../adapters/recorder/live.js';
 import { listRecordings, saveRecording } from '../core/recording-store.js';
 import { parseScript } from '../adapters/recorder/script.js';
+import { loadRecording } from '../core/recording-store.js';
+import { replay } from '../core/replay.js';
 
 const USAGE = `understudy — learn a web app, then test it by intent
 
@@ -33,6 +35,7 @@ COMMANDS
   record <slug>         capture a flow in a headed browser
   recordings [slug]     list captured recordings
   import <slug> <file>  read an existing Playwright script into a recording
+  replay <hash>         re-run a recording, verify it, and capture signals
   test <goal>           plan and execute a goal against an app      [not built]
 
 GLOBAL
@@ -51,6 +54,10 @@ RECORD
 
 IMPORT
   --url <baseUrl>       resolves goto('/') when the script relies on a baseURL
+
+REPLAY
+  --value REF=value     supply a redacted value, e.g. SECRET.password=hunter2
+  --headed              watch it replay
 
 RECALL
   --kinds <a,b>         restrict to chunk kinds (segment, fact, lesson, …)
@@ -236,6 +243,58 @@ async function cmdImport(positional: string[], flags: Map<string, string | true>
   console.log(`saved ${path}`);
 }
 
+async function cmdReplay(positional: string[], flags: Map<string, string | true>) {
+  const hash = positional[0] ?? fail('replay needs a recording hash', 'understudy recordings');
+  const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`, 'understudy recordings'));
+
+  // Credentials are deliberately absent from recordings, so they must be
+  // supplied here: --value SECRET.password=hunter2 (repeatable).
+  const values: Record<string, string> = {};
+  for (const [k, v] of flags) {
+    if (k !== 'value' || typeof v !== 'string') continue;
+    const eq = v.indexOf('=');
+    if (eq < 0) fail('--value must be REF=value');
+    values[v.slice(0, eq)] = v.slice(eq + 1);
+  }
+
+  const needed = recording.events.filter((e) => e.valueRef && !(e.valueRef in values));
+  if (needed.length) {
+    console.log(`this recording needs ${needed.length} value(s) it deliberately does not store:`);
+    for (const e of needed) console.log(`  --value ${e.valueRef}=…`);
+    console.log('');
+  }
+
+  const result = await replay(recording, {
+    values,
+    ...(flags.has('headed') ? { headless: false } : {}),
+  });
+
+  console.log(`replay ${result.ok ? 'PASSED' : 'FAILED'} in ${(result.durationMs / 1000).toFixed(1)}s\n`);
+  for (const s of result.steps) {
+    const status = s.ok ? 'ok  ' : 'FAIL';
+    const notes = [
+      s.ambiguousByName && `ambiguous: ${s.ambiguousByName.matched} by name, resolved via ${s.ambiguousByName.disambiguatedBy}`,
+      s.roundTripMismatch && `value did not survive: wrote "${s.roundTripMismatch.expected}", read "${s.roundTripMismatch.actual}"`,
+      s.error,
+    ].filter(Boolean).join('; ');
+    console.log(`  ${String(s.seq).padStart(2)}  ${status}  ${s.action.padEnd(7)} ${(s.sig ?? '').padEnd(28)} ${notes}`);
+  }
+
+  console.log(`\npath: ${result.sigSequence.join('  ->  ')}`);
+
+  if (result.signals.length) {
+    console.log(`\n${result.signals.length} signal(s) captured:`);
+    for (const g of result.signals.slice(0, 12)) {
+      console.log(`  [step ${g.duringStep}] ${g.kind}${g.status ? ' ' + g.status : ''}  ${g.text.slice(0, 90)}`);
+    }
+  }
+
+  if (result.needsReview) {
+    console.log('\nNEEDS REVIEW — this recording will not be promoted to memory.');
+    process.exitCode = 3;
+  }
+}
+
 async function cmdRecall(positional: string[], flags: Map<string, string | true>) {
   const slug = positional[0] ?? fail('recall needs an app slug');
   const goal = positional.slice(1).join(' ');
@@ -320,6 +379,9 @@ async function main() {
       break;
     case 'import':
       await cmdImport(rest, flags);
+      break;
+    case 'replay':
+      await cmdReplay(rest, flags);
       break;
     case 'recordings': {
       const rows = await listRecordings(rest[0]);
