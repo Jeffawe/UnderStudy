@@ -183,8 +183,8 @@ export async function explore(
     const cached = selectorIds.get(key);
     if (cached) return cached;
     const { rows } = await pool.query<{ selector_id: string }>(
-      `INSERT INTO selectors (app_id, role, name, fragility, observed_only)
-       VALUES ($1, $2, $3, 'stable', true)
+      `INSERT INTO selectors (app_id, role, name, frame_hint, fragility, observed_only)
+       VALUES ($1, $2, $3, '', 'stable', true)
        ON CONFLICT (app_id, role, name, frame_hint)
          DO UPDATE SET last_seen_at = now()
        RETURNING selector_id`,

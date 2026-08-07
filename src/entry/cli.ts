@@ -23,6 +23,7 @@ import { listRecordings, saveRecording } from '../core/recording-store.js';
 import { parseScript } from '../adapters/recorder/script.js';
 import { loadRecording } from '../core/recording-store.js';
 import { replay } from '../core/replay.js';
+import { ingestRecording } from '../core/ingest.js';
 
 const USAGE = `understudy — learn a web app, then test it by intent
 
@@ -36,6 +37,7 @@ COMMANDS
   recordings [slug]     list captured recordings
   import <slug> <file>  read an existing Playwright script into a recording
   replay <hash>         re-run a recording, verify it, and capture signals
+  ingest <hash>         replay, then write the flow into memory
   test <goal>           plan and execute a goal against an app      [not built]
 
 GLOBAL
@@ -58,6 +60,10 @@ IMPORT
 REPLAY
   --value REF=value     supply a redacted value, e.g. SECRET.password=hunter2
   --headed              watch it replay
+
+INGEST
+  --value REF=value     supply a redacted value, as for replay
+  --force               ingest even if replay failed (stays unbindable)
 
 RECALL
   --kinds <a,b>         restrict to chunk kinds (segment, fact, lesson, …)
@@ -249,13 +255,7 @@ async function cmdReplay(positional: string[], flags: Map<string, string | true>
 
   // Credentials are deliberately absent from recordings, so they must be
   // supplied here: --value SECRET.password=hunter2 (repeatable).
-  const values: Record<string, string> = {};
-  for (const [k, v] of flags) {
-    if (k !== 'value' || typeof v !== 'string') continue;
-    const eq = v.indexOf('=');
-    if (eq < 0) fail('--value must be REF=value');
-    values[v.slice(0, eq)] = v.slice(eq + 1);
-  }
+  const values = valuesFromFlags(flags);
 
   const needed = recording.events.filter((e) => e.valueRef && !(e.valueRef in values));
   if (needed.length) {
@@ -293,6 +293,53 @@ async function cmdReplay(positional: string[], flags: Map<string, string | true>
     console.log('\nNEEDS REVIEW — this recording will not be promoted to memory.');
     process.exitCode = 3;
   }
+}
+
+function valuesFromFlags(flags: Map<string, string | true>): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const [k, v] of flags) {
+    if (k !== 'value' || typeof v !== 'string') continue;
+    const eq = v.indexOf('=');
+    if (eq < 0) fail('--value must be REF=value');
+    values[v.slice(0, eq)] = v.slice(eq + 1);
+  }
+  return values;
+}
+
+async function cmdIngest(positional: string[], flags: Map<string, string | true>) {
+  const hash = positional[0] ?? fail('ingest needs a recording hash', 'understudy recordings');
+  const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`));
+
+  // Replay is not optional. A recording that does not reproduce must not become
+  // memory, and the replay is also where start_state/end_state and per-step
+  // fingerprints come from.
+  console.log(`target: ${describeTarget()}`);
+  console.log('replaying to verify…');
+  const result = await replay(recording, { values: valuesFromFlags(flags) });
+
+  const failed = result.steps.find((s) => !s.ok);
+  if (failed) {
+    console.log(`  step ${failed.seq} (${failed.action}) failed: ${failed.error}`);
+  }
+  console.log(`  ${result.steps.filter((s) => s.ok).length}/${recording.events.length} steps replayed\n`);
+
+  if (result.needsReview && !flags.has('force')) {
+    console.error('NOT INGESTED — this recording did not replay cleanly.');
+    console.error('  memory built from an unverified recording is worse than no memory.');
+    console.error('  use --force to write it anyway (it will be flagged needs_review and stay unbindable).');
+    process.exitCode = 3;
+    return;
+  }
+
+  const ing = await ingestRecording(createEmbedder(), recording, result, {
+    ...(flags.has('force') ? { force: true } : {}),
+  });
+
+  console.log(`${ing.created ? 'created' : 'updated'} flow  ${ing.slug}`);
+  console.log(`  steps       ${ing.steps}`);
+  console.log(`  selectors   ${ing.selectorsCreated} new, ${ing.selectorsReused} already known`);
+  console.log(`  destructive ${ing.destructive}`);
+  console.log(`  bindable    ${ing.chunkWritten ? 'yes — embedded and searchable' : 'no (needs_review)'}`);
 }
 
 async function cmdRecall(positional: string[], flags: Map<string, string | true>) {
@@ -379,6 +426,9 @@ async function main() {
       break;
     case 'import':
       await cmdImport(rest, flags);
+      break;
+    case 'ingest':
+      await cmdIngest(rest, flags);
       break;
     case 'replay':
       await cmdReplay(rest, flags);
