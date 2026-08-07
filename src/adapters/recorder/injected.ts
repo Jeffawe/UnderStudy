@@ -212,6 +212,8 @@ export const INJECTED_LISTENER = `
       resolvedBy: a11y() ? 'accname' : 'heuristic',
       css: cssPath(el),
       testId: (el.getAttribute && (el.getAttribute('data-testid') || el.getAttribute('data-test'))) || undefined,
+      testIdAttr: (el.getAttribute && el.getAttribute('data-testid')) ? 'data-testid'
+                : (el.getAttribute && el.getAttribute('data-test')) ? 'data-test' : undefined,
       inputType: (el.getAttribute && el.getAttribute('type')) || undefined,
       frameHint: frameHint(),
     };

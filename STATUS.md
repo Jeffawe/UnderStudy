@@ -102,8 +102,35 @@ Two things it gets right that matter:
 that would never resolve on replay. The target is now the last addressing link;
 earlier links are kept as `hints.scope`.
 
-**Not yet built:** replay + tracing, and turning a recording into
-`flows`/`steps` rows. A recording currently lands on disk and stops there.
+**Replay + signal capture built — `understudy replay <hash>`.**
+Walks the IR headless, and **this step-walker IS the executor's step-walker** —
+running a recording and running a bound plan are the same operation, so it is
+not scaffolding.
+
+Does three jobs: verifies the recording reproduces (`needsReview`, exit 3, never
+promoted), captures per-step `sig()` + console + `pageerror` + failed requests +
+non-2xx bodies, and proves each locator still resolves. Every signal is tagged
+with the step it fired during — a 500 is noise, a 500 *during checkout* is a
+finding.
+
+Verified on saucedemo: 5/5 steps, and the sigSequence
+`/#6aeef289 → /inventory.html#bf3dd322 → /inventory.html#b885fc85` **matches the
+fingerprints explore recorded independently**. Credentials are supplied at
+replay (`--value SECRET.password=…`); without them the run fails loudly and
+prints exactly which refs it needs, rather than filling empty strings.
+
+Two things replay found immediately:
+- **`getByTestId` only looks at `data-testid`.** saucedemo uses `data-test`, so
+  every step resolved to nothing. Recordings now store `testIdAttr` and replay
+  builds an explicit attribute selector rather than relying on ambient config.
+- **Ambiguity is not success.** `"Add to cart"` is the accessible name of SIX
+  buttons; the step passed only by `.first()`, which would pick a different
+  product the moment the list reorders. Replay now detects `matched > 1`,
+  disambiguates via the captured test id, and records
+  `ambiguousByName` — which is exactly what `selectors.fragility` needs.
+
+**Not yet built:** mechanical ingest (recording → `flows`/`steps` rows). Nothing
+is bindable yet; `recall()` still returns `bindable=0` for every query.
 
 **CLI built — `src/entry/cli.ts`, dependency-free arg parsing.**
 `understudy explore <slug>` · `recall <slug> <goal>` · `record` / `test` (both
