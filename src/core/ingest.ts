@@ -30,7 +30,7 @@ import { toVector } from './recall.js';
 import type { Embedder } from './types.js';
 import type { RawEvent, RawRecording } from './recording.js';
 import type { ReplayResult, StepOutcome } from './replay.js';
-import type { Distilled } from './distill.js';
+import { loadDistilled, type Distilled } from './distill.js';
 
 /**
  * Commit-shaped words, shared in spirit with exploration's refusal list.
@@ -179,7 +179,11 @@ export async function ingestRecording(
   // way someone would ask for it. Mechanical ingest can only enumerate what the
   // flow does, which retrieves far worse. This is the text swap the distiller
   // exists to make.
-  const distilled = opts.distilled;
+  // A recording that has been distilled STAYS distilled. Re-ingesting without
+  // passing one used to tear the segments down and leave the flow with only its
+  // enumerated text — silently discarding the distillation, and then macro
+  // mining would "discover" the login block it had just deleted the name for.
+  const distilled = opts.distilled ?? (await loadDistilled(recording.hash));
   const chunkText = distilled
     ? `${distilled.intent}. Outcome: ${distilled.outcome}`
     : chunkTextFor(recording, semantics);
@@ -316,8 +320,8 @@ export async function ingestRecording(
         const { rows: prior } = await client.query<{ selector_id: string }>(
           `SELECT selector_id FROM selectors
            WHERE app_id = $1 AND role IS NOT DISTINCT FROM $2
-             AND name IS NOT DISTINCT FROM $3 AND frame_hint = $4`,
-          [appId, event.role ?? null, event.name ?? null, event.frameHint ?? ''],
+             AND name = $3 AND frame_hint = $4`,
+          [appId, event.role ?? '', event.name ?? '', event.frameHint ?? ''],
         );
         if (prior.length) selectorsReused++;
         else selectorsCreated++;
@@ -337,8 +341,9 @@ export async function ingestRecording(
            RETURNING selector_id, observed_only`,
           [
             appId,
-            event.role ?? null,
-            event.name ?? null,
+            // '' not NULL: a NULL component makes the unique key inert.
+            event.role ?? '',
+            event.name ?? '',
             event.testId ?? null,
             event.css ?? null,
             fragilityFor(event, outcome),

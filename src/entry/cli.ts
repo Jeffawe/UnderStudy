@@ -29,6 +29,7 @@ import {
 } from '../core/distill.js';
 import { fetchVocabulary } from '../core/vocabulary.js';
 import { recordRun } from '../core/run.js';
+import { mineMacros } from '../core/macros.js';
 import { writeFile, readFile, mkdir } from 'node:fs/promises';
 
 const USAGE = `understudy — learn a web app, then test it by intent
@@ -45,6 +46,7 @@ COMMANDS
   replay <hash>         re-run a recording, verify it, and capture signals
   ingest <hash>         replay, then write the flow into memory
   distill <hash>        ask for intent + segments; --save <file> to answer
+  mine <slug>           find step blocks that recur across recorded flows
   test <goal>           plan and execute a goal against an app      [not built]
 
 GLOBAL
@@ -307,6 +309,14 @@ async function cmdReplay(positional: string[], flags: Map<string, string | true>
   }
 }
 
+async function appIdOrFail(slug: string): Promise<string> {
+  const { rows } = await getPool().query<{ app_id: string }>(
+    'SELECT app_id FROM apps WHERE slug = $1',
+    [slug],
+  );
+  return rows[0]?.app_id ?? fail(`unknown app '${slug}'`, 'run `understudy explore` or `ingest` first');
+}
+
 function valuesFromFlags(flags: Map<string, string | true>): Record<string, string> {
   const values: Record<string, string> = {};
   for (const [k, v] of flags) {
@@ -361,6 +371,17 @@ async function cmdIngest(positional: string[], flags: Map<string, string | true>
   console.log(`  bindable    ${ing.chunkWritten ? 'yes — embedded and searchable' : 'no (needs_review)'}`);
   console.log(`  run         ${run.events} events, ${run.edges} page edge(s)`);
   console.log(`  findings    ${run.findingsNew} new, ${run.findingsSeenAgain} seen before`);
+
+  // Macro mining runs at ingest, per the plan. It is the deterministic backstop
+  // for distillation: a distiller only ever sees ONE recording, so it cannot
+  // know that this one opens with the same block as the last three.
+  const mined = await mineMacros(createEmbedder(), ing.appId);
+  const created = mined.macros.filter((m) => !m.deferredTo);
+  const deferred = mined.macros.filter((m) => m.deferredTo);
+  if (created.length || deferred.length) {
+    console.log(`  macros      ${created.length} mined, ${deferred.length} already named`);
+    for (const m of deferred) console.log(`                "${m.deferredTo}" now used by ${m.usedBy} flows`);
+  }
 }
 
 async function cmdDistill(positional: string[], flags: Map<string, string | true>) {
@@ -417,6 +438,17 @@ async function cmdDistill(positional: string[], flags: Map<string, string | true
     console.log(`  bindable    ${ing.chunkWritten ? 'yes' : 'no'}`);
     console.log(`  run         ${run.events} events, ${run.edges} page edge(s)`);
     console.log(`  findings    ${run.findingsNew} new, ${run.findingsSeenAgain} seen before`);
+
+  // Macro mining runs at ingest, per the plan. It is the deterministic backstop
+  // for distillation: a distiller only ever sees ONE recording, so it cannot
+  // know that this one opens with the same block as the last three.
+  const mined = await mineMacros(createEmbedder(), ing.appId);
+  const created = mined.macros.filter((m) => !m.deferredTo);
+  const deferred = mined.macros.filter((m) => m.deferredTo);
+  if (created.length || deferred.length) {
+    console.log(`  macros      ${created.length} mined, ${deferred.length} already named`);
+    for (const m of deferred) console.log(`                "${m.deferredTo}" now used by ${m.usedBy} flows`);
+  }
     return;
   }
 
@@ -461,6 +493,28 @@ async function cmdDistill(positional: string[], flags: Map<string, string | true
   console.log(`\nrequest written to ${out}`);
   console.log(`answer with:  understudy distill ${hash} --save <your.json>`);
   process.exitCode = 4; // "waiting on a decision", distinct from failure
+}
+
+async function cmdMine(positional: string[]) {
+  const slug = positional[0] ?? fail('mine needs an app slug');
+  const appId = await appIdOrFail(slug);
+
+  const result = await mineMacros(createEmbedder(), appId);
+  console.log(`scanned ${result.flowsScanned} recorded flow(s), ${result.candidates} shared block(s)\n`);
+
+  if (!result.macros.length) {
+    console.log(result.flowsScanned < 2
+      ? 'nothing to mine — a block has to appear in at least 2 flows to be a pattern'
+      : 'no recurring blocks of 3+ steps');
+    return;
+  }
+  for (const m of result.macros) {
+    if (m.deferredTo) {
+      console.log(`  ${String(m.length).padStart(2)} steps x${m.usedBy}  already named "${m.deferredTo}" — used_by updated, no macro created`);
+    } else {
+      console.log(`  ${String(m.length).padStart(2)} steps x${m.usedBy}  ${m.created ? 'mined' : 'updated'} ${m.slug}`);
+    }
+  }
 }
 
 async function cmdRecall(positional: string[], flags: Map<string, string | true>) {
@@ -547,6 +601,9 @@ async function main() {
       break;
     case 'import':
       await cmdImport(rest, flags);
+      break;
+    case 'mine':
+      await cmdMine(rest);
       break;
     case 'distill':
       await cmdDistill(rest, flags);

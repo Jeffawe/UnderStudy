@@ -89,8 +89,12 @@ CREATE TABLE IF NOT EXISTS flows (
 CREATE TABLE IF NOT EXISTS selectors (
   selector_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   app_id        UUID NOT NULL REFERENCES apps(app_id) ON DELETE CASCADE,
-  role          STRING,
-  name          STRING,
+  -- role/name/frame_hint are ALL NOT NULL because they are ALL part of the
+  -- unique key below, and one NULL component makes the whole constraint
+  -- inert. '' means "no role" / "no name" — a fact about the element, not
+  -- missing information. See db/02 and db/04.
+  role          STRING NOT NULL DEFAULT '',
+  name          STRING NOT NULL DEFAULT '',
   test_id       STRING,
   css           STRING,
   -- '' means the main frame. NOT NULL is load-bearing, not tidiness: a NULL
@@ -244,8 +248,13 @@ CREATE TABLE IF NOT EXISTS run_events (
   event_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   run_id        UUID NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
   ordinal       INT NOT NULL,
-  step_id       UUID REFERENCES steps(step_id),
-  selector_id   UUID REFERENCES selectors(selector_id),
+  -- ON DELETE SET NULL: a run event is a HISTORICAL RECORD. Re-ingesting a
+  -- recording replaces its step rows, and with RESTRICT that made ingest
+  -- un-repeatable the moment anything recorded a run. The outcome, error, sig,
+  -- timings, console and network stay true without the pointer.
+  -- See db/03-run-events-detach.sql.
+  step_id       UUID REFERENCES steps(step_id) ON DELETE SET NULL,
+  selector_id   UUID REFERENCES selectors(selector_id) ON DELETE SET NULL,
   outcome       STRING NOT NULL CHECK (outcome IN (
                   'ok','not_found','assert_fail','timeout','healed','skipped','error')),
   error         STRING,

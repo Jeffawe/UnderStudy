@@ -303,10 +303,61 @@ which made "detection is free, judgment is the reasoner" untrue. Now:
   skipped — which is why a bare `replay` contributes no edges while an `ingest`
   (which knows each step's selector) does.
 
+**Macro mining built — `src/core/macros.ts`, `understudy mine <slug>`, and it
+runs automatically at ingest.**
+Steps carry `fingerprint = sha1(action|role|name|url_pattern)`, so two
+recordings doing the same thing produce byte-identical runs. Mining finds runs
+of ≥3 appearing in ≥2 flows.
+
+**Contiguous runs, not subsequences.** The master plan says "common
+subsequences", but a macro has to be RUNNABLE and a non-contiguous subsequence
+is a pattern with holes. This finds common *substrings*.
+
+**It defers to named segments.** A mined macro can only describe itself
+mechanically ("a block that recurs"), which retrieves far worse than a real
+intent — so if a distilled segment already covers exactly that fingerprint run,
+mining bumps its `used_by` and creates nothing. Verified on 3 recorded flows:
+
+```
+5 steps x2   mined macro-1d421029-5
+4 steps x3   already named "log-in-as-standard-user" — used_by updated, no macro created
+```
+
+Both are reported because they cover **different flow sets** — the login block
+genuinely recurs more widely than login+sort, so neither subsumes the other.
+The macro shares all 5 of its steps with the recordings (another view over the
+same rows, never a copy).
+
+This is the deterministic backstop for distillation: a distiller only ever sees
+ONE recording, so it cannot know this one opens with the same block as the last
+three. Vocabulary helps it notice; mining notices regardless.
+
+### Three bugs found here
+
+- **`UNIQUE (app_id, role, name, frame_hint)` was STILL inert.** Migration 02
+  made `frame_hint` NOT NULL and I stopped there — but `role` and `name` were
+  also nullable, and saucedemo's sort dropdown genuinely has no accessible name.
+  Every ingest inserted another `combobox / NULL` row; four of them, one
+  element, four health scores, none of which would ever reach quarantine.
+  **When a UNIQUE constraint spans several columns, EVERY one must be NOT NULL
+  or the constraint is decorative.** Fixed in
+  `db/04-selector-role-name-not-null.sql`, applied to both targets.
+- **Run history blocked re-ingest.** `run_events.step_id` referenced `steps`
+  with the default RESTRICT, so replacing step rows failed the moment anything
+  had recorded a run — which, now that ingest records its own verifying run, was
+  immediately. `db/03-run-events-detach.sql` makes both links `ON DELETE SET
+  NULL`: a run event is a historical record, and its outcome, error, sig,
+  timings, console and network stay true without the pointer.
+- **Plain `ingest` silently discarded a distillation.** The teardown removed
+  segments unconditionally, so re-ingesting an already-distilled recording left
+  it with only enumerated text — and then mining "discovered" the login block
+  whose name had just been deleted. `ingestRecording` now falls back to the
+  cached distillation: a recording that has been distilled stays distilled.
+
 **Not yet built:** Bedrock distiller adapter, `corrections` persistence (still
 accepted and dropped — only `candidateLessons` are stored), destructive
-inference signals 2–5, macro mining, `run_plan`/`resume_run` (the stateful half
-of the handshake), and binding/execution.
+inference signals 2–5, `run_plan`/`resume_run` (the stateful half of the
+handshake), and binding/execution.
 
 **CLI built — `src/entry/cli.ts`, dependency-free arg parsing.**
 `understudy explore <slug>` · `recall <slug> <goal>` · `record` / `test` (both
