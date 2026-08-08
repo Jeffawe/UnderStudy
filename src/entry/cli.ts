@@ -24,6 +24,12 @@ import { parseScript } from '../adapters/recorder/script.js';
 import { loadRecording } from '../core/recording-store.js';
 import { replay } from '../core/replay.js';
 import { ingestRecording } from '../core/ingest.js';
+import {
+  buildDistillRequest, validateDistilled, saveDistilled, loadDistilled, distilledPath,
+} from '../core/distill.js';
+import { fetchVocabulary } from '../core/vocabulary.js';
+import { recordRun } from '../core/run.js';
+import { writeFile, readFile, mkdir } from 'node:fs/promises';
 
 const USAGE = `understudy — learn a web app, then test it by intent
 
@@ -38,6 +44,7 @@ COMMANDS
   import <slug> <file>  read an existing Playwright script into a recording
   replay <hash>         re-run a recording, verify it, and capture signals
   ingest <hash>         replay, then write the flow into memory
+  distill <hash>        ask for intent + segments; --save <file> to answer
   test <goal>           plan and execute a goal against an app      [not built]
 
 GLOBAL
@@ -64,6 +71,11 @@ REPLAY
 INGEST
   --value REF=value     supply a redacted value, as for replay
   --force               ingest even if replay failed (stays unbindable)
+
+DISTILL
+  --save <file>         supply the distillation JSON; validated before writing
+  --again               re-distill even if a cached answer exists
+  --value REF=value     as for replay
 
 RECALL
   --kinds <a,b>         restrict to chunk kinds (segment, fact, lesson, …)
@@ -334,12 +346,121 @@ async function cmdIngest(positional: string[], flags: Map<string, string | true>
   const ing = await ingestRecording(createEmbedder(), recording, result, {
     ...(flags.has('force') ? { force: true } : {}),
   });
+  const run = await recordRun(result, {
+    appId: ing.appId,
+    goal: `verify recording ${hash.slice(0, 8)}`,
+    mode: 'dry-run',
+    stepIds: ing.stepIds,
+    selectorIds: ing.selectorIds,
+  });
 
   console.log(`${ing.created ? 'created' : 'updated'} flow  ${ing.slug}`);
   console.log(`  steps       ${ing.steps}`);
   console.log(`  selectors   ${ing.selectorsCreated} new, ${ing.selectorsReused} already known`);
   console.log(`  destructive ${ing.destructive}`);
   console.log(`  bindable    ${ing.chunkWritten ? 'yes — embedded and searchable' : 'no (needs_review)'}`);
+  console.log(`  run         ${run.events} events, ${run.edges} page edge(s)`);
+  console.log(`  findings    ${run.findingsNew} new, ${run.findingsSeenAgain} seen before`);
+}
+
+async function cmdDistill(positional: string[], flags: Map<string, string | true>) {
+  const hash = positional[0] ?? fail('distill needs a recording hash', 'understudy recordings');
+  const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`));
+
+  // Replay first, always. The distiller must only ever see VERIFIED steps —
+  // an unreplayable step could otherwise be named, segmented, and bound like
+  // a real one.
+  const result = await replay(recording, { values: valuesFromFlags(flags) });
+  if (result.needsReview) {
+    console.error('cannot distill — the recording did not replay cleanly.');
+    const bad = result.steps.find((s) => !s.ok);
+    if (bad) console.error(`  step ${bad.seq} (${bad.action}): ${bad.error}`);
+    process.exitCode = 3;
+    return;
+  }
+
+  const savePath = str(flags.get('save'));
+
+  // ---- second half of the handshake: an answer came back ----
+  if (savePath) {
+    const parsed = JSON.parse(await readFile(savePath, 'utf8'));
+    const request = buildDistillRequest(recording, result);
+    const check = validateDistilled(parsed, request.steps.length);
+
+    if (!check.ok) {
+      console.error(`distillation is invalid (${check.errors.length} problem(s)):`);
+      for (const e of check.errors) console.error(`  ${e}`);
+      console.error('\nnothing was written. fix and re-run.');
+      process.exitCode = 2;
+      return;
+    }
+
+    await saveDistilled(hash, check.value!);
+    const ing = await ingestRecording(createEmbedder(), recording, result, { distilled: check.value! });
+
+    // The replay that verified this recording IS a run. Recording it gives the
+    // flow-drift baseline, turns captured signals into findings, and grows the
+    // page graph from what was actually walked.
+    const run = await recordRun(result, {
+      appId: ing.appId,
+      goal: `verify recording ${hash.slice(0, 8)}`,
+      mode: 'dry-run',
+      stepIds: ing.stepIds,
+      selectorIds: ing.selectorIds,
+    });
+
+    console.log(`${ing.created ? 'created' : 'updated'} flow  ${ing.slug}`);
+    console.log(`  intent      ${check.value!.intent}`);
+    console.log(`  steps       ${ing.steps}`);
+    console.log(`  segments    ${ing.segments}  <- reusable by future flows`);
+    console.log(`  lessons     ${ing.lessons}`);
+    console.log(`  bindable    ${ing.chunkWritten ? 'yes' : 'no'}`);
+    console.log(`  run         ${run.events} events, ${run.edges} page edge(s)`);
+    console.log(`  findings    ${run.findingsNew} new, ${run.findingsSeenAgain} seen before`);
+    return;
+  }
+
+  // ---- cached? then there is nothing to ask ----
+  const cached = await loadDistilled(hash);
+  if (cached && !flags.has('again')) {
+    const ing = await ingestRecording(createEmbedder(), recording, result, { distilled: cached });
+    console.log(`used cached distillation (${distilledPath(hash)})`);
+    console.log(`  intent    ${cached.intent}`);
+    console.log(`  segments  ${ing.segments}`);
+    console.log('\nre-distill with --again');
+    return;
+  }
+
+  // ---- first half of the handshake: pause and return ----
+  //
+  // The app's existing vocabulary goes WITH the request, so a second recording
+  // of the same block reuses its name instead of minting a synonym.
+  const { rows: appRow } = await getPool().query<{ app_id: string }>(
+    'SELECT app_id FROM apps WHERE slug = $1',
+    [recording.appSlug],
+  );
+  const vocabulary = appRow[0]
+    ? await fetchVocabulary(appRow[0].app_id)
+    : { segments: [], flows: [], facts: [] };
+
+  const request = buildDistillRequest(recording, result, vocabulary);
+  await mkdir('.understudy/requests', { recursive: true });
+  const out = `.understudy/requests/${hash}.distill.json`;
+  await writeFile(out, JSON.stringify(request, null, 2), 'utf8');
+
+  console.log(`NEEDS DISTILLATION — ${request.steps.length} verified steps`);
+  if (vocabulary.segments.length) {
+    console.log(`\nthis app already knows ${vocabulary.segments.length} segment(s) — reuse their wording where it fits:`);
+    for (const v of vocabulary.segments) console.log(`  ${v.slug.padEnd(28)} ${v.intent.slice(0, 60)}`);
+  }
+  console.log('');
+  for (const s of request.steps) {
+    const v = s.value !== undefined ? ` = "${s.value}"` : s.valueRef ? ` = <${s.valueRef}>` : '';
+    console.log(`  ${String(s.index).padStart(2)}  ${s.action.padEnd(7)} ${(s.role ?? '').padEnd(9)} ${s.name ?? ''}${v}`);
+  }
+  console.log(`\nrequest written to ${out}`);
+  console.log(`answer with:  understudy distill ${hash} --save <your.json>`);
+  process.exitCode = 4; // "waiting on a decision", distinct from failure
 }
 
 async function cmdRecall(positional: string[], flags: Map<string, string | true>) {
@@ -426,6 +547,9 @@ async function main() {
       break;
     case 'import':
       await cmdImport(rest, flags);
+      break;
+    case 'distill':
+      await cmdDistill(rest, flags);
       break;
     case 'ingest':
       await cmdIngest(rest, flags);
