@@ -30,6 +30,7 @@ import { toVector } from './recall.js';
 import type { Embedder } from './types.js';
 import type { RawEvent, RawRecording } from './recording.js';
 import type { ReplayResult, StepOutcome } from './replay.js';
+import type { Distilled } from './distill.js';
 
 /**
  * Commit-shaped words, shared in spirit with exploration's refusal list.
@@ -51,6 +52,17 @@ export interface IngestResult {
   needsReview: boolean;
   destructive: boolean;
   chunkWritten: boolean;
+  /** Segments written, when a distillation was supplied. */
+  segments: number;
+  /** Candidate lessons persisted. */
+  lessons: number;
+  /** Step ids in ordinal order — lets the caller record a run against them. */
+  stepIds: string[];
+  /** Selector per step, parallel to stepIds. */
+  selectorIds: Array<string | null>;
+  appId: string;
+  /** True when intent came from a distiller rather than being enumerated. */
+  distilled: boolean;
 }
 
 /**
@@ -140,7 +152,7 @@ export async function ingestRecording(
   embedder: Embedder,
   recording: RawRecording,
   replayResult: ReplayResult,
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; distilled?: Distilled } = {},
 ): Promise<IngestResult> {
   const pool = getPool();
 
@@ -162,12 +174,29 @@ export async function ingestRecording(
   const destructive = events.some((e) => COMMIT_WORDS.test(e.name ?? ''));
   const slug = slugFor(recording);
   const semantics = events.map(semanticFor);
-  const chunkText = chunkTextFor(recording, semantics);
+
+  // A distilled flow is searched by its INTENT — what it is for, phrased the
+  // way someone would ask for it. Mechanical ingest can only enumerate what the
+  // flow does, which retrieves far worse. This is the text swap the distiller
+  // exists to make.
+  const distilled = opts.distilled;
+  const chunkText = distilled
+    ? `${distilled.intent}. Outcome: ${distilled.outcome}`
+    : chunkTextFor(recording, semantics);
 
   // Embed OUTSIDE the transaction — it is the slow part, and holding a
   // CockroachDB transaction open across it invites the 40001 retries tx()
   // exists to absorb.
   const vector = needsReview ? null : await embedder.embedDocument(chunkText);
+
+  // Segment chunks are embedded up front for the same reason — outside the
+  // transaction, because embedding is the slow part.
+  const segmentVectors: number[][] = [];
+  if (distilled && !needsReview) {
+    for (const seg of distilled.segments) {
+      segmentVectors.push(await embedder.embedDocument(`${seg.intent}. Outcome: ${seg.outcome ?? distilled.outcome}`));
+    }
+  }
 
   let selectorsCreated = 0;
   let selectorsReused = 0;
@@ -176,8 +205,15 @@ export async function ingestRecording(
     // Re-ingesting the same recording UPDATES rather than duplicating. The
     // recording hash is the identity — that is the same key the distillation
     // cache uses.
+    // source='recorded' is NOT optional here. Segments carry the SAME
+    // recording_hash as their parent (they came from that recording), so
+    // without it this lookup returns the parent AND its segments — and
+    // whichever row came back first was treated as "the flow". A segment then
+    // received the parent's steps, its own children were torn down instead of
+    // the parent's, and the next run died on a foreign key.
     const { rows: existing } = await client.query<{ flow_id: string }>(
-      `SELECT flow_id FROM flows WHERE app_id = $1 AND recording_hash = $2`,
+      `SELECT flow_id FROM flows
+       WHERE app_id = $1 AND recording_hash = $2 AND source = 'recorded'`,
       [appId, recording.hash],
     );
 
@@ -193,7 +229,7 @@ export async function ingestRecording(
         [
           appId,
           slug,
-          slug,
+          distilled?.intent ?? slug,
           chunkText,
           replayResult.sigSequence[replayResult.sigSequence.length - 1] ?? null,
           replayResult.sigSequence[0] ?? null,
@@ -208,7 +244,8 @@ export async function ingestRecording(
       flowId = existing[0]!.flow_id;
       await client.query(
         `UPDATE flows SET intent = $2, start_state = $3, end_state = $4,
-                          destructive = $5, needs_review = $6, updated_at = now()
+                          destructive = $5, needs_review = $6, updated_at = now(),
+                          title = coalesce($7, title), preconditions = $8
          WHERE flow_id = $1`,
         [
           flowId,
@@ -217,12 +254,51 @@ export async function ingestRecording(
           replayResult.sigSequence[replayResult.sigSequence.length - 1] ?? null,
           destructive,
           needsReview,
+          distilled?.intent ?? null,
+          JSON.stringify(distilled?.preconditions ?? []),
         ],
       );
-      // Membership is rebuilt from scratch; the steps themselves are shared and
-      // may belong to other flows, so they are never deleted here.
+      // Membership is rebuilt from scratch. The step ROWS are then garbage
+      // collected below: re-ingesting inserts fresh steps, so the previous
+      // generation would otherwise linger forever, unreferenced and invisible
+      // (10 step rows for a 5-step flow after one re-ingest).
+      // FULL TEARDOWN BEFORE ANY WRITE.
+      //
+      // Interleaving teardown with inserts was too subtle to get right: the
+      // old step rows were still referenced by the old SEGMENT memberships
+      // when the collector ran, so they survived, and the rebuilt segments
+      // then pointed at a different generation than the parent — silently
+      // un-sharing them (steps=10 for a 5-step flow, 0 shared). Tear the whole
+      // previous generation down first, collect its garbage, THEN build.
+      const { rows: oldSegs } = await client.query<{ flow_id: string }>(
+        'SELECT flow_id FROM flows WHERE parent_flow_id = $1',
+        [flowId],
+      );
+      const oldSegIds = oldSegs.map((r) => r.flow_id);
+
+      if (oldSegIds.length) {
+        await client.query(
+          `DELETE FROM memory_chunks WHERE app_id = $1 AND kind = 'segment' AND ref_id = ANY($2::UUID[])`,
+          [appId, oldSegIds],
+        );
+        await client.query('DELETE FROM flow_steps WHERE flow_id = ANY($1::UUID[])', [oldSegIds]);
+        await client.query('DELETE FROM flows WHERE flow_id = ANY($1::UUID[])', [oldSegIds]);
+      }
       await client.query('DELETE FROM flow_steps WHERE flow_id = $1', [flowId]);
+
+      // Now nothing references the previous generation, so this is unambiguous.
+      await client.query(
+        `DELETE FROM steps WHERE app_id = $1
+           AND NOT EXISTS (SELECT 1 FROM flow_steps fs WHERE fs.step_id = steps.step_id)`,
+        [appId],
+      );
     }
+
+    // Segments reference these EXACT step rows at their own ordinals — the
+    // schema's whole reason for flow_steps being a join table. A step is never
+    // duplicated just because two flows contain it.
+    const stepIds: string[] = [];
+    const stepSelectorIds: Array<string | null> = [];
 
     for (const [ordinal, event] of events.entries()) {
       const outcome = outcomeBySeq.get(event.seq);
@@ -297,10 +373,98 @@ export async function ingestRecording(
         ],
       );
 
+      stepIds.push(stepRows[0]!.step_id);
+      stepSelectorIds.push(selectorId);
       await client.query(
         `INSERT INTO flow_steps (flow_id, step_id, ordinal) VALUES ($1,$2,$3)`,
         [flowId, stepRows[0]!.step_id, ordinal],
       );
+    }
+
+    // ---- segments -------------------------------------------------------
+    //
+    // A segment is NOT a different kind of thing: it is a flows row with
+    // source='sliced' and a parent_flow_id, sharing the parent's step rows via
+    // flow_steps. That is what makes "a login block captured while recording
+    // checkout is reusable by every future flow" literally true rather than
+    // aspirational.
+    let segmentCount = 0;
+    if (distilled) {
+      // Segments were already torn down with the parent's membership above, so
+      // a re-cut set of boundaries cannot leave stale bindable memory behind.
+      for (const [i, seg] of distilled.segments.entries()) {
+        const [start, end] = seg.stepRange;
+        const slice = stepIds.slice(start, end);
+        if (!slice.length) continue;
+
+        const segDestructive = events
+          .slice(start, end)
+          .some((e) => COMMIT_WORDS.test(e.name ?? ''));
+
+        const { rows: segRows } = await client.query<{ flow_id: string }>(
+          `INSERT INTO flows (app_id, slug, title, intent, preconditions, outcome,
+                              start_state, end_state, source, parent_flow_id,
+                              destructive, recording_hash)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'sliced',$9,$10,$11)
+           ON CONFLICT (app_id, slug) DO UPDATE
+             SET title = excluded.title, intent = excluded.intent,
+                 preconditions = excluded.preconditions, outcome = excluded.outcome,
+                 start_state = excluded.start_state, end_state = excluded.end_state,
+                 parent_flow_id = excluded.parent_flow_id,
+                 destructive = excluded.destructive, updated_at = now()
+           RETURNING flow_id`,
+          [
+            appId,
+            seg.slug,
+            seg.title,
+            seg.intent,
+            JSON.stringify(seg.preconditions ?? []),
+            seg.outcome ?? null,
+            // start_state is the state the segment begins FROM — the sig after
+            // the PRECEDING step, not after its own first one. Seam resolution
+            // matches A.end_state against B.start_state, so an off-by-one here
+            // makes every segment uncomposable.
+            start === 0
+              ? (replayResult.sigSequence[0] ?? null)
+              : (outcomeBySeq.get(events[start - 1]!.seq)?.sig ?? null),
+            outcomeBySeq.get(events[end - 1]!.seq)?.sig ?? null,
+            flowId,
+            segDestructive,
+            recording.hash,
+          ],
+        );
+        const segId = segRows[0]!.flow_id;
+
+        await client.query('DELETE FROM flow_steps WHERE flow_id = $1', [segId]);
+        for (const [ordinal, stepId] of slice.entries()) {
+          await client.query(
+            `INSERT INTO flow_steps (flow_id, step_id, ordinal) VALUES ($1,$2,$3)`,
+            [segId, stepId, ordinal],
+          );
+        }
+
+        const segVector = segmentVectors[i];
+        if (segVector) {
+          const segText = `${seg.intent}. Outcome: ${seg.outcome ?? distilled.outcome}`;
+          await client.query(
+            `DELETE FROM memory_chunks WHERE app_id = $1 AND kind = 'segment' AND ref_id = $2`,
+            [appId, segId],
+          );
+          await client.query(
+            `INSERT INTO memory_chunks (app_id, kind, ref_id, flow_id, text, meta, destructive, health, embedding)
+             VALUES ($1,'segment',$2,$2,$3,$4,$5,0.6,$6::VECTOR(1024))`,
+            [
+              appId,
+              segId,
+              segText,
+              JSON.stringify({ source: 'sliced', parent: flowId, steps: slice.length }),
+              segDestructive,
+              toVector(segVector),
+            ],
+          );
+        }
+        segmentCount++;
+      }
     }
 
     // THE GATE. A recording that did not replay gets a flow row for the record,
@@ -326,7 +490,41 @@ export async function ingestRecording(
       chunkWritten = true;
     }
 
-    return { flowId, created, chunkWritten };
+    // ---- lessons ---------------------------------------------------------
+    //
+    // A lesson says "when X, do Y first" — the agent adapts. It is matched by
+    // EXACT trigger predicate at every step during execution, not retrieved by
+    // similarity, which is why the trigger is stored as structured JSON rather
+    // than prose. Until now the distiller could return these and they were
+    // validated and then silently dropped.
+    let lessonCount = 0;
+    if (distilled?.candidateLessons?.length) {
+      // Rebuilt per distillation: a re-cut distillation may drop a lesson, and
+      // a lesson nobody stands behind should not linger.
+      await client.query(
+        `DELETE FROM lessons WHERE lesson_id IN (
+           SELECT lesson_id FROM lesson_links
+           WHERE target_kind = 'flow' AND target_id = $1)`,
+        [flowId],
+      );
+
+      for (const lesson of distilled.candidateLessons) {
+        const { rows: lr } = await client.query<{ lesson_id: string }>(
+          `INSERT INTO lessons (app_id, kind, title, body, trigger, source)
+           VALUES ($1,$2,$3,$4,$5,'distilled')
+           RETURNING lesson_id`,
+          [appId, lesson.kind, lesson.title, lesson.body, JSON.stringify(lesson.trigger ?? {})],
+        );
+        await client.query(
+          `INSERT INTO lesson_links (lesson_id, target_kind, target_id)
+           VALUES ($1,'flow',$2) ON CONFLICT DO NOTHING`,
+          [lr[0]!.lesson_id, flowId],
+        );
+        lessonCount++;
+      }
+    }
+
+    return { flowId, created, chunkWritten, segmentCount, lessonCount, stepIds, stepSelectorIds };
   });
 
   return {
@@ -339,5 +537,11 @@ export async function ingestRecording(
     needsReview,
     destructive,
     chunkWritten: result.chunkWritten,
+    segments: result.segmentCount,
+    distilled: Boolean(distilled),
+    lessons: result.lessonCount,
+    stepIds: result.stepIds,
+    selectorIds: result.stepSelectorIds,
+    appId,
   };
 }

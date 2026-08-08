@@ -167,8 +167,146 @@ duplicate groups after a full explore + ingest cycle.
 **Migration ordering matters** — normalize AFTER deduping, or setting `''`
 creates the very collision it is trying to remove.
 
-**Not yet built:** distillation (segments, intent, lessons, corrections). Mode B
-with the host agent is next, then Bedrock.
+**Distillation handshake built — `understudy distill <hash>` / `--save <file>`.**
+Exercised end to end with the host agent (me) as the Mode B distiller. No
+Bedrock needed to validate the shape.
+
+**THE MODEL ANNOTATES; IT DOES NOT AUTHOR STEPS.** The request hands over
+numbered, replay-verified steps and the answer may only reference them BY
+INDEX. A distillation can partition and name; it cannot fabricate a selector or
+invent an action. That constraint is what makes it safe to let an agent do this
+at all — and `DistilledSegment.stepRange` was always this shape.
+
+The request also carries `sigAfter` per step, which makes segment boundaries
+obvious: steps 0–3 all end on `/#6aeef289`, step 3 transitions to
+`/inventory.html` — so the cut is after step 3, visible without guessing.
+
+**Validation is the SERVER's job.** A malformed answer writes nothing and
+returns every problem at once. Verified against a deliberately bad file — all
+6 caught: empty intent, non-array preconditions, non-kebab slug, out-of-range
+`stepRange`, duplicate slug, inverted range.
+
+**Retrieval improvement is the whole point** — intent text vs enumerated steps:
+
+| query | mechanical | distilled segment |
+|---|---|---|
+| `log in to the app` | 0.8425 | **0.7062** |
+| `sign in with username and password` | 0.8278 | **0.6716** |
+| `add a product to the cart` | 0.7708 | **0.6936** |
+| `put an item in my basket` | — | **0.8120** |
+
+The last one matters most: "basket" appears nowhere in the corpus, and it still
+binds. That is meaning, not keywords.
+
+**Segments share the parent's step rows** — `flow_steps` doing its job.
+Verified stable over 3 consecutive re-ingests: `steps=5, flows=3`, sliced
+memberships 5/5 shared with the parent. A login block cut from a checkout
+recording is literally reusable, not aspirationally.
+
+**And the seam already chains:** `log-in-as-standard-user` ends at
+`/inventory.html#bf3dd322`; `add-product-to-cart` starts at
+`/inventory.html#bf3dd322`. That is rung 1 of seam resolution (sig match →
+concatenate, 0 bridging steps) confirmed on real data.
+
+### Four bugs this uncovered, all in the re-ingest path
+
+- **Parent lookup returned segments.** Segments carry the SAME `recording_hash`
+  as their parent, so `WHERE recording_hash = $2` matched all three rows and
+  `existing[0]` was sometimes a SEGMENT — which then received the parent's
+  steps, tore down the wrong children, and died on a foreign key the run after.
+  Fixed with `AND source = 'recorded'`. **Root cause of the other three.**
+- **Segment `start_state` was off by one** — it used the sig AFTER the
+  segment's first step instead of the state it begins FROM. Seam resolution
+  matches `A.end_state` against `B.start_state`, so this made every segment
+  uncomposable.
+- **Orphaned step rows** — re-ingest inserted a new generation and left the old
+  one unreferenced (10 rows for a 5-step flow).
+- **Teardown/GC ordering.** Collecting garbage while old segment memberships
+  still existed let dead steps survive, after which rebuilt segments pointed at
+  a different generation than the parent — silently un-sharing them. Now the
+  entire previous generation is torn down and collected BEFORE anything is
+  written.
+
+**Vocabulary built — `src/core/vocabulary.ts`, used at BOTH ends.**
+`fetchVocabulary(appId)` returns existing segment slugs/titles/intents, flow
+titles, and facts (boundary facts first). It is deliberately one function for
+two callers:
+- **distill time** — so a second recording of the same login block reuses the
+  existing name instead of minting a synonym. Two segments meaning one thing
+  compete for the same bind slot and quietly break "reusable by every future
+  flow".
+- **test time** — so `decompose` can rewrite a goal INTO this vocabulary before
+  recall runs. That is the documented answer to the polarity problem: the
+  measured difference between `"what did exploration refuse"` (works) and
+  `"what should I avoid clicking"` (fails) is purely whether the query speaks
+  the corpus's language.
+
+Verified: the second distillation of the same recording is handed both existing
+segments with their exact slugs and intents.
+
+**MCP entry point built — `src/entry/mcp.ts`, `understudy-mcp` bin.**
+Five tools: `understudy_recordings`, `understudy_distill`,
+`understudy_save_distilled`, `understudy_recall`, `understudy_vocabulary`.
+
+Full handshake exercised over real stdio MCP:
+
+| | result |
+|---|---|
+| distill without the credential | refuses, and returns `needsValues: ["SECRET.password"]` |
+| distill with it | `needs_distillation` + 5 verified steps + vocabulary |
+| save a malformed answer | `isError`, every problem listed, **nothing written** |
+| save a valid answer | ingested, 2 segments, bindable |
+| distill again | `already_distilled` — cache short-circuits, asks nothing |
+
+**The agent does not drive; it is consulted.** Every tool is one half of a
+handshake, never a step in a loop — PLAN.md's reason being that eighty MCP
+round-trips would consume the context window the user is working in.
+`stdout` is the protocol channel, so all logging goes to `stderr`.
+
+**Runs, findings, lessons and run-inferred page edges built — `src/core/run.ts`.**
+Replay was already collecting console errors, non-2xx bodies, failed requests
+and round-trip mismatches on every execution and then **throwing them away**,
+which made "detection is free, judgment is the reasoner" untrue. Now:
+
+- **`runs` / `run_events`** — every ingest records the replay that verified it.
+  `sig_sequence` is the flow-drift baseline: you cannot diff against last week
+  unless last week was recorded. Verified: 5 events, all with `step_id`, 4 with
+  `selector_id` (the `goto` has no element — correct).
+- **`findings`** — deduped by fingerprint ACROSS runs. Verified with three runs
+  whose ids and line numbers differed each time: `orders/8891`, `orders/4402`,
+  `orders/7317` all normalize to `orders/:id`, so it is **1 finding at 3
+  occurrences**, not 3 findings. Severity is mechanical (5xx and `pageerror`
+  high, console low, persistence medium); triage stays a human call.
+  The generated round-trip assertion caught a field silently reformatting
+  `555-1234` → `5551234`.
+- **`lessons`** — persisted with the structured trigger predicate
+  (`{url_pattern, action, role, name}`), `source='distilled'`, linked to its
+  flow through `lesson_links`. Matched by EXACT trigger at execution time, which
+  is why the trigger is JSON and not prose.
+- **`page_edges kind='inferred_from_run'`** — the sig sequence IS a set of
+  observed transitions, so every run now grows the route map:
+  `/#6aeef289 → /inventory.html#bf3dd322` **via Login**, then
+  `→ /inventory.html#b885fc85` **via Add to cart**. Correctly attributed to the
+  control that caused each transition.
+
+### Two bugs found here
+
+- **`xmax` does not exist in CockroachDB.** `RETURNING (xmax = 0) AS inserted`
+  is the standard PostgreSQL "was this an insert?" trick and it throws
+  `UndefinedColumn` here. It was a **latent crash** — invisible until a run
+  actually captured a signal. Replaced with `RETURNING occurrences`, which is
+  portable: the column defaults to 1 on insert and is incremented on conflict.
+- **`page_edges.via_selector` is implicitly NOT NULL** because it is part of
+  `PRIMARY KEY (app_id, from_page, to_page, via_selector)`. The schema's model
+  of an edge is "A → B **via this control**", not merely "A → B". An observed
+  transition whose cause cannot be named is therefore not representable and is
+  skipped — which is why a bare `replay` contributes no edges while an `ingest`
+  (which knows each step's selector) does.
+
+**Not yet built:** Bedrock distiller adapter, `corrections` persistence (still
+accepted and dropped — only `candidateLessons` are stored), destructive
+inference signals 2–5, macro mining, `run_plan`/`resume_run` (the stateful half
+of the handshake), and binding/execution.
 
 **CLI built — `src/entry/cli.ts`, dependency-free arg parsing.**
 `understudy explore <slug>` · `recall <slug> <goal>` · `record` / `test` (both

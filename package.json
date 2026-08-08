@@ -8,7 +8,8 @@
     "node": ">=22"
   },
   "bin": {
-    "understudy": "./dist/entry/cli.js"
+    "understudy": "./dist/entry/cli.js",
+    "understudy-mcp": "./dist/entry/mcp.js"
   },
   "files": [
     "dist",
@@ -26,10 +27,12 @@
     "sig:check": "tsx src/core/sig-check.ts",
     "explore:check": "tsx src/core/explore-check.ts",
     "understudy": "tsx src/entry/cli.ts",
-    "vendor:accname": "node scripts/vendor-accname.mjs"
+    "vendor:accname": "node scripts/vendor-accname.mjs",
+    "mcp": "tsx src/entry/mcp.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.7.6",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "dom-accessibility-api": "^0.7.1",
     "dotenv": "^17.2.3",
     "pg": "^8.16.3",
