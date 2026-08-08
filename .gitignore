@@ -19,6 +19,10 @@ dist/
 
 # Distiller cache, keyed by recording hash — regenerable, but expensive to lose
 .understudy/cache/
+.understudy/distilled/
+
+# Pending distillation requests — ephemeral scratch, regenerated on demand
+.understudy/requests/
 
 # Local cockroach data dir
 cockroach-data/
