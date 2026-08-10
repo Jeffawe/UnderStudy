@@ -30,6 +30,8 @@ import {
 import { fetchVocabulary } from '../core/vocabulary.js';
 import { recordRun } from '../core/run.js';
 import { mineMacros } from '../core/macros.js';
+import { buildPlan } from '../core/plan.js';
+import { executePlan } from '../core/execute.js';
 import { writeFile, readFile, mkdir } from 'node:fs/promises';
 
 const USAGE = `understudy — learn a web app, then test it by intent
@@ -47,7 +49,7 @@ COMMANDS
   ingest <hash>         replay, then write the flow into memory
   distill <hash>        ask for intent + segments; --save <file> to answer
   mine <slug>           find step blocks that recur across recorded flows
-  test <goal>           plan and execute a goal against an app      [not built]
+  test <slug> <goal>    plan and execute a goal against an app
 
 GLOBAL
   --target local|cloud  which store to use (default: $UNDERSTUDY_TARGET)
@@ -79,6 +81,13 @@ DISTILL
   --again               re-distill even if a cached answer exists
   --value REF=value     as for replay
 
+TEST
+  --sub-goal <text>     supply a sub-goal (repeatable); stands in for decompose
+  --dry-run             plan only, never open a browser
+  --allow-purchases     permit a destructive plan (default: refuse)
+  --value REF=value     as for replay
+  --headed              watch it run
+
 RECALL
   --kinds <a,b>         restrict to chunk kinds (segment, fact, lesson, …)
   --limit <n>           results per list (default 5)
@@ -90,9 +99,17 @@ EXAMPLES
   understudy record saucedemo
 `;
 
-/** Minimal flag parser: --key value, --flag, and positional arguments. */
-function parseArgs(argv: string[]) {
-  const flags = new Map<string, string | true>();
+/**
+ * Minimal flag parser: --key value, --flag, and positional arguments.
+ *
+ * Values accumulate per key. A Map<string, string> silently kept only the LAST
+ * occurrence, which made every repeatable flag a lie: `--sub-goal a --sub-goal
+ * b` planned only b, and `--value` could never supply more than one credential.
+ */
+type Flags = Map<string, Array<string | true>>;
+
+function parseArgs(argv: string[]): { flags: Flags; positional: string[] } {
+  const flags: Flags = new Map();
   const positional: string[] = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -103,18 +120,22 @@ function parseArgs(argv: string[]) {
     }
     const key = arg.replace(/^--?/, '');
     const next = argv[i + 1];
-    if (next !== undefined && !next.startsWith('-')) {
-      flags.set(key, next);
-      i++;
-    } else {
-      flags.set(key, true);
-    }
+    const value: string | true = next !== undefined && !next.startsWith('-') ? next : true;
+    if (typeof value === 'string') i++;
+    flags.set(key, [...(flags.get(key) ?? []), value]);
   }
   return { flags, positional };
 }
 
-const str = (v: string | true | undefined): string | undefined =>
-  typeof v === 'string' ? v : undefined;
+/** Last string value for a key, if any. */
+const str = (v: Array<string | true> | undefined): string | undefined => {
+  const strings = (v ?? []).filter((x): x is string => typeof x === 'string');
+  return strings[strings.length - 1];
+};
+
+/** Every string value for a key — for genuinely repeatable flags. */
+const all = (flags: Flags, key: string): string[] =>
+  (flags.get(key) ?? []).filter((x): x is string => typeof x === 'string');
 
 function fail(message: string, hint?: string): never {
   console.error(`error: ${message}`);
@@ -124,7 +145,7 @@ function fail(message: string, hint?: string): never {
 
 // ---------------------------------------------------------------------------
 
-async function cmdExplore(positional: string[], flags: Map<string, string | true>) {
+async function cmdExplore(positional: string[], flags: Flags) {
   const slug = positional[0] ?? fail('explore needs an app slug', 'understudy explore saucedemo --url https://…');
 
   const baseUrl = await resolveBaseUrl(slug, str(flags.get('url')));
@@ -186,7 +207,7 @@ async function resolveBaseUrl(slug: string, flag: string | undefined): Promise<s
   return baseUrl;
 }
 
-async function cmdRecord(positional: string[], flags: Map<string, string | true>) {
+async function cmdRecord(positional: string[], flags: Flags) {
   const slug = positional[0] ?? fail('record needs an app slug', 'understudy record saucedemo --url https://…');
   const baseUrl = await resolveBaseUrl(slug, str(flags.get('url')));
 
@@ -226,7 +247,7 @@ async function cmdRecord(positional: string[], flags: Map<string, string | true>
   console.log(`saved ${path}`);
 }
 
-async function cmdImport(positional: string[], flags: Map<string, string | true>) {
+async function cmdImport(positional: string[], flags: Flags) {
   const slug = positional[0] ?? fail('import needs an app slug', 'understudy import saucedemo tests/login.spec.ts');
   const file = positional[1] ?? fail('import needs a script path');
 
@@ -263,7 +284,7 @@ async function cmdImport(positional: string[], flags: Map<string, string | true>
   console.log(`saved ${path}`);
 }
 
-async function cmdReplay(positional: string[], flags: Map<string, string | true>) {
+async function cmdReplay(positional: string[], flags: Flags) {
   const hash = positional[0] ?? fail('replay needs a recording hash', 'understudy recordings');
   const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`, 'understudy recordings'));
 
@@ -317,10 +338,9 @@ async function appIdOrFail(slug: string): Promise<string> {
   return rows[0]?.app_id ?? fail(`unknown app '${slug}'`, 'run `understudy explore` or `ingest` first');
 }
 
-function valuesFromFlags(flags: Map<string, string | true>): Record<string, string> {
+function valuesFromFlags(flags: Flags): Record<string, string> {
   const values: Record<string, string> = {};
-  for (const [k, v] of flags) {
-    if (k !== 'value' || typeof v !== 'string') continue;
+  for (const v of all(flags, 'value')) {
     const eq = v.indexOf('=');
     if (eq < 0) fail('--value must be REF=value');
     values[v.slice(0, eq)] = v.slice(eq + 1);
@@ -328,7 +348,7 @@ function valuesFromFlags(flags: Map<string, string | true>): Record<string, stri
   return values;
 }
 
-async function cmdIngest(positional: string[], flags: Map<string, string | true>) {
+async function cmdIngest(positional: string[], flags: Flags) {
   const hash = positional[0] ?? fail('ingest needs a recording hash', 'understudy recordings');
   const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`));
 
@@ -384,7 +404,7 @@ async function cmdIngest(positional: string[], flags: Map<string, string | true>
   }
 }
 
-async function cmdDistill(positional: string[], flags: Map<string, string | true>) {
+async function cmdDistill(positional: string[], flags: Flags) {
   const hash = positional[0] ?? fail('distill needs a recording hash', 'understudy recordings');
   const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`));
 
@@ -517,7 +537,90 @@ async function cmdMine(positional: string[]) {
   }
 }
 
-async function cmdRecall(positional: string[], flags: Map<string, string | true>) {
+async function cmdTest(positional: string[], flags: Flags) {
+  const slug = positional[0] ?? fail('test needs an app slug', 'understudy test saucedemo "log in"');
+  const goal = positional.slice(1).join(' ');
+  if (!goal) fail('test needs a goal');
+
+  const appId = await appIdOrFail(slug);
+  const { rows: app } = await getPool().query<{ base_url: string }>(
+    'SELECT base_url FROM apps WHERE app_id = $1', [appId]);
+
+  // --sub-goal is the manual stand-in for the reasoner's decompose. Repeatable.
+  const subGoals = all(flags, 'sub-goal');
+
+  const plan = await buildPlan(createEmbedder(), appId, goal, {
+    ...(subGoals.length ? { subGoals } : {}),
+    ...(flags.has('allow-purchases')
+      ? { env: { allowsPurchases: true, allowsIrreversible: true, name: 'cli --allow-purchases' } }
+      : {}),
+  });
+
+  console.log(`target: ${describeTarget()}`);
+  console.log(`goal:   "${goal}"\n`);
+
+  for (const sg of plan.subGoals) {
+    console.log(`SUB-GOAL  "${sg.subGoal}"`);
+    if (sg.bound) {
+      console.log(`  bound   ${sg.bound.distance.toFixed(4)}  ${sg.bound.slug} (${sg.bound.steps} steps)`);
+      console.log(`          ${sg.bound.intent.slice(0, 76)}`);
+    } else {
+      console.log(`  GAP     nothing legal bound (top=${sg.topDistance?.toFixed(4) ?? 'n/a'})`);
+    }
+    // Rejections are the interesting part: this is where a candidate that
+    // retrieved WELL was refused on state grounds.
+    for (const r of sg.rejected) {
+      console.log(`  reject  ${r.distance.toFixed(4)}  ${r.slug} — ${r.why}`);
+    }
+    for (const c of sg.context.slice(0, 2)) {
+      console.log(`  context ${c.distance.toFixed(4)}  [${c.kind}] ${c.text.slice(0, 62)}`);
+    }
+    console.log('');
+  }
+
+  for (const seam of plan.seams) {
+    console.log(`SEAM ${seam.from} -> ${seam.to}: ${seam.kind} (${seam.detail})`);
+  }
+  if (plan.seams.length) console.log('');
+
+  if (plan.unbound.length) {
+    console.log(`NOT RUNNABLE — ${plan.unbound.length} sub-goal(s) bound to nothing.`);
+    console.log('  this is the gap loop: record a flow for it, then try again.');
+    process.exitCode = 4;
+    return;
+  }
+  if (plan.blocked) {
+    console.log(`BLOCKED — ${plan.blocked}`);
+    console.log('  re-run with --allow-purchases only if that is genuinely safe here.');
+    process.exitCode = 5;
+    return;
+  }
+
+  if (flags.has('dry-run')) {
+    console.log('dry run — plan is executable, stopping before the browser.');
+    return;
+  }
+
+  const exec = await executePlan(plan, app[0]!.base_url, slug, {
+    values: valuesFromFlags(flags),
+    ...(flags.has('headed') ? { headless: false } : {}),
+  });
+
+  console.log(`EXECUTED ${exec.flowsRun.join(' -> ')}`);
+  console.log(`  ${exec.result.ok ? 'PASSED' : 'FAILED'} in ${(exec.result.durationMs / 1000).toFixed(1)}s`);
+  for (const st of exec.result.steps) {
+    if (st.ok && !st.ambiguousByName && !st.roundTripMismatch) continue;
+    const note = st.error ?? (st.ambiguousByName ? `ambiguous: ${st.ambiguousByName.matched} by name` : 'value did not survive');
+    console.log(`  step ${st.seq} ${st.action}: ${note}`);
+  }
+  console.log(`  path: ${exec.result.sigSequence.join('  ->  ')}`);
+
+  const run = await recordRun(exec.result, { appId, goal, mode: 'execute' });
+  console.log(`  findings ${run.findingsNew} new, ${run.findingsSeenAgain} seen before`);
+  if (!exec.result.ok) process.exitCode = 1;
+}
+
+async function cmdRecall(positional: string[], flags: Flags) {
   const slug = positional[0] ?? fail('recall needs an app slug');
   const goal = positional.slice(1).join(' ');
   if (!goal) fail('recall needs a goal', 'understudy recall saucedemo "add to cart"');
@@ -602,6 +705,9 @@ async function main() {
     case 'import':
       await cmdImport(rest, flags);
       break;
+    case 'test':
+      await cmdTest(rest, flags);
+      break;
     case 'mine':
       await cmdMine(rest);
       break;
@@ -622,9 +728,6 @@ async function main() {
       }
       break;
     }
-    case 'test':
-      notBuilt('test', 'needs the recorder and distiller: nothing bindable exists yet');
-      break;
     default:
       fail(`unknown command '${command}'`, 'understudy --help');
   }

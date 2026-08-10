@@ -35,6 +35,7 @@ import { ingestRecording } from '../core/ingest.js';
 import { buildDistillRequest, validateDistilled, saveDistilled, loadDistilled } from '../core/distill.js';
 import { fetchVocabulary } from '../core/vocabulary.js';
 import { recall, isGap, GAP_DISTANCE } from '../core/recall.js';
+import { startRun, resumeRun, type RunStep } from '../core/session.js';
 
 const json = (value: unknown) => ({
   content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
@@ -216,6 +217,103 @@ server.registerTool(
     const appId = await appIdFor(appSlug);
     if (!appId) return fail(`unknown app '${appSlug}'`);
     return json(await fetchVocabulary(appId));
+  },
+);
+
+/** Render a step of the run loop for the agent. */
+const renderStep = (step: RunStep) => {
+  if (step.status === 'needs_decision') {
+    return json({
+      status: 'needs_decision',
+      runId: step.runId,
+      requestId: step.requestId,
+      ask: step.ask,
+      why: step.reason,
+      ...step.payload,
+      answerWith: 'understudy_resume_run',
+    });
+  }
+  if (step.status === 'failed') return fail(step.error, { runId: step.runId });
+
+  const o = step.outcome;
+  return json({
+    status: o.blocked ? 'blocked' : o.executed ? 'executed' : 'planned',
+    runId: step.runId,
+    ...(o.blocked ? { blocked: o.blocked } : {}),
+    subGoals: o.plan.subGoals.map((s) => ({
+      subGoal: s.subGoal,
+      bound: s.bound ? { slug: s.bound.slug, distance: s.bound.distance, steps: s.bound.steps } : null,
+      rejected: s.rejected,
+      gap: s.gap,
+    })),
+    seams: o.plan.seams,
+    unbound: o.plan.unbound,
+    ...(o.result
+      ? {
+          passed: o.result.ok,
+          flowsRun: o.flowsRun,
+          path: o.result.sigSequence,
+          failures: o.result.steps.filter((st) => !st.ok).map((st) => ({ seq: st.seq, action: st.action, error: st.error })),
+        }
+      : {}),
+  });
+};
+
+server.registerTool(
+  'understudy_run_plan',
+  {
+    title: 'Run a goal (first half of the run handshake)',
+    description:
+      'Plans and executes a goal. Returns at the first point it needs YOU: decomposing the goal ' +
+      'into sub-goals phrased in the app\'s own vocabulary. It does NOT drive the browser through ' +
+      'you — deterministic code binds, splices and executes; you are consulted at judgement points ' +
+      'only. Answer with understudy_resume_run.',
+    inputSchema: {
+      appSlug: z.string(),
+      goal: z.string(),
+      values: z.record(z.string(), z.string()).optional().describe('e.g. {"SECRET.password": "hunter2"}'),
+      dryRun: z.boolean().optional().describe('plan only, never open a browser'),
+      allowPurchases: z.boolean().optional().describe('permit a destructive plan (default: refuse)'),
+    },
+  },
+  async ({ appSlug, goal, values, dryRun, allowPurchases }) => {
+    const appId = await appIdFor(appSlug);
+    if (!appId) return fail(`unknown app '${appSlug}'`);
+    try {
+      return renderStep(
+        await startRun(createEmbedder(), appId, appSlug, goal, {
+          ...(values ? { values } : {}),
+          ...(dryRun ? { dryRun } : {}),
+          ...(allowPurchases
+            ? { env: { allowsPurchases: true, allowsIrreversible: true, name: 'tool --allowPurchases' } }
+            : {}),
+        }),
+      );
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  'understudy_resume_run',
+  {
+    title: 'Answer a run\'s question (second half of the run handshake)',
+    description:
+      'Supply the decision a suspended run is waiting on, and it continues. Returns at the NEXT ' +
+      'point it needs you, or when the run finishes. For a decompose request answer ' +
+      '{ subGoals: ["...", "..."] } using the vocabulary you were given.',
+    inputSchema: {
+      requestId: z.string(),
+      answer: z.record(z.string(), z.unknown()).describe('e.g. { "subGoals": ["log in", "add to cart"] }'),
+    },
+  },
+  async ({ requestId, answer }) => {
+    try {
+      return renderStep(await resumeRun(requestId, answer));
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
   },
 );
 

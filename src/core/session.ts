@@ -1,0 +1,160 @@
+/**
+ * The run registry — the stateful half of the pause-and-ask handshake.
+ *
+ *     run_plan(goal)              → pipeline starts, hits decompose, SUSPENDS
+ *                                 → returns needs_decision (does NOT block)
+ *     resume_run(requestId, ans)  → deferred resolves, pipeline continues
+ *                                 → returns at the NEXT suspension, or the end
+ *
+ * Each call returns at the next suspension point or at completion — the
+ * coroutine-over-RPC shape. The pipeline itself runs as a detached task, so a
+ * tool call never waits on a human.
+ *
+ * Runs live in memory because they hold an open browser. That is the difference
+ * from distillation, which is stateless and survives a restart. If this process
+ * dies, its runs are abandoned; the `runs` row records that.
+ */
+
+import { HostAgentReasoner, vocabularyLines } from '../adapters/reasoner/host-agent.js';
+import { buildPlan, type Plan } from './plan.js';
+import { executePlan } from './execute.js';
+import { fetchVocabulary } from './vocabulary.js';
+import { recordRun } from './run.js';
+import { getPool } from './db.js';
+import type { Embedder } from './types.js';
+import type { ReplayResult } from './replay.js';
+
+export interface RunOutcome {
+  plan: Plan;
+  executed: boolean;
+  result?: ReplayResult;
+  flowsRun?: string[];
+  blocked?: string;
+}
+
+interface Session {
+  runId: string;
+  appId: string;
+  appSlug: string;
+  goal: string;
+  reasoner: HostAgentReasoner;
+  settled: Promise<RunOutcome>;
+  finished?: RunOutcome;
+  error?: string;
+}
+
+const sessions = new Map<string, Session>();
+/** requestId -> runId, so resume only needs the request it was handed. */
+const byRequest = new Map<string, string>();
+
+export type RunStep =
+  | { status: 'needs_decision'; runId: string; requestId: string; ask: string; reason: string; payload: Record<string, unknown> }
+  | { status: 'finished'; runId: string; outcome: RunOutcome }
+  | { status: 'failed'; runId: string; error: string };
+
+/** Wait for whichever comes first: the next suspension, or the run finishing. */
+async function advance(session: Session): Promise<RunStep> {
+  const next = await session.reasoner.nextSuspensionOr(
+    session.settled.then(
+      (outcome) => ({ ok: true as const, outcome }),
+      (err: unknown) => ({ ok: false as const, error: err instanceof Error ? err.message : String(err) }),
+    ),
+  );
+
+  if ('suspended' in next) {
+    byRequest.set(next.suspended.requestId, session.runId);
+    return {
+      status: 'needs_decision',
+      runId: session.runId,
+      requestId: next.suspended.requestId,
+      ask: next.suspended.ask,
+      reason: next.suspended.reason,
+      payload: next.suspended.payload,
+    };
+  }
+
+  if (!next.done.ok) {
+    session.error = next.done.error;
+    return { status: 'failed', runId: session.runId, error: next.done.error };
+  }
+  session.finished = next.done.outcome;
+  return { status: 'finished', runId: session.runId, outcome: next.done.outcome };
+}
+
+export interface StartRunOptions {
+  values?: Record<string, string>;
+  env?: { allowsPurchases: boolean; allowsIrreversible: boolean; name?: string };
+  dryRun?: boolean;
+  headless?: boolean;
+}
+
+export async function startRun(
+  embedder: Embedder,
+  appId: string,
+  appSlug: string,
+  goal: string,
+  opts: StartRunOptions = {},
+): Promise<RunStep> {
+  const { rows } = await getPool().query<{ base_url: string }>(
+    'SELECT base_url FROM apps WHERE app_id = $1',
+    [appId],
+  );
+  const baseUrl = rows[0]?.base_url;
+  if (!baseUrl) throw new Error(`app ${appSlug} has no base URL`);
+
+  const reasoner = new HostAgentReasoner(appId);
+  const runId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+  // Detached: the tool call must return at the first suspension, not sit here.
+  const settled = (async (): Promise<RunOutcome> => {
+    const vocabulary = await fetchVocabulary(appId);
+
+    // THE ONE MODEL CALL IN PLANNING. Everything after it is arithmetic.
+    const subGoals = await reasoner.decompose(goal, vocabularyLines(vocabulary));
+
+    const plan = await buildPlan(embedder, appId, goal, {
+      subGoals,
+      ...(opts.env ? { env: opts.env } : {}),
+    });
+
+    if (plan.blocked) return { plan, executed: false, blocked: plan.blocked };
+    if (plan.unbound.length) return { plan, executed: false };
+    if (opts.dryRun) return { plan, executed: false };
+
+    const exec = await executePlan(plan, baseUrl, appSlug, {
+      values: opts.values ?? {},
+      ...(opts.headless === false ? { headless: false } : {}),
+    });
+    await recordRun(exec.result, { appId, goal, mode: 'execute', reasoner: reasoner.id });
+
+    return { plan, executed: true, result: exec.result, flowsRun: exec.flowsRun };
+  })();
+
+  // Swallow here so an unhandled rejection cannot take the process down; the
+  // error is surfaced through advance() instead.
+  settled.catch(() => {});
+
+  const session: Session = { runId, appId, appSlug, goal, reasoner, settled };
+  sessions.set(runId, session);
+  return advance(session);
+}
+
+export async function resumeRun(requestId: string, answer: unknown): Promise<RunStep> {
+  const runId = byRequest.get(requestId);
+  const session = runId ? sessions.get(runId) : undefined;
+  if (!session) throw new Error(`no run is waiting on request ${requestId}`);
+
+  byRequest.delete(requestId);
+  if (!session.reasoner.answer(requestId, answer)) {
+    throw new Error(`request ${requestId} has already been answered`);
+  }
+  return advance(session);
+}
+
+export function abandonRun(runId: string, reason = 'abandoned'): boolean {
+  const session = sessions.get(runId);
+  if (!session) return false;
+  session.reasoner.abandon(reason);
+  sessions.delete(runId);
+  return true;
+}
