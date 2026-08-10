@@ -22,6 +22,7 @@
 
 import { getPool } from './db.js';
 import { recall, isGap, GAP_DISTANCE, type RecalledChunk } from './recall.js';
+import { resolveSeam, persistProbedBridge, type Seam } from './seams.js';
 import type { Embedder } from './types.js';
 
 export interface BoundStep {
@@ -50,15 +51,6 @@ export interface SubGoalPlan {
   context: RecalledChunk[];
 }
 
-export type SeamKind = 'contiguous' | 'navigation-gap' | 'unresolved';
-
-export interface Seam {
-  from: string;
-  to: string;
-  kind: SeamKind;
-  detail: string;
-}
-
 export interface Plan {
   goal: string;
   appId: string;
@@ -78,6 +70,23 @@ export interface PlanOptions {
   /** Environment flags. Absent means the safest reading — see below. */
   env?: { allowsPurchases: boolean; allowsIrreversible: boolean; name?: string };
   limit?: number;
+  /** Needed to build an absolute URL for a rung-4 navigation seam. */
+  baseUrl?: string;
+  /**
+   * Rung 5. Called only when rungs 1–4 all fail, so probing stays the last
+   * resort it is meant to be. The reasoner drives a real browser and returns
+   * the steps it found; we persist them and re-resolve, which then lands on
+   * rung 2 — so the same gap is never probed twice.
+   *
+   * Omitted means an unresolved seam stays unresolved and blocks execution,
+   * rather than being guessed at.
+   */
+  onSeamProbe?: (context: {
+    fromSlug: string;
+    toSlug: string;
+    fromState: string;
+    toState: string;
+  }) => Promise<{ steps?: Array<{ action: string; role?: string; name?: string; testId?: string; css?: string; value?: string }> }>;
   /**
    * What is already true when the plan starts.
    *
@@ -257,7 +266,37 @@ export async function buildPlan(
 
     if (bound) {
       if (previous) {
-        seams.push(seamBetween(previous, bound));
+        const fromEp = { slug: previous.slug, endState: previous.endState, startState: previous.startState };
+        const toEp = { slug: bound.slug, endState: bound.endState, startState: bound.startState };
+        let seam = await resolveSeam(appId, fromEp, toEp, opts.baseUrl ?? 'http://localhost');
+
+        // RUNG 5 — everything cheaper has failed, so ask someone who can look.
+        if (seam.kind === 'unresolved' && opts.onSeamProbe && previous.endState && bound.startState) {
+          const probed = await opts.onSeamProbe({
+            fromSlug: previous.slug,
+            toSlug: bound.slug,
+            fromState: previous.endState,
+            toState: bound.startState,
+          });
+
+          if (probed.steps?.length) {
+            await persistProbedBridge(
+              embedder,
+              appId,
+              previous.endState,
+              bound.startState,
+              probed.steps,
+            );
+            // Re-resolve rather than using the returned steps directly: if the
+            // write-back worked, this now answers at rung 2 from the database,
+            // which proves the gap will never be probed again.
+            seam = await resolveSeam(appId, fromEp, toEp, opts.baseUrl ?? 'http://localhost');
+            if (seam.kind === 'bridge-segment') {
+              seam = { ...seam, kind: 'probed', rung: 5, detail: `probed and persisted; ${seam.detail}` };
+            }
+          }
+        }
+        seams.push(seam);
       }
       currentState = bound.endState ?? currentState;
       // A flow's outcome becomes the state its successor is judged against.
@@ -288,39 +327,5 @@ export async function buildPlan(
   };
 }
 
-/**
- * How to get from the end of one bound flow to the start of the next.
- *
- * Only the first two rungs of PLAN.md's ladder are implemented here:
- * `sig` match, and same-origin navigation. Bridge segments, the page graph and
- * live probing come later — an unresolved seam is reported rather than guessed
- * at, because a wrong bridge executes real clicks on a real app.
- */
-function seamBetween(from: BoundStep, to: BoundStep): Seam {
-  if (!from.endState || !to.startState) {
-    return { from: from.slug, to: to.slug, kind: 'unresolved', detail: 'missing start or end state' };
-  }
-  if (from.endState === to.startState) {
-    return { from: from.slug, to: to.slug, kind: 'contiguous', detail: 'states match — concatenate, no bridging steps' };
-  }
-
-  const fromPattern = from.endState.slice(0, from.endState.lastIndexOf('#'));
-  const toPattern = to.startState.slice(0, to.startState.lastIndexOf('#'));
-  if (fromPattern !== toPattern) {
-    return {
-      from: from.slug,
-      to: to.slug,
-      kind: 'navigation-gap',
-      detail: `different route: ${fromPattern} -> ${toPattern}`,
-    };
-  }
-
-  return {
-    from: from.slug,
-    to: to.slug,
-    kind: 'unresolved',
-    detail: `same route ${fromPattern} but different state: ${from.endState} -> ${to.startState}`,
-  };
-}
-
 export { GAP_DISTANCE };
+export type { Seam } from './seams.js';

@@ -84,6 +84,15 @@ export interface RawEvent {
 
   /** URL at the moment of the event. */
   url: string;
+  /**
+   * The page fingerprint this step produced WHEN IT WAS RECORDED.
+   *
+   * Carried so execution can answer "am I where I expected to be?" — the sig is
+   * computed after every step anyway, so comparing it to this costs nothing and
+   * is the difference between noticing the app changed under you and walking
+   * blindly into a page the plan never saw.
+   */
+  expectedSig?: string;
   resolution: Resolution;
 
   /** Anything the source knew but the IR has no column for. */
