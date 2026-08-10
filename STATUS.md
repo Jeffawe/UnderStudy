@@ -354,10 +354,118 @@ three. Vocabulary helps it notice; mining notices regardless.
   whose name had just been deleted. `ingestRecording` now falls back to the
   cached distillation: a recording that has been distilled stays distilled.
 
-**Not yet built:** Bedrock distiller adapter, `corrections` persistence (still
-accepted and dropped — only `candidateLessons` are stored), destructive
-inference signals 2–5, `run_plan`/`resume_run` (the stateful half of the
-handshake), and binding/execution.
+**Planning + execution built — `understudy test <slug> "<goal>"`.**
+`src/core/plan.ts` (bind, seams, safety gate) and `src/core/execute.ts`.
+
+**There is ONE executor.** Rather than write a second step walker, `execute`
+reconstructs IR steps out of the database into exactly the shape `replay()`
+already consumes. Everything replay learned the hard way — ambiguity detection,
+`testIdAttr`, settle-before-fingerprint, the round-trip assertion, signal
+correlation — applies to real execution for free and cannot rot separately.
+
+Working end to end:
+
+```
+SUB-GOAL "log in to the app"
+  bound  0.7062  log-in-as-standard-user (4 steps)
+SUB-GOAL "add a product to the cart"
+  bound  0.5688  add-product-to-cart (1 steps)
+SEAM contiguous — states match, no bridging steps
+EXECUTED log-in-as-standard-user -> add-product-to-cart
+  PASSED in 1.4s
+  path: /#6aeef289 -> /inventory.html#bf3dd322 -> /inventory.html#b885fc85
+```
+
+**BINDING IS NOT RETRIEVAL — and this is the polarity fix, working.**
+`recall()` proposes by meaning; binding decides what is LEGAL from where
+execution is. Asked for `"add a product to the cart"` from a fresh browser, the
+CLOSEST match is rejected and a worse-scoring one wins:
+
+```
+bound   0.6650  fill-username-...-login-e4f3fd  (logs in first)
+reject  0.5688  add-product-to-cart — requires "authenticated" but state is "not authenticated"
+```
+
+Initial state defaults to `['not authenticated']` because a fresh browser
+context has no cookies — a fact about how execution begins, not an assumption.
+Without it the first sub-goal is judged against "we know nothing" and a segment
+requiring auth binds as step one, then fails on a locator that was never going
+to be there.
+
+**Safety gate verified in both directions:** a destructive plan exits 5 with
+`BLOCKED` naming the offending flow; `--allow-purchases` runs it. It fails
+closed — no configured environment means "we do not know if spend is allowed",
+which must not read as permitted.
+
+### Bugs found here
+
+- **Repeatable flags were never repeatable.** `parseArgs` stored flags in a
+  `Map<string, value>`, so `--sub-goal a --sub-goal b` planned only `b`. That
+  also means **`--value` could never have supplied more than one credential** —
+  it only ever appeared to work because we passed one. Values now accumulate
+  per key.
+
+### A safety hole worth naming
+
+Marking only a SEGMENT destructive did not block the plan: `recall()`'s +0.50
+destructive penalty pushed it down the ranking, the planner bound a
+differently-labelled flow that **does the same thing**, and the plan never
+registered as destructive. **The penalty can route around the gate.**
+Destructive marking must be consistent across a flow and the segments cut from
+it, or the gate is advisory. Ties into destructive inference signals 2–5 still
+being unimplemented — today only commit-word matching runs, and it never looked
+at "Add to cart".
+
+**Reasoner adapter built — `src/adapters/reasoner/host-agent.ts` +
+`src/core/session.ts` + `understudy_run_plan` / `understudy_resume_run`.**
+
+The stateful half of the handshake. Unlike distillation (no live state, so a
+clean two-call split that survives a restart), a run holds an OPEN BROWSER on a
+particular page — that cannot be serialised, so the process holds the promise
+and a dead process abandons its runs. Deliberate trade, not an oversight.
+
+`HostAgentReasoner` computes nothing: it writes a pending `context_requests`
+row and returns a promise that resolves when `resume_run` arrives. The executor
+never learns which adapter it has — it writes `await reasoner.decompose(...)`
+and in Mode A that resolves from Bedrock in ~2s, here in however long the agent
+takes. **A tool call never blocks on a human**: `startRun` races the pipeline
+against its own next suspension and returns whichever comes first.
+
+Verified over real stdio MCP:
+
+```
+1. run_plan("sign in and put something in my basket")
+     → needs_decision, requestId, + the app's vocabulary
+2. resume_run({ subGoals: [...] })
+     → bound, seam contiguous, EXECUTED, passed=true
+     → path /#6aeef289 -> /inventory.html#bf3dd322 -> /inventory.html#b885fc85
+3. answering the same request twice → isError, "no run is waiting on request …"
+```
+
+**VOCABULARY GROUNDING MEASURABLY WORKS** — the same two sub-goals, phrased in
+the user's words vs the corpus's:
+
+| query | distance |
+|---|---|
+| `log in to the app` | 0.7062 |
+| `Sign in to the app with a username and password` | **0.6251** |
+| `add a product to the cart` | 0.5688 |
+| `Put an item into the shopping cart from the product list` | **0.4124** |
+
+That is the documented fix for the polarity problem, working end to end: the
+reasoner rewrites the goal INTO the vocabulary before recall runs, and
+retrieval improves sharply. Combined with the precondition filter at bind time,
+both halves of the answer are now in place.
+
+**Schema note:** `context_requests` has no `answered_at` column — `status` plus
+the stored `answer` is the record. The first draft wrote to it and would have
+failed silently inside its own catch.
+
+**Not yet built:** Bedrock adapters (distiller + reasoner), `resolve()` is
+implemented but nothing calls it yet (the executor does not escalate on an
+unexpected page), seam rungs 3–5 (bridge segments, page graph, live probe),
+`corrections` persistence, destructive inference signals 2–5, selector health
+rollup and quarantine, flow-drift diffing, and code emitters.
 
 **CLI built — `src/entry/cli.ts`, dependency-free arg parsing.**
 `understudy explore <slug>` · `recall <slug> <goal>` · `record` / `test` (both
