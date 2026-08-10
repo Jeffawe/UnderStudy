@@ -25,6 +25,7 @@
 import { chromium, type Browser, type Frame, type Locator, type Page } from 'playwright';
 import { computeSig, waitForAriaStable } from './sig.js';
 import type { RawEvent, RawRecording } from './recording.js';
+import type { PendingDecision } from './types.js';
 
 export interface StepOutcome {
   seq: number;
@@ -39,6 +40,15 @@ export interface StepOutcome {
   matched?: number;
   /** Set when a filled value did not survive being written. */
   roundTripMismatch?: { expected: string; actual: string };
+  /**
+   * Set when the page after this step is NOT the page the step recorded.
+   *
+   * This is the executor's "unexpected page" signal — where PLAN.md escalates
+   * to the reasoner. It is NOT automatically a failure: an app can legitimately
+   * gain a banner or a cookie prompt. It is a fact worth carrying, and the
+   * judgement about what it means belongs to the reasoner.
+   */
+  unexpectedPage?: { expected: string; observed: string };
   /**
    * Set when role+name matched several elements and something more specific
    * had to disambiguate. Feeds `selectors.fragility` — a name that is not
@@ -57,6 +67,13 @@ export interface CapturedSignal {
   body?: string;
 }
 
+export interface Escalation {
+  step: number;
+  kind: PendingDecision['kind'];
+  question: Record<string, unknown>;
+  answer: Record<string, unknown>;
+}
+
 export interface ReplayResult {
   hash: string;
   ok: boolean;
@@ -67,6 +84,8 @@ export interface ReplayResult {
   sigSequence: string[];
   signals: CapturedSignal[];
   durationMs: number;
+  /** Every point the executor stopped and asked, with what came back. */
+  escalations: Escalation[];
 }
 
 export interface ReplayOptions {
@@ -84,7 +103,19 @@ export interface ReplayOptions {
   timeoutMs?: number;
   /** Capture response bodies for non-2xx and JSON responses. */
   captureBodies?: boolean;
+  /**
+   * Called when the executor cannot decide alone. Deliberately a callback
+   * rather than the Reasoner interface, so replay stays decoupled from who is
+   * answering — Bedrock, the host agent, or nobody at all.
+   *
+   * Omitted means NO ESCALATION: the run records what it saw and carries on,
+   * which is right for a verification replay and wrong for a real test.
+   */
+  onDecision?: (decision: PendingDecision) => Promise<Record<string, unknown>>;
 }
+
+/** What a decision may tell the executor to do. */
+export type DecisionAction = 'continue' | 'abort' | 'retry';
 
 /** Bodies above this are truncated — a findings fingerprint needs the shape, not the payload. */
 const MAX_BODY = 4000;
@@ -144,7 +175,8 @@ export async function replay(
   recording: RawRecording,
   opts: ReplayOptions = {},
 ): Promise<ReplayResult> {
-  const { values = {}, headless = true, timeoutMs = 10_000, captureBodies = true } = opts;
+  const { values = {}, headless = true, timeoutMs = 10_000, captureBodies = true, onDecision } = opts;
+  const escalations: Escalation[] = [];
 
   const browser: Browser = await chromium.launch({ headless });
   const context = await browser.newContext();
@@ -306,8 +338,60 @@ export async function replay(
       const sig = await computeSig(page);
       outcome.sig = sig.sig;
       if (sigSequence[sigSequence.length - 1] !== sig.sig) sigSequence.push(sig.sig);
+
+      // AM I WHERE I EXPECTED TO BE?
+      //
+      // Both sides of this comparison already existed and were being discarded:
+      // the step recorded the sig it produced, and we compute the sig after
+      // every step regardless. Not comparing them meant execution could walk
+      // into a page the plan had never seen and notice nothing until a locator
+      // happened to miss.
+      if (event.expectedSig && event.expectedSig !== sig.sig) {
+        outcome.unexpectedPage = { expected: event.expectedSig, observed: sig.sig };
+
+        // THE ESCALATION. An unexpected page is not automatically wrong — an
+        // app may have gained a banner — but continuing blindly is how a run
+        // does something nobody asked for. Deterministic code cannot judge it,
+        // so it asks. With nobody to ask, it records and carries on.
+        if (onDecision) {
+          const question = {
+            step: event.seq,
+            action: event.action,
+            target: event.name ?? event.testId ?? event.css,
+            expected: event.expectedSig,
+            observed: sig.sig,
+            semantic: `after ${event.action} on "${event.name ?? '?'}"`,
+          };
+          const answer = await onDecision({ kind: 'unexpected_page', context: question });
+          escalations.push({ step: event.seq, kind: 'unexpected_page', question, answer });
+
+          if (answer.action === 'abort') {
+            outcome.error = `aborted by reasoner: ${String(answer.reason ?? 'unexpected page')}`;
+            outcome.ok = false;
+          }
+        }
+      }
     } catch (err) {
       outcome.error = (err instanceof Error ? err.message : String(err)).split('\n')[0]!.slice(0, 200);
+    }
+
+    // A step that FAILED is the other place judgement is needed: a missing
+    // element may be rot to heal or a genuine gap to ask about, and only the
+    // selector's health tells them apart.
+    if (!outcome.ok && onDecision && outcome.error && !outcome.error.startsWith('aborted by reasoner')) {
+      const question = {
+        step: event.seq,
+        action: event.action,
+        target: event.name ?? event.testId ?? event.css,
+        error: outcome.error,
+        matched: outcome.matched,
+      };
+      const answer = await onDecision({ kind: 'unexpected_page', context: question });
+      escalations.push({ step: event.seq, kind: 'unexpected_page', question, answer });
+      if (answer.action === 'continue') {
+        outcome.ok = true;
+        outcome.error = `${outcome.error} (continued by reasoner)`;
+      }
     }
 
     outcome.durationMs = Date.now() - stepStart;
@@ -332,5 +416,6 @@ export async function replay(
     sigSequence,
     signals,
     durationMs: Date.now() - startedAt,
+    escalations,
   };
 }

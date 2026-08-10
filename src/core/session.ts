@@ -114,6 +114,13 @@ export async function startRun(
 
     const plan = await buildPlan(embedder, appId, goal, {
       subGoals,
+      baseUrl,
+      // Rung 5 uses the same reasoner as everything else — it just asks a
+      // different question, and the answer is written back as memory.
+      onSeamProbe: async (context) => {
+        const answer = await reasoner.resolve({ kind: 'seam', context });
+        return answer as { steps?: Array<{ action: string; role?: string; name?: string; testId?: string; css?: string; value?: string }> };
+      },
       ...(opts.env ? { env: opts.env } : {}),
     });
 
@@ -124,6 +131,11 @@ export async function startRun(
     const exec = await executePlan(plan, baseUrl, appSlug, {
       values: opts.values ?? {},
       ...(opts.headless === false ? { headless: false } : {}),
+      // THE MID-RUN ESCALATION. The executor drives; when it cannot decide —
+      // an unexpected page, a step that failed — it suspends here and the agent
+      // answers, exactly as it did for decompose. Same mechanism, different
+      // question.
+      onDecision: (decision) => reasoner.resolve(decision),
     });
     await recordRun(exec.result, { appId, goal, mode: 'execute', reasoner: reasoner.id });
 

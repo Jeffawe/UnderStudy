@@ -461,11 +461,163 @@ both halves of the answer are now in place.
 the stored `answer` is the record. The first draft wrote to it and would have
 failed silently inside its own catch.
 
-**Not yet built:** Bedrock adapters (distiller + reasoner), `resolve()` is
-implemented but nothing calls it yet (the executor does not escalate on an
-unexpected page), seam rungs 3–5 (bridge segments, page graph, live probe),
-`corrections` persistence, destructive inference signals 2–5, selector health
-rollup and quarantine, flow-drift diffing, and code emitters.
+**Seam ladder built — `src/core/seams.ts`. Rungs 1–4 resolve; rung 5 refuses.**
+A seam now produces STEPS that actually execute, rather than only describing
+itself. Each rung is more speculative than the last, so the first that answers
+wins. Verified against the real corpus:
+
+| rung | case | result |
+|---|---|---|
+| 1 | identical states | `contiguous` — 0 steps |
+| 2 | `/#6aeef289 → /inventory.html#b885fc85` | chained **two** segments, spliced 5 steps |
+| 3 | `/inventory.html#b885fc85 → /inventory-item.html#0128d5ba` | `click link "Sauce Labs Fleece Jacket"` |
+| 4 | `/inventory.html → /cart.html` | `goto https://www.saucedemo.com/cart.html` |
+| 5 | same route, unknown state | **unresolved — refuses to guess** |
+
+**Rung 3 is the one that pays for exploration.** That pair of page states was
+never visited together by any recording — the connection came from
+`page_edges`, as a graph query rather than a browser session, and it emitted the
+control that bridges them.
+
+**Escalation is real, not decorative:** a case built to test rung 3 was answered
+at rung 2 instead, because a known segment covered that exact gap. A named
+segment beats a bare click, and the ladder picked correctly without being told.
+
+**An unresolved seam BLOCKS execution.** `executePlan` throws rather than
+running the two halves back to back — otherwise the second flow starts from a
+state it was never recorded in, which is how a plan quietly does the wrong thing
+instead of failing.
+
+**Flow drift + the expectation check built — `src/core/drift.ts`.**
+
+**"Am I where I expected to be?"** Both sides of that comparison already existed
+and were being thrown away: every step records the sig it produced
+(`steps.state_after`), and execution computes the sig after every step anyway.
+Worse, `execute.ts` was loading `state_after` and assigning it to `url` — so the
+expectation was fetched and then overwritten into the wrong field. Now carried
+as `expectedSig`, compared, and a mismatch sets `StepOutcome.unexpectedPage`.
+It is **not** treated as a failure — an app may legitimately gain a banner —
+it becomes a `flow_drift` finding, because judging it is the reasoner's job.
+
+**Flow drift.** `runs.sig_sequence` was WRITE-ONLY: recorded on all 18 runs and
+never once read back. Now each run diffs its path against the last N passing
+runs of the same goal:
+
+```
+run 1  first run of this goal — nothing to compare against yet
+run 2  drift none (matches the last 1 passing run)
+run 3  DRIFT path changed vs the last 2 passing runs:
+           + /inventory.html#b885fc85
+run 4  drift none (matches the last 3 passing runs)
+```
+
+A text diff over sigs. No model, no pixels — **visual drift stays out of
+scope**; this is structural. A conventional suite cannot do this at all: it has
+no memory of what the flow looked like last week, and `sig_sequence` is that
+memory.
+
+**Three implementation bugs found on review — the decisions were right, the code
+was not:**
+
+- **A sig diff conflated "different page" with "same page, different state".**
+  `sig()` is state-granular by design and `/inventory.html` alone has FOUR sigs
+  in this corpus (empty cart, one item, menu open, …), so an ordinary state
+  difference reported as "a page disappeared and a different one appeared".
+  Given how often cart state differs between runs, this would have produced
+  near-constant false drift. An adjacent removed+added pair on the same
+  url_pattern now collapses to one `changed` entry, tracked separately and at
+  lower severity — a page nobody has ever seen is a much bigger deal than a
+  known page in another state.
+- **The alternation filter was one-directional.** `added` was filtered against
+  "has any recent run taken this?" and `removed` was not filtered at all. So a
+  flow alternating A→B→C and A→C reported nothing in one direction and drift in
+  the other. Now symmetric.
+- **The finding fingerprint truncated away the discriminating part.** It was
+  `` `drift:${goal}:${changes}`.slice(0, 60) `` — with the goal first, so any
+  goal longer than ~55 characters lost the change list entirely and **every
+  distinct drift on that goal collided into one finding**. Now hashed.
+
+Verified with crafted histories:
+
+```
+same page, different state   =6aeef289 ~b885fc85    added=[] stateChanged=[…]
+alternation, either order    changed=false in BOTH directions
+genuinely new page           =6aeef289 +deadbeef =bf3dd322   added=[…]
+```
+
+Details worth keeping:
+- **LCS diff, not substring** — unlike macro mining, which needs contiguity
+  because a macro must be runnable. A drift diff is for a human to read, and
+  alignment across an inserted step is what makes "one new page appeared in the
+  middle" legible.
+- **Baseline is the most recent PASSED run.** Diffing against a failure would
+  report its truncated path as "removed steps" — noise, not drift.
+- **A sig is only "new" if NO recent run took it**, so a flow that legitimately
+  alternates between two paths does not drift every time.
+- Drift becomes a `flow_drift` finding, fingerprinted on WHAT changed rather
+  than the whole path, so a recurring drift accumulates instead of minting a new
+  finding every run.
+
+**Mid-run escalation built — the executor now STOPS AND ASKS.**
+`ReplayOptions.onDecision` is deliberately a plain callback rather than the
+`Reasoner` interface, so replay stays decoupled from who answers. **Omitting it
+means no escalation** — right for a verification replay, wrong for a real test.
+
+Escalates on two things:
+- **unexpected page** — the sig after a step is not the sig that step recorded
+- **a failed step** — a missing element may be rot to heal or a genuine gap
+
+Verified over MCP, with **two suspensions in a single run**:
+
+```
+ASKED: Split this goal into sub-goals…            -> answered with sub-goals
+ASKED: The executor needs a decision: unexpected_page
+         expected /inventory.html#WRONG999
+         observed /inventory.html#b885fc85        -> answered "continue"
+final: executed, passed=true
+```
+
+and the other answer genuinely stops it:
+
+```
+-> answered "abort"
+status=executed passed=false
+  step 4 click: aborted by reasoner: this is not the page the plan expected
+```
+
+That is the same handshake as decompose, reused for a different question —
+which is the point of `context_requests` modelling "agent asks human" and
+"server asks reasoner" with one state machine.
+
+**Seam rung 5 built — `persistProbedBridge`.** The reasoner does the probing
+with its own Playwright access (PLAN.md: it "reaches for Playwright MCP directly
+just for live probing and selector repair") and hands back steps; we persist
+them as **both** a bridge segment and a `page_edge`, stored exactly as a
+distilled segment would be. So the next composition over that gap lands on rung
+2 or 3 and never probes again — probing is the expensive rung and should happen
+once per gap.
+
+**Rung 5 is now wired into the planner.** An unresolved seam calls
+`onSeamProbe`, which in Mode B is the same reasoner answering a different
+question. Its steps are persisted, then the seam is **re-resolved from the
+database rather than using the returned steps directly** — so a successful probe
+must land on rung 2 to count, which proves the write-back actually took:
+
+```
+BEFORE probe:  rung 5 unresolved
+AFTER  probe:  rung 2 bridge-segment — spliced bridge-0fd1b19119 (2 steps)
+persisted:     bridge-0fd1b19119  source=sliced  steps=2
+page_edge:     written
+```
+
+Probing is the expensive rung; this is what makes "once per gap" true rather
+than aspirational. Omitting `onSeamProbe` leaves an unresolved seam unresolved,
+which **blocks execution** rather than guessing.
+
+**Not yet built:** Bedrock adapters (distiller + reasoner); findings triage (all
+sit at `status='open'`, nothing asks the reasoner whether they matter);
+`corrections` persistence; destructive inference signals 2–5; selector health
+rollup and quarantine; code emitters.
 
 **CLI built — `src/entry/cli.ts`, dependency-free arg parsing.**
 `understudy explore <slug>` · `recall <slug> <goal>` · `record` / `test` (both

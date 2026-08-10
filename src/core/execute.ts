@@ -71,7 +71,11 @@ async function eventsForFlow(flowId: string, startingSeq: number): Promise<RawEv
       ...(r.frame_hint ? { frameHint: r.frame_hint } : {}),
       ...(args.exact ? { exact: true } : {}),
       ...(typeof args.nth === 'number' ? { hints: { nth: args.nth } } : {}),
-      url: r.state_after ?? '',
+      // state_after is the fingerprint this step PRODUCED when recorded — an
+      // expectation, not a URL. It was being loaded and then assigned to `url`,
+      // which threw the expectation away and put a sig where a URL belongs.
+      ...(r.state_after ? { expectedSig: r.state_after } : {}),
+      url: '',
       resolution: 'accname' as const,
     };
   });
@@ -107,8 +111,30 @@ export async function executePlan(
   const events: RawEvent[] = [];
   const flowsRun: string[] = [];
 
+  // Seams are indexed by the flow they lead INTO, so a bridge is spliced
+  // immediately before its destination.
+  const seamBefore = new Map<string, (typeof plan.seams)[number]>();
+  for (const seam of plan.seams) seamBefore.set(seam.to, seam);
+
   for (const sub of plan.subGoals) {
     if (!sub.bound) continue;
+
+    // A seam that could not be resolved must NOT be executed through. Running
+    // the two halves back to back would start the second flow from a state it
+    // was never recorded in — which is how a plan quietly does the wrong thing
+    // rather than failing.
+    const seam = seamBefore.get(sub.bound.slug);
+    if (seam && seam.kind === 'unresolved') {
+      throw new Error(
+        `refusing to execute: unresolved seam ${seam.from} -> ${seam.to} (${seam.detail})`,
+      );
+    }
+    if (seam?.steps.length) {
+      for (const e of seam.steps) {
+        events.push({ ...e, seq: events.length, ts: events.length });
+      }
+    }
+
     const flowEvents = await eventsForFlow(sub.bound.flowId, events.length);
 
     // A bound flow that begins with its own `goto` is self-contained. Splicing

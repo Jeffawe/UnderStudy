@@ -550,6 +550,7 @@ async function cmdTest(positional: string[], flags: Flags) {
   const subGoals = all(flags, 'sub-goal');
 
   const plan = await buildPlan(createEmbedder(), appId, goal, {
+    baseUrl: app[0]!.base_url,
     ...(subGoals.length ? { subGoals } : {}),
     ...(flags.has('allow-purchases')
       ? { env: { allowsPurchases: true, allowsIrreversible: true, name: 'cli --allow-purchases' } }
@@ -579,7 +580,8 @@ async function cmdTest(positional: string[], flags: Flags) {
   }
 
   for (const seam of plan.seams) {
-    console.log(`SEAM ${seam.from} -> ${seam.to}: ${seam.kind} (${seam.detail})`);
+    console.log(`SEAM rung ${seam.rung} ${seam.from} -> ${seam.to}: ${seam.kind}`);
+    console.log(`     ${seam.detail}${seam.steps.length ? ` [+${seam.steps.length} bridging step(s)]` : ''}`);
   }
   if (plan.seams.length) console.log('');
 
@@ -617,6 +619,22 @@ async function cmdTest(positional: string[], flags: Flags) {
 
   const run = await recordRun(exec.result, { appId, goal, mode: 'execute' });
   console.log(`  findings ${run.findingsNew} new, ${run.findingsSeenAgain} seen before`);
+
+  const d = run.drift;
+  if (d?.firstRun) {
+    console.log('  drift    first run of this goal — nothing to compare against yet');
+  } else if (d?.changed) {
+    console.log(`  DRIFT    path changed vs the last ${d.baselineRuns} passing run(s):`);
+    for (const step of d.diff) {
+      const mark = step.change === 'added' ? '  + ' : step.change === 'removed' ? '  - '
+                 : step.change === 'changed' ? '  ~ ' : '    ';
+      const extra = step.was ? `   (was ${step.was})` : '';
+      console.log(`         ${mark}${step.sig}${extra}`);
+    }
+    console.log('           recorded as a flow_drift finding — whether it is a bug is a judgement call');
+  } else if (d) {
+    console.log(`  drift    none (matches the last ${d.baselineRuns} passing run(s))`);
+  }
   if (!exec.result.ok) process.exitCode = 1;
 }
 

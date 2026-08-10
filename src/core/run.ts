@@ -29,6 +29,7 @@ import { createHash } from 'node:crypto';
 import type pg from 'pg';
 import { tx } from './db.js';
 import type { CapturedSignal, ReplayResult } from './replay.js';
+import { detectDrift, recordDrift, type Drift } from './drift.js';
 
 export interface RecordRunOptions {
   appId: string;
@@ -47,6 +48,8 @@ export interface RecordRunResult {
   findingsNew: number;
   findingsSeenAgain: number;
   edges: number;
+  /** Path comparison against previous runs of the same goal. */
+  drift?: Drift;
 }
 
 /** A finding before it meets the database. */
@@ -140,6 +143,21 @@ export function extractFindings(result: ReplayResult, goal: string): FindingDraf
     }
   }
 
+  // The page after a step is not the page that step recorded. Not automatically
+  // a failure — an app may legitimately gain a banner — but it is precisely the
+  // signal PLAN.md escalates to the reasoner, so it must be recorded rather
+  // than shrugged off.
+  for (const step of result.steps) {
+    if (!step.unexpectedPage) continue;
+    add({
+      kind: 'flow_drift',
+      severity: 'medium',
+      statement: `step ${step.seq} (${step.action}) landed on ${step.unexpectedPage.observed}, expected ${step.unexpectedPage.expected}`,
+      evidence: { step: step.seq, ...step.unexpectedPage, goal },
+      fingerprint: fingerprint(['unexpected_page', step.unexpectedPage.expected, step.unexpectedPage.observed]),
+    });
+  }
+
   // A value that does not survive being written is a real defect class, and the
   // IR makes it free to detect: we know what went into which field.
   for (const step of result.steps) {
@@ -163,6 +181,10 @@ export async function recordRun(
   result: ReplayResult,
   opts: RecordRunOptions,
 ): Promise<RecordRunResult> {
+  // Drift compares against PREVIOUS runs, so it is measured before this run is
+  // written — otherwise the baseline would include the run being judged.
+  const drift = await detectDrift(opts.appId, opts.goal, result.sigSequence);
+
   const { appId, goal, mode = 'execute', reasoner, stepIds = [], selectorIds = [] } = opts;
 
   const findings = extractFindings(result, goal);
@@ -173,7 +195,7 @@ export async function recordRun(
     signalsByStep.set(s.duringStep, list);
   }
 
-  return tx(async (client: pg.PoolClient) => {
+  const outcome = await tx(async (client: pg.PoolClient) => {
     const { rows: runRows } = await client.query<{ run_id: string }>(
       `INSERT INTO runs (app_id, goal, mode, status, sig_sequence, reasoner, finished_at)
        VALUES ($1,$2,$3,$4,$5,$6, now())
@@ -289,4 +311,7 @@ export async function recordRun(
 
     return { runId, events: result.steps.length, findingsNew, findingsSeenAgain, edges };
   });
+
+  if (drift.changed) await recordDrift(opts.appId, drift, outcome.runId);
+  return { ...outcome, drift };
 }
