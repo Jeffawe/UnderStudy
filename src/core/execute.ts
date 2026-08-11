@@ -19,6 +19,7 @@ import { getPool } from './db.js';
 import { replay, type ReplayOptions, type ReplayResult } from './replay.js';
 import { buildRecording, type RawEvent, type RawRecording } from './recording.js';
 import type { Plan } from './plan.js';
+import { lessonsFor, markApplied } from './lessons.js';
 
 interface StepRow {
   action: string;
@@ -153,5 +154,18 @@ export async function executePlan(
     events,
   );
 
-  return { result: await replay(recording, opts), recording, flowsRun };
+  const result = await replay(recording, {
+    ...opts,
+    // Bind lesson lookup to this app. replay stays ignorant of the database.
+    lessonsFor: opts.lessonsFor ?? ((context) => lessonsFor(plan.appId, context)),
+  });
+
+  // Bookkeeping: a lesson that fires constantly and never helps is noise with a
+  // trigger attached, and only the ratio shows that.
+  for (const step of result.steps) {
+    if (!step.lessonsApplied?.length) continue;
+    await markApplied(step.lessonsApplied.map((l) => l.lessonId), step.ok);
+  }
+
+  return { result, recording, flowsRun };
 }

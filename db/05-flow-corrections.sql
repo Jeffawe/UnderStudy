@@ -1,0 +1,26 @@
+-- Migration 05 — give distillation corrections somewhere to live.
+--
+-- The distiller returns `corrections`: what it judged wrong or redundant in the
+-- raw recording, and why. They were accepted, validated, and then silently
+-- dropped, because no table had a column for them.
+--
+-- WHY ON `flows` AND NOT SOMEWHERE ELSE:
+--   · not `findings` — a finding says THE APP is wrong. A correction says the
+--     RECORDING was noisy. Different subject, different reader, and mixing them
+--     would put recorder artefacts in front of someone triaging real defects.
+--   · not `facts` — facts are retrieved by meaning at planning time and fed to
+--     the reasoner as context. "codegen emitted a redundant click" is not
+--     knowledge about the app and would only dilute retrieval.
+--   · not `lessons` — a lesson has a trigger and fires during execution. A
+--     correction has already been applied; there is nothing left to trigger.
+--
+-- A correction is PROVENANCE for one flow's distillation, so it belongs on that
+-- flow. Read it when you are asking "why does this flow have these steps and
+-- not the ones I recorded?".
+--
+-- Apply:  TARGET=local ./scripts/db.sh -f db/05-flow-corrections.sql
+--         TARGET=cloud ./scripts/db.sh -f db/05-flow-corrections.sql
+--
+-- Safe to re-run.
+
+ALTER TABLE flows ADD COLUMN IF NOT EXISTS corrections JSONB NOT NULL DEFAULT '[]';

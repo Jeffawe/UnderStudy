@@ -30,6 +30,7 @@ import type pg from 'pg';
 import { tx } from './db.js';
 import type { CapturedSignal, ReplayResult } from './replay.js';
 import { detectDrift, recordDrift, type Drift } from './drift.js';
+import { rollUpSelectorHealth, type HealthRollup } from './health.js';
 
 export interface RecordRunOptions {
   appId: string;
@@ -50,6 +51,8 @@ export interface RecordRunResult {
   edges: number;
   /** Path comparison against previous runs of the same goal. */
   drift?: Drift;
+  /** Selector health after this run's outcomes were folded in. */
+  health?: HealthRollup;
 }
 
 /** A finding before it meets the database. */
@@ -100,6 +103,16 @@ const fingerprint = (parts: unknown[]) =>
 export function extractFindings(result: ReplayResult, goal: string): FindingDraft[] {
   const drafts = new Map<string, FindingDraft>();
 
+  // A lesson of kind `ignore` says: signals during this step are known, expected
+  // and not defects. This is the payoff of promoting a finding to a lesson — the
+  // observation stops being re-reported as a problem on every single run, which
+  // is what "the same observation is a lesson if you accept it" actually buys.
+  const ignoredSteps = new Set(
+    result.steps
+      .filter((s) => s.lessonsApplied?.some((l) => l.kind === 'ignore'))
+      .map((s) => s.seq),
+  );
+
   const add = (d: FindingDraft) => {
     // Within one run the same defect can fire repeatedly; it is still one
     // finding. Cross-run accumulation happens in the database.
@@ -107,6 +120,7 @@ export function extractFindings(result: ReplayResult, goal: string): FindingDraf
   };
 
   for (const s of result.signals as CapturedSignal[]) {
+    if (ignoredSteps.has(s.duringStep)) continue;
     if (s.kind === 'http' && (s.status ?? 0) >= 400) {
       const route = routeOf(s.url);
       add({
@@ -313,5 +327,10 @@ export async function recordRun(
   });
 
   if (drift.changed) await recordDrift(opts.appId, drift, outcome.runId);
-  return { ...outcome, drift };
+
+  // Fold this run's per-step outcomes into each selector's health, and
+  // quarantine anything that has only ever failed.
+  const health = await rollUpSelectorHealth(opts.appId, outcome.runId);
+
+  return { ...outcome, drift, health };
 }

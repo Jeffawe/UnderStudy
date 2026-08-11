@@ -31,16 +31,7 @@ import type { Embedder } from './types.js';
 import type { RawEvent, RawRecording } from './recording.js';
 import type { ReplayResult, StepOutcome } from './replay.js';
 import { loadDistilled, type Distilled } from './distill.js';
-
-/**
- * Commit-shaped words, shared in spirit with exploration's refusal list.
- *
- * Destructive marking is INFERENCE-ONLY and FAILS OPEN: no signal means not
- * destructive, and no question is ever asked. This covers the first of the
- * plan's five signals — "a commit-shaped control was clicked".
- */
-const COMMIT_WORDS =
-  /\b(pay|purchase|buy|order|checkout|confirm|delete|remove account|reset|deactivate|destroy|publish|subscribe|charge)\b/i;
+import { judgeStep, loadDestructiveContext, propagateDestructive } from './destructive.js';
 
 export interface IngestResult {
   flowId: string;
@@ -56,6 +47,8 @@ export interface IngestResult {
   segments: number;
   /** Candidate lessons persisted. */
   lessons: number;
+  /** Distillation corrections recorded against the flow. */
+  corrections: number;
   /** Step ids in ordinal order — lets the caller record a run against them. */
   stepIds: string[];
   /** Selector per step, parallel to stepIds. */
@@ -171,7 +164,6 @@ export async function ingestRecording(
   // would otherwise contribute steps that were never proven to work.
   const events = recording.events.filter((e) => outcomeBySeq.get(e.seq)?.ok);
 
-  const destructive = events.some((e) => COMMIT_WORDS.test(e.name ?? ''));
   const slug = slugFor(recording);
   const semantics = events.map(semanticFor);
 
@@ -221,14 +213,16 @@ export async function ingestRecording(
       [appId, recording.hash],
     );
 
+    const destructiveContext = await loadDestructiveContext(client, appId);
+
     let flowId: string;
     const created = existing.length === 0;
 
     if (created) {
       const { rows } = await client.query<{ flow_id: string }>(
         `INSERT INTO flows (app_id, slug, title, intent, outcome, start_state, end_state,
-                            source, destructive, needs_review, recording_hash)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'recorded',$8,$9,$10)
+                            source, destructive, needs_review, recording_hash, corrections)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'recorded',$8,$9,$10,$11)
          RETURNING flow_id`,
         [
           appId,
@@ -238,9 +232,10 @@ export async function ingestRecording(
           replayResult.sigSequence[replayResult.sigSequence.length - 1] ?? null,
           replayResult.sigSequence[0] ?? null,
           replayResult.sigSequence[replayResult.sigSequence.length - 1] ?? null,
-          destructive,
+          false, // set by propagateDestructive once the steps exist
           needsReview,
           recording.hash,
+          JSON.stringify(distilled?.corrections ?? []),
         ],
       );
       flowId = rows[0]!.flow_id;
@@ -249,17 +244,19 @@ export async function ingestRecording(
       await client.query(
         `UPDATE flows SET intent = $2, start_state = $3, end_state = $4,
                           destructive = $5, needs_review = $6, updated_at = now(),
-                          title = coalesce($7, title), preconditions = $8
+                          title = coalesce($7, title), preconditions = $8,
+                          corrections = $9
          WHERE flow_id = $1`,
         [
           flowId,
           chunkText,
           replayResult.sigSequence[0] ?? null,
           replayResult.sigSequence[replayResult.sigSequence.length - 1] ?? null,
-          destructive,
+          false, // set by propagateDestructive once the steps exist
           needsReview,
           distilled?.intent ?? null,
           JSON.stringify(distilled?.preconditions ?? []),
+          JSON.stringify(distilled?.corrections ?? []),
         ],
       );
       // Membership is rebuilt from scratch. The step ROWS are then garbage
@@ -355,10 +352,18 @@ export async function ingestRecording(
         selectorId = sel[0]!.selector_id;
       }
 
+      const fp = stepFingerprint(event);
+      // All five signals, evaluated per STEP. Marking the step rather than the
+      // flow is what propagates to every segment and macro sharing this row.
+      const verdict = judgeStep(
+        { action: event.action, name: event.name, url: event.url, fingerprint: fp },
+        destructiveContext,
+      );
+
       const { rows: stepRows } = await client.query<{ step_id: string }>(
         `INSERT INTO steps (app_id, action, selector_id, value_ref, args, semantic,
-                            state_after, fingerprint)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                            state_after, fingerprint, destructive, destructive_signal)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
          RETURNING step_id`,
         [
           appId,
@@ -370,11 +375,18 @@ export async function ingestRecording(
           JSON.stringify({
             ...(event.value !== undefined ? { value: event.value } : {}),
             ...(event.exact ? { exact: true } : {}),
+            // Which attribute the test id came from. Dropped here originally,
+            // so anything reading it back defaulted to `data-testid` — and
+            // saucedemo uses `data-test`. Same bug the executor hit once
+            // already; losing it at ingest just moved it downstream.
+            ...(event.testIdAttr ? { testIdAttr: event.testIdAttr } : {}),
             ...(event.hints ?? {}),
           }),
           semantics[ordinal]!,
           outcome?.sig ?? null,
-          stepFingerprint(event),
+          fp,
+          verdict.destructive,
+          verdict.signal,
         ],
       );
 
@@ -402,9 +414,6 @@ export async function ingestRecording(
         const slice = stepIds.slice(start, end);
         if (!slice.length) continue;
 
-        const segDestructive = events
-          .slice(start, end)
-          .some((e) => COMMIT_WORDS.test(e.name ?? ''));
 
         const { rows: segRows } = await client.query<{ flow_id: string }>(
           `INSERT INTO flows (app_id, slug, title, intent, preconditions, outcome,
@@ -434,7 +443,7 @@ export async function ingestRecording(
               : (outcomeBySeq.get(events[start - 1]!.seq)?.sig ?? null),
             outcomeBySeq.get(events[end - 1]!.seq)?.sig ?? null,
             flowId,
-            segDestructive,
+            false, // derived from its steps, like every other flow
             recording.hash,
           ],
         );
@@ -463,7 +472,7 @@ export async function ingestRecording(
               segId,
               segText,
               JSON.stringify({ source: 'sliced', parent: flowId, steps: slice.length }),
-              segDestructive,
+              false,
               toVector(segVector),
             ],
           );
@@ -488,7 +497,7 @@ export async function ingestRecording(
           flowId,
           chunkText,
           JSON.stringify({ source: 'recorded', recording_hash: recording.hash, steps: events.length }),
-          destructive,
+          false, // propagateDestructive syncs this from the flow afterwards
           toVector(vector),
         ],
       );
@@ -529,7 +538,20 @@ export async function ingestRecording(
       }
     }
 
-    return { flowId, created, chunkWritten, segmentCount, lessonCount, stepIds, stepSelectorIds };
+    // Derive destructive for every flow from the steps it now contains. This is
+    // the propagation: parent, segments and macros all reference the same rows,
+    // so none of them can be labelled differently from the others.
+    await propagateDestructive(client, appId);
+
+    const { rows: destRows } = await client.query<{ destructive: boolean }>(
+      'SELECT destructive FROM flows WHERE flow_id = $1',
+      [flowId],
+    );
+
+    return {
+      flowId, created, chunkWritten, segmentCount, lessonCount, stepIds, stepSelectorIds,
+      destructive: destRows[0]?.destructive ?? false,
+    };
   });
 
   return {
@@ -540,11 +562,12 @@ export async function ingestRecording(
     selectorsCreated,
     selectorsReused,
     needsReview,
-    destructive,
+    destructive: result.destructive,
     chunkWritten: result.chunkWritten,
     segments: result.segmentCount,
     distilled: Boolean(distilled),
     lessons: result.lessonCount,
+    corrections: distilled?.corrections?.length ?? 0,
     stepIds: result.stepIds,
     selectorIds: result.stepSelectorIds,
     appId,

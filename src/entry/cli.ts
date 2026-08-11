@@ -31,6 +31,8 @@ import { fetchVocabulary } from '../core/vocabulary.js';
 import { recordRun } from '../core/run.js';
 import { mineMacros } from '../core/macros.js';
 import { buildPlan } from '../core/plan.js';
+import { emitFlow, type Framework } from '../core/emit.js';
+import { listOpenFindings, suppressThirdParty, triageSummary } from '../core/triage.js';
 import { executePlan } from '../core/execute.js';
 import { writeFile, readFile, mkdir } from 'node:fs/promises';
 
@@ -49,6 +51,9 @@ COMMANDS
   ingest <hash>         replay, then write the flow into memory
   distill <hash>        ask for intent + segments; --save <file> to answer
   mine <slug>           find step blocks that recur across recorded flows
+  flows <slug>          list what this app knows how to do
+  findings <slug>       what looks wrong, filtered and ranked
+  emit <slug> <flow>    print a flow as runnable test code
   test <slug> <goal>    plan and execute a goal against an app
 
 GLOBAL
@@ -87,6 +92,14 @@ TEST
   --allow-purchases     permit a destructive plan (default: refuse)
   --value REF=value     as for replay
   --headed              watch it run
+
+FINDINGS
+  --no-filter           keep findings from other origins
+  --all                 include already-triaged findings
+
+EMIT
+  --framework <name>    playwright-ts (default) | cypress-js
+  --out <file>          write instead of printing
 
 RECALL
   --kinds <a,b>         restrict to chunk kinds (segment, fact, lesson, …)
@@ -585,16 +598,19 @@ async function cmdTest(positional: string[], flags: Flags) {
   }
   if (plan.seams.length) console.log('');
 
-  if (plan.unbound.length) {
-    console.log(`NOT RUNNABLE — ${plan.unbound.length} sub-goal(s) bound to nothing.`);
-    console.log('  this is the gap loop: record a flow for it, then try again.');
-    process.exitCode = 4;
-    return;
-  }
+  // BLOCKED is checked first: "I know how and I am not allowed" is a more
+  // specific and more useful answer than "I could not bind anything", and a
+  // safety refusal leaves the sub-goal unbound as a side effect.
   if (plan.blocked) {
     console.log(`BLOCKED — ${plan.blocked}`);
     console.log('  re-run with --allow-purchases only if that is genuinely safe here.');
     process.exitCode = 5;
+    return;
+  }
+  if (plan.unbound.length) {
+    console.log(`NOT RUNNABLE — ${plan.unbound.length} sub-goal(s) bound to nothing.`);
+    console.log('  this is the gap loop: record a flow for it, then try again.');
+    process.exitCode = 4;
     return;
   }
 
@@ -619,6 +635,13 @@ async function cmdTest(positional: string[], flags: Flags) {
 
   const run = await recordRun(exec.result, { appId, goal, mode: 'execute' });
   console.log(`  findings ${run.findingsNew} new, ${run.findingsSeenAgain} seen before`);
+  if (run.health?.quarantined.length) {
+    console.log(`  QUARANTINED ${run.health.quarantined.length} selector(s): ${run.health.quarantined.join(', ')}`);
+    console.log('              3+ failures and no successes — dropped from recall until one works');
+  }
+  if (run.health?.released.length) {
+    console.log(`  released ${run.health.released.length} selector(s): ${run.health.released.join(', ')}`);
+  }
 
   const d = run.drift;
   if (d?.firstRun) {
@@ -636,6 +659,91 @@ async function cmdTest(positional: string[], flags: Flags) {
     console.log(`  drift    none (matches the last ${d.baselineRuns} passing run(s))`);
   }
   if (!exec.result.ok) process.exitCode = 1;
+}
+
+async function cmdEmit(positional: string[], flags: Flags) {
+  const slug = positional[0] ?? fail('emit needs an app slug', 'understudy emit saucedemo log-in-as-standard-user');
+  const flowSlug = positional[1] ?? fail('emit needs a flow slug', 'understudy flows <slug> to list them');
+
+  const framework = (str(flags.get('framework')) ?? 'playwright-ts') as Framework;
+  if (framework !== 'playwright-ts' && framework !== 'cypress-js') {
+    fail(`unknown framework '${framework}'`, 'playwright-ts | cypress-js');
+  }
+
+  const out = await emitFlow(slug, flowSlug, framework);
+
+  const target = str(flags.get('out'));
+  if (target) {
+    await writeFile(target, out.code, 'utf8');
+    console.log(`wrote ${target}`);
+  } else {
+    console.log(out.code);
+  }
+
+  if (out.requiredValues.length) {
+    console.log(`\nthis test needs values it deliberately does not contain:`);
+    for (const r of out.requiredValues) {
+      console.log(`  export ${r.replace(/[^a-zA-Z0-9]+/g, '_').toUpperCase()}=…   (${r})`);
+    }
+  }
+  if (out.warnings.length) {
+    console.log(`\n${out.warnings.length} warning(s):`);
+    for (const w of out.warnings) console.log(`  ${w}`);
+  }
+}
+
+async function cmdFlows(positional: string[]) {
+  const slug = positional[0] ?? fail('flows needs an app slug');
+  const appId = await appIdOrFail(slug);
+  const { rows } = await getPool().query<{
+    slug: string; source: string; steps: string; destructive: boolean; needs_review: boolean; corrections: unknown[];
+  }>(
+    `SELECT f.slug, f.source, f.destructive, f.needs_review, f.corrections,
+            (SELECT count(*) FROM flow_steps fs WHERE fs.flow_id = f.flow_id)::STRING AS steps
+     FROM flows f WHERE f.app_id = $1 ORDER BY f.source, f.slug`,
+    [appId],
+  );
+  for (const r of rows) {
+    const marks = [
+      r.destructive ? 'DESTRUCTIVE' : '',
+      r.needs_review ? 'needs_review' : '',
+      Array.isArray(r.corrections) && r.corrections.length ? `${r.corrections.length} correction(s)` : '',
+    ].filter(Boolean).join(' ');
+    console.log(`  ${r.source.padEnd(8)} ${r.slug.padEnd(46)} ${String(r.steps).padStart(2)} steps  ${marks}`);
+  }
+}
+
+async function cmdFindings(positional: string[], flags: Flags) {
+  const slug = positional[0] ?? fail('findings needs an app slug');
+  const appId = await appIdOrFail(slug);
+
+  // Mechanical filter first. Asking a model whether someone else's telemetry
+  // endpoint is our bug wastes a call and the reader's attention.
+  if (!flags.has('no-filter')) {
+    const filtered = await suppressThirdParty(appId);
+    if (filtered.suppressed) {
+      console.log(`suppressed ${filtered.suppressed} finding(s) from other origins: ${filtered.hosts.join(', ')}`);
+      console.log('  (these never touched the app under test — --no-filter to keep them)\n');
+    }
+  }
+
+  const findings = await listOpenFindings(appId, {
+    ...(flags.has('all') ? { includeSuppressed: true } : {}),
+  });
+
+  if (!findings.length) {
+    console.log('no open findings');
+  }
+  for (const f of findings) {
+    console.log(`${f.severity.toUpperCase().padEnd(6)} ${f.kind.padEnd(14)} x${String(f.occurrences).padStart(3)}  ${f.findingId.slice(0, 8)}`);
+    console.log(`       ${f.statement.slice(0, 96)}`);
+    // The correlation with intent is the whole reason a finding is worth more
+    // than a log line.
+    if (f.goal) console.log(`       while: "${f.goal}"${f.duringStep !== undefined ? ` (step ${f.duringStep})` : ''}`);
+  }
+
+  const summary = await triageSummary(appId);
+  console.log(`\n${Object.entries(summary).map(([k, v]) => `${k}=${v}`).join('  ')}`);
 }
 
 async function cmdRecall(positional: string[], flags: Flags) {
@@ -725,6 +833,15 @@ async function main() {
       break;
     case 'test':
       await cmdTest(rest, flags);
+      break;
+    case 'findings':
+      await cmdFindings(rest, flags);
+      break;
+    case 'emit':
+      await cmdEmit(rest, flags);
+      break;
+    case 'flows':
+      await cmdFlows(rest);
       break;
     case 'mine':
       await cmdMine(rest);

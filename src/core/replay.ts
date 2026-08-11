@@ -23,7 +23,7 @@
  */
 
 import { chromium, type Browser, type Frame, type Locator, type Page } from 'playwright';
-import { computeSig, waitForAriaStable } from './sig.js';
+import { computeSig, urlPattern, waitForAriaStable } from './sig.js';
 import type { RawEvent, RawRecording } from './recording.js';
 import type { PendingDecision } from './types.js';
 
@@ -49,6 +49,8 @@ export interface StepOutcome {
    * judgement about what it means belongs to the reasoner.
    */
   unexpectedPage?: { expected: string; observed: string };
+  /** Lessons whose trigger matched this step, and therefore fired. */
+  lessonsApplied?: Array<{ lessonId: string; kind: string; title: string }>;
   /**
    * Set when role+name matched several elements and something more specific
    * had to disambiguate. Feeds `selectors.fragility` — a name that is not
@@ -112,6 +114,16 @@ export interface ReplayOptions {
    * which is right for a verification replay and wrong for a real test.
    */
   onDecision?: (decision: PendingDecision) => Promise<Record<string, unknown>>;
+  /**
+   * Lessons that apply to a step, looked up before it runs.
+   *
+   * A callback again, so replay does not need to know about the database or
+   * which app it is running. Omitted means lessons are not consulted — correct
+   * for verifying a raw recording, wrong for a real run.
+   */
+  lessonsFor?: (context: {
+    url_pattern?: string; action?: string; role?: string; name?: string;
+  }) => Promise<Array<{ lessonId: string; kind: string; title: string; body: string }>>;
 }
 
 /** What a decision may tell the executor to do. */
@@ -175,7 +187,10 @@ export async function replay(
   recording: RawRecording,
   opts: ReplayOptions = {},
 ): Promise<ReplayResult> {
-  const { values = {}, headless = true, timeoutMs = 10_000, captureBodies = true, onDecision } = opts;
+  const {
+    values = {}, headless = true, timeoutMs = 10_000, captureBodies = true,
+    onDecision, lessonsFor,
+  } = opts;
   const escalations: Escalation[] = [];
 
   const browser: Browser = await chromium.launch({ headless });
@@ -191,6 +206,8 @@ export async function replay(
   // the correlation between a signal and the intent that was executing when it
   // fired. A 500 is interesting; a 500 *during checkout* is a finding.
   let currentStep = -1;
+  /** Route of the page we are on, so a lesson can be scoped to one page. */
+  let lastPattern: string | undefined;
 
   page.on('console', (msg) => {
     if (msg.type() !== 'error' && msg.type() !== 'warning') return;
@@ -237,6 +254,35 @@ export async function replay(
     currentStep = event.seq;
     const stepStart = Date.now();
     const outcome: StepOutcome = { seq: event.seq, action: event.action, ok: false, durationMs: 0 };
+
+    // WHAT HAVE WE LEARNED ABOUT THIS STEP? Consulted BEFORE acting, because a
+    // lesson's whole purpose is "do Y first".
+    let applied: Array<{ lessonId: string; kind: string; title: string; body: string }> = [];
+    if (lessonsFor) {
+      // For a goto the relevant page is the one being navigated TO — there is
+      // no previous page on the first step, and a lesson about a landing page
+      // would never fire if we only ever looked backwards.
+      const contextPattern =
+        event.action === 'goto' && (event.value ?? event.url)
+          ? urlPattern(event.value ?? event.url)
+          : lastPattern;
+
+      applied = await lessonsFor({
+        ...(contextPattern ? { url_pattern: contextPattern } : {}),
+        action: event.action,
+        ...(event.role ? { role: event.role } : {}),
+        ...(event.name ? { name: event.name } : {}),
+      }).catch(() => []);
+
+      if (applied.length) {
+        outcome.lessonsApplied = applied.map((l) => ({ lessonId: l.lessonId, kind: l.kind, title: l.title }));
+      }
+      // A `wait` lesson exists because something on this page renders late.
+      // Settling before the action is the cheapest possible form of "do Y first".
+      if (applied.some((l) => l.kind === 'wait')) {
+        await waitForAriaStable(page, 2000).catch(() => {});
+      }
+    }
 
     try {
       if (event.action === 'goto') {
@@ -337,6 +383,7 @@ export async function replay(
       await waitForAriaStable(page, 1500);
       const sig = await computeSig(page);
       outcome.sig = sig.sig;
+      lastPattern = sig.urlPattern;
       if (sigSequence[sigSequence.length - 1] !== sig.sig) sigSequence.push(sig.sig);
 
       // AM I WHERE I EXPECTED TO BE?

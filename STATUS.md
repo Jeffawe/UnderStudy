@@ -614,10 +614,193 @@ Probing is the expensive rung; this is what makes "once per gap" true rather
 than aspirational. Omitting `onSeamProbe` leaves an unresolved seam unresolved,
 which **blocks execution** rather than guessing.
 
-**Not yet built:** Bedrock adapters (distiller + reasoner); findings triage (all
-sit at `status='open'`, nothing asks the reasoner whether they matter);
-`corrections` persistence; destructive inference signals 2–5; selector health
-rollup and quarantine; code emitters.
+**Corrections persisted — `db/05-flow-corrections.sql`, both targets.**
+`flows.corrections JSONB`. They went there and not elsewhere on purpose: not
+`findings` (a finding says the APP is wrong; a correction says the RECORDING was
+noisy — different subject, and mixing them puts recorder artefacts in front of
+someone triaging real defects), not `facts` (retrieved by meaning at planning
+time; "codegen emitted a redundant click" is not knowledge about the app and
+would only dilute retrieval), not `lessons` (a lesson has a trigger and fires
+during execution; a correction has already been applied). A correction is
+PROVENANCE for one flow's distillation. `understudy flows <slug>` surfaces the
+count.
+
+**Emitters built — `understudy emit <slug> <flow> [--framework]`.**
+This closes the loop the project rests on: recordings are DATA, and code is an
+OUTPUT format, never an input one.
+
+```ts
+test('Log in as a standard user', async ({ page }) => {
+  await page.goto('https://www.saucedemo.com');
+  await page.getByRole('textbox', { name: 'Username' }).fill('standard_user');
+  await page.getByRole('textbox', { name: 'Password' }).fill(SECRET_PASSWORD);
+  await page.getByRole('button', { name: 'Login' }).click();
+});
+```
+
+Two refusals built in:
+- **A `value_ref` is never inlined.** The recording deliberately never stored the
+  credential; printing it into a file someone will commit would undo that at the
+  last possible step. It emits `process.env.SECRET_PASSWORD` and tells you what
+  to export.
+- **A step it cannot address cleanly produces a WARNING**, not a
+  plausible-looking locator. Generated code that looks right and is subtly wrong
+  is worse than generated code that admits it. Cypress has no role engine, so
+  every role+name step it downgrades to a text match says so.
+
+**A bug the emitter exposed: `testIdAttr` was dropped at ingest.** Captured in
+the recording, never written to `steps.args` — so anything reading it back
+defaulted to `data-testid`, and saucedemo uses `data-test`. Cypress output
+(which prefers test ids) emitted selectors that would match nothing. The
+executor had the same latent hole via `execute.ts`; it only stayed hidden
+because role+name is tried first. Same family as the original `getByTestId` bug
+— losing the attribute at ingest just moved it downstream.
+
+**Findings triage built — `src/core/triage.ts`, `understudy findings <slug>`,
+plus `understudy_findings` / `understudy_triage_finding` over MCP.**
+
+The problem was concrete rather than theoretical: this corpus had **three of
+five findings being third-party analytics 401s at 29 occurrences**, while the
+one arguably real observation sat at 1. Noise was outvoting signal, and nothing
+ever moved a finding off `open`.
+
+**MECHANICAL FIRST, JUDGEMENT SECOND.** A finding whose request went to a
+different origin than the app under test is almost certainly not about the app —
+that is a filter, not a judgement, and asking a model whether someone else's
+telemetry endpoint is our bug wastes a call and the reader's attention. The
+origin filter suppressed both `events.backtrace.io` findings for free.
+
+It is deliberately conservative: only findings with a URL in evidence, only when
+it parses, only when the origin genuinely differs. **A suppressed real defect is
+far worse than a surviving piece of noise.** The console-error twin of those
+same 401s survived, because console messages carry no URL — honest, and exactly
+the case where judgement is needed.
+
+**`promoted_to` is now live**, which is the part that changes future behaviour:
+
+```
+finding  "Failed to load resource: 401"  (29x)
+   -> triaged_lesson
+   -> lesson "Telemetry 401s on load are not app failures"
+              trigger { url_pattern: "/", action: "goto" }   source=promoted_finding
+```
+
+That is PLAN.md's distinction working: *the same observation is a lesson if you
+accept it and a finding if you don't.* Without that path a finding could only
+ever be a complaint, and the agent would rediscover the same problem forever.
+
+Every disposition records **who decided and why** in `evidence.triage`, so
+`origin-filter` and `reasoner` decisions are distinguishable after the fact:
+
+```
+triaged_lesson  reasoner       third-party telemetry 401s on every page load…
+wontfix         origin-filter  request went to a different origin than the app…
+wontfix         reasoner       artefact of a deliberately corrupted expected sig…
+```
+
+Summary went `open=5` → `open=1, triaged_lesson=1, wontfix=3`.
+
+**`lessons_for` wired — `src/core/lessons.ts`. The learning loop now closes.**
+Lessons were written by the distiller and promoted from findings and then never
+once read: the difference between recording that you learned something and
+acting on it.
+
+**Matched by EXACT trigger predicate, never by similarity** — which is why the
+trigger is structured JSON and not prose. A lesson that fired approximately
+would be worse than no lesson, because it would change behaviour on steps it
+was never about. Implemented as JSONB containment in SQL (`$context @>
+trigger`), so an absent key is a wildcard and a lesson is exactly as broad as
+whoever wrote it made it:
+
+```
+goto /                                 -> ignore
+click Add to cart on /inventory.html   -> wait
+click Login on /                       -> none
+click Add to cart on the WRONG page    -> none      <- scoping holds
+```
+
+**A `goto` looks FORWARD, not back.** The relevant page for a navigation is the
+one being navigated *to*; on step 0 there is no previous page at all, so a
+lesson about a landing page would never have fired if context only looked
+backwards.
+
+**The payoff is measurable.** Every previous run reported `findings 0 new, 3
+seen before` as those telemetry 401s re-incremented. With the promoted lesson
+active: **`findings 0 new, 0 seen before`**, and `console_error` stayed at 29
+instead of climbing. That is what "the same observation is a lesson if you
+accept it" actually buys — the thing stops being re-reported as a defect on
+every single run.
+
+`times_applied` / `times_helped` are tracked per firing, because a lesson that
+fires constantly and never helps is noise with a trigger attached, and only the
+ratio shows that.
+
+**All five destructive signals + the routing hole closed —
+`src/core/destructive.ts`, `db/06-step-destructive.sql`, both targets.**
+
+**The fix was structural, not more signals.** Destructiveness now lives on the
+STEP. Segments share their parent's step rows through `flow_steps`, so marking
+the step propagates in every direction for free — parent, segment, and any mined
+macro containing it. Verified: marking ONE step marked both its recorded parent
+and the segment cut from it, and synced `memory_chunks`.
+
+Signal 4 (fingerprint match) closes the last gap — an equivalent step captured
+in a *different* recording gets marked on next ingest:
+
+```
+"Click the button Add to cart"  t  commit-shaped control
+"Click the button Add to cart"  t  fingerprint matches an already-destructive step
+```
+
+### THE PENALTY WAS ROUTING AROUND THE GATE — three compounding bugs
+
+1. **A soft penalty cannot express "forbidden".** `recall()` adds +0.50 to
+   destructive chunks when spend is disallowed. That re-orders; it does not
+   refuse. Asked to add an item to the cart with the cart step destructive, the
+   planner bound a mined macro **that does not touch the cart at all** — a plan
+   that would have run cleanly and not done what was asked.
+2. **The penalty hid the candidate from the filter.** Penalised, the correct
+   segment (0.4124) sorted *behind* the unrelated macro (0.8936 → score 0.7186
+   vs 0.7225), so binding took the macro before ever reaching the candidate it
+   was supposed to refuse. The penalty and the hard filter were fighting.
+   **Retrieval now ranks by MEANING and binding applies POLICY** — the planner
+   deliberately does not pass `allowsSpend` to `recall()`.
+3. **A far-worse fallback is not an alternative.** After a safety refusal,
+   binding only accepts a candidate within `FALLBACK_MARGIN` (0.12) of the
+   refused one. Beyond that it is a different intent, and the honest answer is
+   blocked.
+
+Result — and `BLOCKED` is now checked before `unbound`, because "I know how and
+I am not allowed" is more useful than "I could not bind anything":
+
+```
+reject 0.7355 …e4f3fd  destructive, and (none configured) does not allow purchases
+reject 0.8936 macro    too far from the refused candidate (0.4124) to be the same intent
+BLOCKED — 1 sub-goal(s) can only be achieved destructively…          exit 5
+--allow-purchases -> EXECUTED, PASSED
+```
+
+**Selector health + quarantine built — `src/core/health.ts`.**
+`recall()` has excluded quarantined selectors since it was written; nothing
+could ever set the flag. Now each run folds its `run_events` outcomes into the
+per-element counts.
+
+Health is a **smoothed** rate `(s+1)/(s+f+2)`, not raw `s/(s+f)`: with one
+observation the raw ratio is 0 or 1, so a single flake would look identical to a
+permanently broken element.
+
+Quarantine is deliberately strict — **≥3 failures AND zero successes** — because
+quarantining removes an element from retrieval entirely. One success proves it
+can work. Verified both directions:
+
+```
+Ghost Button  s=0 f=3  health=0.200  quarantined=true    <- only ever failed
+Flaky Button  s=1 f=5  health=0.250  quarantined=false   <- flaky, not dead
+Ghost Button  s=1 f=3  health=0.333  quarantined=false   <- released once it worked
+```
+
+**Not yet built:** Bedrock adapters (distiller + reasoner) — everything else on
+the original plan is in.
 
 **CLI built — `src/entry/cli.ts`, dependency-free arg parsing.**
 `understudy explore <slug>` · `recall <slug> <goal>` · `record` / `test` (both

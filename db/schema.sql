@@ -76,6 +76,10 @@ CREATE TABLE IF NOT EXISTS flows (
   cost_note     STRING,
   needs_review  BOOL NOT NULL DEFAULT false,     -- replay failed; never promoted
   recording_hash STRING,                          -- distillation cache key
+  -- What the distiller judged wrong or redundant in the raw recording, and why.
+  -- Provenance for THIS flow's distillation — not a finding (the app is fine)
+  -- and not a fact (it is not knowledge about the app). See db/05.
+  corrections   JSONB NOT NULL DEFAULT '[]',
   used_by       INT NOT NULL DEFAULT 0,           -- flows containing this macro
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -133,6 +137,11 @@ CREATE TABLE IF NOT EXISTS steps (
   semantic    STRING NOT NULL,             -- THIS is what gets embedded
   state_after STRING,                      -- sig() after this step
   fingerprint STRING NOT NULL,             -- sha1(action|role|name|url_pattern) — macro mining
+  -- Destructiveness lives on the STEP so it propagates: segments and mined
+  -- macros share these rows, so none of them can be labelled differently from
+  -- the flow they came from. Inference-only, fails open. See db/06.
+  destructive BOOL NOT NULL DEFAULT false,
+  destructive_signal STRING,               -- which of the five signals fired
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   INDEX steps_fingerprint_idx (app_id, fingerprint),
   INDEX steps_selector_idx (selector_id)
