@@ -111,6 +111,18 @@ export interface PlanOptions {
  */
 const STATE_PREDICATES = ['authenticated'];
 
+/**
+ * How much worse than the best candidate a fallback may be.
+ *
+ * When the closest match is refused on SAFETY grounds, the next legal candidate
+ * is only a real alternative if it means roughly the same thing. Observed: with
+ * the cart step marked destructive, "put an item into the cart" fell through
+ * from a 0.4124 match to a 0.8936 mined macro that does not touch the cart —
+ * a plan that silently did not do what was asked. Anything beyond this margin
+ * is a different intent, and the honest answer there is "blocked".
+ */
+const FALLBACK_MARGIN = 0.12;
+
 /** Fold a flow's outcome into what is now true. */
 function applyOutcome(satisfied: Set<string>, outcome: string | null | undefined): void {
   if (!outcome) return;
@@ -203,13 +215,21 @@ export async function buildPlan(
   let previous: BoundStep | undefined;
 
   for (const subGoal of subGoals) {
-    const result = await recall(embedder, appId, subGoal, {
-      limit,
-      allowsSpend: env.allowsPurchases,
-    });
+    // NO destructive penalty here, deliberately. recall() can add +0.50 to
+    // destructive chunks when spend is disallowed, but that RE-ORDERS rather
+    // than forbids — and it fought the hard filter below: the correct segment
+    // (0.4124) sorted behind an unrelated macro (0.8936) once penalised, so
+    // binding took the macro before ever reaching the candidate it was meant to
+    // refuse.
+    //
+    // Retrieval ranks by MEANING; binding applies POLICY. Keeping them separate
+    // is what lets a refusal be a refusal instead of a nudge.
+    const result = await recall(embedder, appId, subGoal, { limit });
 
     const rejected: SubGoalPlan['rejected'] = [];
     let bound: BoundStep | undefined;
+    /** Distance of the closest candidate refused for being destructive. */
+    let refusedBest: number | undefined;
 
     for (const candidate of result.bindable) {
       const { rows } = await pool.query<FlowMeta>(
@@ -222,6 +242,41 @@ export async function buildPlan(
       if (!meta) continue;
 
       const preconditions = Array.isArray(meta.preconditions) ? meta.preconditions : [];
+
+      // DESTRUCTIVE IS A HARD FILTER, NOT A PENALTY.
+      //
+      // recall() adds +0.50 to destructive chunks when spend is disallowed,
+      // which sorts them down — but sorting down is not forbidding. Observed:
+      // asked to add an item to the cart with the cart step marked destructive,
+      // the planner bound a mined macro that does not touch the cart at all,
+      // because it merely scored better. A soft signal produced a plan that
+      // silently did not do what was asked.
+      //
+      // If the only way to achieve a sub-goal is destructive and the
+      // environment forbids it, the honest answer is "blocked", never
+      // "here is something else".
+      if (meta.destructive && !env.allowsPurchases) {
+        rejected.push({
+          slug: meta.slug,
+          distance: candidate.distance,
+          why: `destructive, and ${env.name ?? 'this environment'} does not allow purchases`,
+        });
+        refusedBest ??= candidate.distance;
+        continue;
+      }
+
+      // A fallback far worse than the refused candidate is not an alternative
+      // way to do the same thing; it is a different thing that happens to be
+      // allowed. Substituting it would produce a plan that runs cleanly and
+      // does not achieve the goal — the worst possible outcome.
+      if (refusedBest !== undefined && candidate.distance - refusedBest > FALLBACK_MARGIN) {
+        rejected.push({
+          slug: meta.slug,
+          distance: candidate.distance,
+          why: `too far from the refused candidate (${refusedBest.toFixed(4)}) to be the same intent`,
+        });
+        continue;
+      }
 
       const clash = contradicts(satisfied, preconditions);
       if (clash) {
@@ -314,6 +369,19 @@ export async function buildPlan(
   if (destructive && !env.allowsPurchases) {
     const which = plans.filter((p) => p.bound?.destructive).map((p) => p.bound!.slug);
     blocked = `plan is destructive (${which.join(', ')}) and environment ${env.name ?? ''} does not allow purchases`;
+  } else {
+    // A sub-goal whose only candidates were refused for being destructive is
+    // BLOCKED, not merely unbound — the difference between "I don't know how"
+    // and "I know how and I am not allowed to" matters to whoever reads it.
+    const forbidden = plans.filter(
+      (p) => !p.bound && p.rejected.some((r) => r.why.includes('does not allow purchases')),
+    );
+    if (forbidden.length) {
+      blocked =
+        `${forbidden.length} sub-goal(s) can only be achieved destructively, and ` +
+        `${env.name ?? 'this environment'} does not allow purchases: ` +
+        forbidden.map((p) => `"${p.subGoal}"`).join(', ');
+    }
   }
 
   return {

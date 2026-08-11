@@ -36,6 +36,7 @@ import { buildDistillRequest, validateDistilled, saveDistilled, loadDistilled } 
 import { fetchVocabulary } from '../core/vocabulary.js';
 import { recall, isGap, GAP_DISTANCE } from '../core/recall.js';
 import { startRun, resumeRun, type RunStep } from '../core/session.js';
+import { listOpenFindings, suppressThirdParty, applyTriage, triageSummary } from '../core/triage.js';
 
 const json = (value: unknown) => ({
   content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
@@ -217,6 +218,92 @@ server.registerTool(
     const appId = await appIdFor(appSlug);
     if (!appId) return fail(`unknown app '${appSlug}'`);
     return json(await fetchVocabulary(appId));
+  },
+);
+
+server.registerTool(
+  'understudy_findings',
+  {
+    title: 'What looks wrong',
+    description:
+      'Open findings, ranked. Detection already happened mechanically on every run — console errors, ' +
+      'non-2xx bodies, failed requests, values that did not survive, flow drift. What is missing is ' +
+      'JUDGEMENT: whether each one matters. `goal` tells you which intent was executing when it fired, ' +
+      'which is the difference between a 500 and a 500 during checkout.',
+    inputSchema: {
+      appSlug: z.string(),
+      filterThirdParty: z.boolean().optional().describe('suppress other origins first (default true)'),
+      includeTriaged: z.boolean().optional(),
+    },
+  },
+  async ({ appSlug, filterThirdParty, includeTriaged }) => {
+    const appId = await appIdFor(appSlug);
+    if (!appId) return fail(`unknown app '${appSlug}'`);
+
+    const filtered = filterThirdParty === false ? { suppressed: 0, hosts: [] } : await suppressThirdParty(appId);
+    const findings = await listOpenFindings(appId, {
+      ...(includeTriaged ? { includeSuppressed: true } : {}),
+    });
+
+    return json({
+      autoSuppressed: filtered,
+      summary: await triageSummary(appId),
+      findings,
+      triageWith: 'understudy_triage_finding',
+      note:
+        'A finding is "X is wrong" and the APP gets fixed. A lesson is "when X, do Y first" and the ' +
+        'AGENT adapts. The same observation is one or the other depending on whether you accept it.',
+    });
+  },
+);
+
+server.registerTool(
+  'understudy_triage_finding',
+  {
+    title: 'Decide what a finding means',
+    description:
+      'Route a finding. `triaged_lesson` is the one that changes future behaviour: it writes a real ' +
+      'lesson, linked back through promoted_to, so the agent routes AROUND the problem next time ' +
+      'instead of rediscovering it. `triaged_issue` means the app should be fixed. `wontfix` means it ' +
+      'is noise.',
+    inputSchema: {
+      appSlug: z.string(),
+      findingId: z.string(),
+      disposition: z.enum(['triaged_lesson', 'triaged_issue', 'wontfix', 'fixed']),
+      reason: z.string().describe('why — recorded on the finding'),
+      lesson: z
+        .object({
+          kind: z.string(),
+          title: z.string(),
+          body: z.string(),
+          trigger: z.record(z.string(), z.unknown()).describe('matched EXACTLY at execution: url_pattern, action, role, name'),
+        })
+        .optional()
+        .describe('required for triaged_lesson — what should the agent do instead?'),
+      externalRef: z.string().optional().describe('issue URL, once filed'),
+    },
+  },
+  async ({ appSlug, findingId, disposition, reason, lesson, externalRef }) => {
+    const appId = await appIdFor(appSlug);
+    if (!appId) return fail(`unknown app '${appSlug}'`);
+    try {
+      const out = await applyTriage(appId, findingId, {
+        disposition,
+        reason,
+        ...(lesson ? { lesson: lesson as NonNullable<Parameters<typeof applyTriage>[2]['lesson']> } : {}),
+        ...(externalRef ? { externalRef } : {}),
+      });
+      // `out.status` is the disposition, not a tool status — name them apart
+      // rather than letting one silently overwrite the other.
+      return json({
+        result: 'triaged',
+        disposition: out.status,
+        ...(out.lessonId ? { lessonId: out.lessonId } : {}),
+        summary: await triageSummary(appId),
+      });
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
   },
 );
 
