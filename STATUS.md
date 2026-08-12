@@ -799,8 +799,33 @@ Flaky Button  s=1 f=5  health=0.250  quarantined=false   <- flaky, not dead
 Ghost Button  s=1 f=3  health=0.333  quarantined=false   <- released once it worked
 ```
 
-**Not yet built:** Bedrock adapters (distiller + reasoner) — everything else on
-the original plan is in.
+**Bedrock adapters written, unverified — `src/adapters/bedrock/`,
+`distiller/bedrock.ts`, `reasoner/bedrock.ts`, `embedder/bedrock.ts`.**
+Mode A now has a distiller (Haiku 4.5, structured outputs, re-prompted with
+`validateDistilled`'s own errors on failure — up to 3 attempts), a reasoner
+(Sonnet 5: `decompose`, plus `seam` and `unexpected_page` judgements), and an
+optional Titan embedder. Everything typechecks; **nothing has made a real call**,
+because model access is still pending. `npm run bedrock:check` is the one
+command that answers "has it landed?" — three probes, no database, no browser.
+
+Two things fell out of writing them:
+
+- **`Distiller` in `core/types.ts` was stale.** It read
+  `distill(recording: string, context: string) => DistilledFlow`, where
+  `DistilledFlow` carried `steps[]` — i.e. the model re-emitting the actions,
+  which `distill.ts` explicitly forbids ("the model annotates; it does not
+  author steps"). Nothing implemented or consumed it, so it was dead code
+  pointing at a superseded design. Now `DistillRequest -> Distilled`, matching
+  the handshake that actually ships.
+- **The pipeline was trapped inside Mode B.** `decompose -> buildPlan ->
+  executePlan` lived in a closure inside `startRun`, wrapped in suspension
+  machinery only MCP needs. Extracted to `runPipeline()`; `startRun` races it,
+  Mode A awaits it. Same body, no behaviour change — the deterministic CLI
+  regression is byte-identical.
+
+**`understudy test <app> "<goal>" --reasoner bedrock`** is the Mode A entry
+point. Without the flag the CLI never calls a model, so the deterministic path
+stays exactly as it was.
 
 **CLI built — `src/entry/cli.ts`, dependency-free arg parsing.**
 `understudy explore <slug>` · `recall <slug> <goal>` · `record` / `test` (both
@@ -937,7 +962,9 @@ insufficient.
 - **`sharp` CVEs** (high, no fix available) come in transitively via `@huggingface/transformers` for *image* preprocessing. We only embed text, so the path never executes. Revisit before publishing the package.
 - **Index recommendation not taken.** CockroachDB suggested `CREATE INDEX ON memory_chunks (app_id) STORING (text, embedding)` to skip the lookup join after the ANN scan. Deliberately deferred — it duplicates every 1024-dim vector and there's no data yet to measure against. Regular indexes can be added later without the vector-index backfill problem.
 - **Oracle ARM Playwright check** still unrun (`npx playwright install --with-deps chromium` on `129.213.113.8`).
-- **Bedrock model access** still pending — blocks Mode A's distiller and reasoner, blocks nothing in Mode B.
+- **Bedrock model access** still pending — the adapters are written but have never made a real call. Enable `anthropic.claude-haiku-4-5` and `anthropic.claude-sonnet-5` (and `amazon.titan-embed-text-v2:0` only if you want the Titan embedder) in the Bedrock console for `AWS_REGION`, add credentials to `.env`, then `npm run bedrock:check`. Blocks nothing in Mode B, which needs no AWS at all.
+- **Titan embedder is for a fresh database only.** It is 1024-dim like mxbai and occupies an unrelated vector space; the `meta` guard will refuse to connect rather than let the two mix. Mode A does *not* require it — the local ONNX embedder is the default in both modes, which is what keeps one vector space and makes corpora portable between them.
+- **The Bedrock seam probe (rung 5) is deliberately weaker than the host agent's.** Rung 5 means "drive the browser and report what you find"; an API call cannot, so `BedrockReasoner` answers only when the transition is obvious from the state names and otherwise returns no steps, leaving the seam unresolved. That fails closed on purpose: `persistProbedBridge` **writes the answer back into the page graph**, so a plausible guess would become a permanent wrong fact every later run inherits.
 
 ---
 

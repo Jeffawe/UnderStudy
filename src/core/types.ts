@@ -10,6 +10,8 @@
  * See PLAN.md.
  */
 
+import type { Distilled, DistillRequest } from './distill.js';
+
 export interface Embedder {
   /**
    * Stable identifier, written to the `meta` table on first use and checked on
@@ -37,42 +39,24 @@ export interface Embedder {
   embedQuery(text: string): Promise<number[]>;
 }
 
-export interface DistilledStep {
-  action: string;
-  role?: string;
-  name?: string;
-  testId?: string;
-  css?: string;
-  frameHint?: string;
-  valueRef?: string;
-  valueParam?: string;
-  args?: Record<string, unknown>;
-  semantic: string;
-  stateAfter?: string;
-}
-
-export interface DistilledSegment {
-  slug: string;
-  title: string;
-  intent: string;
-  /** Indices into the flat steps[] array — segments are boundaries, not copies. */
-  stepRange: [number, number];
-}
-
-export interface DistilledFlow {
-  intent: string;
-  preconditions: string[];
-  outcome: string;
-  steps: DistilledStep[];
-  segments: DistilledSegment[];
-  candidateLessons: Array<{ kind: string; title: string; body: string; trigger: Record<string, unknown> }>;
-  /** What the distiller fixed in the raw recording, and why. */
-  corrections: Array<{ rule: string; detail: string; stepIndex?: number }>;
-}
-
+/**
+ * The distiller ANNOTATES; it does not author steps.
+ *
+ * This interface used to take a recording as a string and return a flow
+ * containing `steps[]` — i.e. the model re-emitting the actions. `distill.ts`
+ * superseded that: the steps are already captured by the recorder and PROVEN by
+ * replay, so handing them back to a model to restate lets it silently rewrite a
+ * verified selector or invent an action that never happened, with nothing
+ * downstream able to tell. The request now hands over numbered, verified steps
+ * and the response may only reference them BY INDEX.
+ *
+ * So the contract is `DistillRequest -> Distilled`, and both live in
+ * `distill.ts` beside the schema and the validator that enforce them. The
+ * import is type-only, so the circularity is erased at runtime.
+ */
 export interface Distiller {
   readonly id: string;
-  distill(recording: string, context: string): Promise<DistilledFlow>;
+  distill(request: DistillRequest): Promise<Distilled>;
 }
 
 export interface PendingDecision {

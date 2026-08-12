@@ -28,9 +28,13 @@
     "explore:check": "tsx src/core/explore-check.ts",
     "understudy": "tsx src/entry/cli.ts",
     "vendor:accname": "node scripts/vendor-accname.mjs",
-    "mcp": "tsx src/entry/mcp.ts"
+    "mcp": "tsx src/entry/mcp.ts",
+    "bedrock:check": "tsx src/adapters/bedrock/check.ts"
   },
   "dependencies": {
+    "@anthropic-ai/bedrock-sdk": "^0.32.1",
+    "@anthropic-ai/sdk": "^0.116.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1107.0",
     "@huggingface/transformers": "^3.7.6",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "dom-accessibility-api": "^0.7.1",

@@ -144,17 +144,43 @@ const MAX_BODY = 4000;
 function locatorFor(root: Page | Frame, event: RawEvent): Locator | undefined {
   let locator: Locator | undefined;
 
+  // APPLY THE SCOPE. The parser splits a chain into scope + target on purpose —
+  // `page.getByRole('navigation').getByText('Login')` addresses "Login" INSIDE
+  // the navigation landmark — and then this function used to ignore the scope
+  // entirely, searching the whole page instead. Mostly that passed by luck with
+  // an ambiguous match; for a relative target like `locator('xpath=..')` it
+  // resolves from the document root and matches nothing at all.
+  const scope = event.hints?.scope;
+  let base: Page | Frame | Locator = root;
+  if (Array.isArray(scope)) {
+    for (const raw of scope) {
+      if (typeof raw !== 'string') continue;
+      const value = raw.slice(raw.indexOf('=') + 1);
+      if (!value) continue;
+      if (raw.startsWith('role=')) base = base.getByRole(value as Parameters<Page['getByRole']>[0]);
+      else if (raw.startsWith('css=')) base = base.locator(value);
+      else if (raw.startsWith('name=')) base = base.getByText(value);
+    }
+  }
+
+  // A name written as a regex in the source stays a regex here. `event.name`
+  // holds the SOURCE, which for something like `Minoxidil 2\.5mg` is not the
+  // accessible name and would match nothing as a literal.
+  const name: string | RegExp = event.hints?.nameRegex
+    ? new RegExp(event.name!, String(event.hints.nameFlags ?? ''))
+    : event.name!;
+
   if (event.role && event.name) {
-    locator = root.getByRole(event.role as Parameters<Page['getByRole']>[0], {
-      name: event.name,
+    locator = base.getByRole(event.role as Parameters<Page['getByRole']>[0], {
+      name,
       ...(event.exact ? { exact: true } : {}),
     });
   } else if (event.name) {
-    locator = root.getByText(event.name, event.exact ? { exact: true } : {});
+    locator = base.getByText(name, event.exact ? { exact: true } : {});
   } else if (event.role) {
-    locator = root.getByRole(event.role as Parameters<Page['getByRole']>[0]);
+    locator = base.getByRole(event.role as Parameters<Page['getByRole']>[0]);
   } else if (event.css) {
-    locator = root.locator(event.css);
+    locator = base.locator(event.css);
   }
 
   // Test id is a FALLBACK, not the first choice: role+name is what the whole
@@ -166,14 +192,53 @@ function locatorFor(root: Page | Frame, event: RawEvent): Locator | undefined {
   // `data-test`, so every step resolved to nothing until this was recorded.
   if (!locator && event.testId) {
     const attr = event.testIdAttr ?? 'data-testid';
-    locator = root.locator(`[${attr}="${event.testId.replace(/"/g, '\\"')}"]`);
+    locator = base.locator(`[${attr}="${event.testId.replace(/"/g, '\\"')}"]`);
   }
-  if (!locator && event.css) locator = root.locator(event.css);
+  if (!locator && event.css) locator = base.locator(event.css);
   if (!locator) return undefined;
+
+  // FILTER BEFORE NTH — that is the order the source wrote them in, and the
+  // two do not commute. `locator('label').filter({hasText:/^No$/}).nth(1)` is
+  // "the second label saying No"; applying nth first would give "the second
+  // label on the page, if it happens to say No".
+  const hasText = event.hints?.hasText as string | undefined;
+  if (hasText !== undefined) {
+    locator = locator.filter({
+      hasText: event.hints?.hasTextRegex
+        ? new RegExp(hasText, String(event.hints.hasTextFlags ?? ''))
+        : hasText,
+    });
+  }
 
   const nth = (event.hints?.nth as number | undefined) ?? undefined;
   if (nth !== undefined) locator = nth < 0 ? locator.last() : locator.nth(nth);
   return locator;
+}
+
+/**
+ * Wait until the URL has stopped changing.
+ *
+ * Deliberately polling rather than `waitForLoadState`: these are client-side
+ * route changes, so there is no document load to wait on — the URL simply
+ * changes a few hundred milliseconds after the action that caused it. Requiring
+ * a quiet period rather than a single reading is what distinguishes "settled"
+ * from "has not started yet".
+ */
+async function waitForUrlSettled(page: Page, quietMs = 400, budgetMs = 4000): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  let last = page.url();
+  let unchangedSince = Date.now();
+
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(50);
+    const now = page.url();
+    if (now !== last) {
+      last = now;
+      unchangedSince = Date.now();
+    } else if (Date.now() - unchangedSince >= quietMs) {
+      return;
+    }
+  }
 }
 
 /** Resolve a step's value, whether literal or a reference. */
@@ -300,7 +365,25 @@ export async function replay(
         let locator = locatorFor(root, event);
         if (!locator) throw new Error('step has no usable locator (no role, name, css or testId)');
 
-        // Count first: a locator matching several elements is a latent flake,
+        // WAIT BEFORE COUNTING. `count()` is an instant poll — it does not
+        // auto-wait the way click()/fill() do. Against a server-rendered page
+        // that is invisible; against a client-rendered app the element simply
+        // has not been created yet, so every step failed in milliseconds with
+        // "locator matched no elements" and the 10s step timeout below never
+        // came into play.
+        //
+        // Waiting for `attached` rather than `visible` on purpose: a step may
+        // legitimately target something present but not visible (the sr-only
+        // radio inputs in these intake forms are exactly that).
+        await locator
+          .first()
+          .waitFor({ state: 'attached', timeout: timeoutMs })
+          .catch(() => {
+            // Genuinely absent. Fall through — count() reports 0 and the
+            // existing "matched no elements" error is still the right one.
+          });
+
+        // Count second: a locator matching several elements is a latent flake,
         // and knowing that is worth more than the step passing by luck.
         outcome.matched = await locator.count();
 
@@ -380,6 +463,17 @@ export async function replay(
 
       // Settle before fingerprinting: a sig taken mid-transition describes a
       // state that never existed. Same lesson as explore.
+      //
+      // THE URL HAS TO SETTLE FIRST, and the aria budget alone does not
+      // guarantee it. A click that signs in returns quickly, then the client
+      // router pushes a new route a beat later — so the fingerprint was taken
+      // on the page being LEFT. That is not a cosmetic error: the sig after a
+      // segment's last step becomes its `end_state`, so the redirect got
+      // attributed to the NEXT segment and every state boundary shifted by one
+      // transition. The planner then rejects the semantically right segment
+      // ("starts at /overview, execution is at /auth/otp") and binds its
+      // neighbour instead.
+      await waitForUrlSettled(page);
       await waitForAriaStable(page, 1500);
       const sig = await computeSig(page);
       outcome.sig = sig.sig;

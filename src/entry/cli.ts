@@ -15,11 +15,13 @@
  */
 
 import { createEmbedder } from '../adapters/embedder/index.js';
+import { createReasoner, vocabularyLines } from '../adapters/reasoner/index.js';
 import { closePool, describeTarget, ensureMeta, getPool } from '../core/db.js';
 import { explore } from '../core/explore.js';
 import { recall, isGap, GAP_DISTANCE, type ChunkKind } from '../core/recall.js';
 import { recordLive } from '../adapters/recorder/live.js';
 import { listRecordings, saveRecording } from '../core/recording-store.js';
+import { buildRecording } from '../core/recording.js';
 import { parseScript } from '../adapters/recorder/script.js';
 import { loadRecording } from '../core/recording-store.js';
 import { replay } from '../core/replay.js';
@@ -88,6 +90,9 @@ DISTILL
 
 TEST
   --sub-goal <text>     supply a sub-goal (repeatable); stands in for decompose
+  --reasoner bedrock    decompose and judge with a model instead (Mode A).
+                        Without it the CLI is fully deterministic and never
+                        calls one. Needs AWS — see: npm run bedrock:check
   --dry-run             plan only, never open a browser
   --allow-purchases     permit a destructive plan (default: refuse)
   --value REF=value     as for replay
@@ -272,7 +277,28 @@ async function cmdImport(positional: string[], flags: Flags) {
   );
   const fallback = str(flags.get('url')) ?? known.rows[0]?.base_url;
 
-  const { recording, warnings } = await parseScript(file, slug, fallback);
+  const { recording: parsed, warnings } = await parseScript(file, slug, fallback);
+
+  // CUT AT A VERIFIED BOUNDARY.
+  //
+  // A spec can contain steps this IR cannot express — an inline page.evaluate,
+  // a wait the schema has no action for — and replay stops at the first of
+  // them. Everything before that point still replayed and is still true, so
+  // throwing it away because of what follows loses real memory. --until keeps
+  // the proven prefix and drops the rest, which is honest in a way that
+  // --force is not: the stored recording then describes exactly what was
+  // verified, rather than claiming steps nobody proved.
+  const until = str(flags.get('until'));
+  const recording = until
+    ? buildRecording(
+        { source: parsed.source, origin: parsed.origin, appSlug: parsed.appSlug, startUrl: parsed.startUrl },
+        parsed.events.slice(0, Number(until)),
+      )
+    : parsed;
+
+  if (until) {
+    console.log(`kept ${recording.events.length} of ${parsed.events.length} steps (--until ${until})\n`);
+  }
 
   if (!recording.events.length) {
     console.error(`no Playwright actions found in ${file}`);
@@ -560,11 +586,36 @@ async function cmdTest(positional: string[], flags: Flags) {
     'SELECT base_url FROM apps WHERE app_id = $1', [appId]);
 
   // --sub-goal is the manual stand-in for the reasoner's decompose. Repeatable.
-  const subGoals = all(flags, 'sub-goal');
+  let subGoals = all(flags, 'sub-goal');
+
+  // MODE A. Without --reasoner the CLI stays fully deterministic: it plans from
+  // whatever sub-goals you typed and never calls a model. With it, decompose
+  // and the two judgement callbacks are wired to Bedrock, which is the same
+  // pipeline the MCP server runs — only the answers arrive from an API instead
+  // of from the agent reading a suspension.
+  const reasoner = flags.has('reasoner') ? createReasoner(str(flags.get('reasoner'))) : undefined;
+
+  if (reasoner && !subGoals.length) {
+    const vocabulary = await fetchVocabulary(appId);
+    subGoals = await reasoner.decompose(goal, vocabularyLines(vocabulary));
+    console.log(`decomposed by ${reasoner.id}:`);
+    for (const sg of subGoals) console.log(`  - ${sg}`);
+    console.log('');
+  }
 
   const plan = await buildPlan(createEmbedder(), appId, goal, {
     baseUrl: app[0]!.base_url,
     ...(subGoals.length ? { subGoals } : {}),
+    // Rung 5 only exists when someone can answer it. Deterministic runs leave
+    // it off, so an unresolved seam blocks rather than being guessed at.
+    ...(reasoner
+      ? {
+          onSeamProbe: async (context: Record<string, unknown>) =>
+            (await reasoner.resolve({ kind: 'seam', context })) as {
+              steps?: Array<{ action: string; role?: string; name?: string; testId?: string; css?: string; value?: string }>;
+            },
+        }
+      : {}),
     ...(flags.has('allow-purchases')
       ? { env: { allowsPurchases: true, allowsIrreversible: true, name: 'cli --allow-purchases' } }
       : {}),
@@ -622,6 +673,9 @@ async function cmdTest(positional: string[], flags: Flags) {
   const exec = await executePlan(plan, app[0]!.base_url, slug, {
     values: valuesFromFlags(flags),
     ...(flags.has('headed') ? { headless: false } : {}),
+    // Without a reasoner an unexpected page is recorded and the run carries on;
+    // with one, it gets judged. Same escalation the MCP server surfaces.
+    ...(reasoner ? { onDecision: (decision) => reasoner.resolve(decision) } : {}),
   });
 
   console.log(`EXECUTED ${exec.flowsRun.join(' -> ')}`);

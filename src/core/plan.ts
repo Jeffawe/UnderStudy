@@ -114,12 +114,16 @@ const STATE_PREDICATES = ['authenticated'];
 /**
  * How much worse than the best candidate a fallback may be.
  *
- * When the closest match is refused on SAFETY grounds, the next legal candidate
- * is only a real alternative if it means roughly the same thing. Observed: with
- * the cart step marked destructive, "put an item into the cart" fell through
- * from a 0.4124 match to a 0.8936 mined macro that does not touch the cart —
- * a plan that silently did not do what was asked. Anything beyond this margin
- * is a different intent, and the honest answer there is "blocked".
+ * When the closest match is refused — for safety, for contradicted
+ * preconditions, or for being unreachable from here — the next legal candidate
+ * is only a real alternative if it means roughly the same thing. Observed
+ * twice: with the cart step marked destructive, "put an item into the cart"
+ * fell through from a 0.4124 match to a 0.8936 mined macro that does not touch
+ * the cart; and with `calculate-bmi` unreachable from the hair loss assessment,
+ * "calculate my BMI" fell through from 0.5741 to `provide-personal-details` at
+ * 0.8859. Both plans run cleanly and do not do what was asked, which is the
+ * worst possible outcome. Anything beyond this margin is a different intent,
+ * and the honest answer there is a gap.
  */
 const FALLBACK_MARGIN = 0.12;
 
@@ -228,7 +232,12 @@ export async function buildPlan(
 
     const rejected: SubGoalPlan['rejected'] = [];
     let bound: BoundStep | undefined;
-    /** Distance of the closest candidate refused for being destructive. */
+    /**
+     * Distance of the closest candidate refused for ANY reason — destructive,
+     * contradicted preconditions, or unreachable from where execution is.
+     * It is the bar the next candidate has to be close to in order to count as
+     * an alternative rather than a substitution.
+     */
     let refusedBest: number | undefined;
 
     for (const candidate of result.bindable) {
@@ -278,9 +287,25 @@ export async function buildPlan(
         continue;
       }
 
+      // The margin guard applies to STATE refusals too, not only safety ones.
+      //
+      // It was originally written for the destructive case, so `refusedBest`
+      // was set there and nowhere else — which left the same hole open one
+      // branch over. Observed: asked to calculate BMI while on the hair loss
+      // assessment, `calculate-bmi` was correctly refused (it only exists in
+      // the weight loss flow) and the planner then bound `provide-personal-
+      // details` at 0.8859 against a refused 0.5741 — 0.31 away, and not
+      // remotely the same intent.
+      //
+      // WHY the reason for refusal does not change the logic: whether a
+      // candidate was refused for being destructive or for being unreachable
+      // from here, the question for the next candidate is identical — does it
+      // mean the same thing? If it does not, the honest answer is a gap, and
+      // "I could not do that from here" beats quietly doing something else.
       const clash = contradicts(satisfied, preconditions);
       if (clash) {
         rejected.push({ slug: meta.slug, distance: candidate.distance, why: clash });
+        refusedBest ??= candidate.distance;
         continue;
       }
       if (!stateAllows(currentState, meta)) {
@@ -289,6 +314,7 @@ export async function buildPlan(
           distance: candidate.distance,
           why: `starts at ${meta.start_state}, execution is at ${currentState}`,
         });
+        refusedBest ??= candidate.distance;
         continue;
       }
 
