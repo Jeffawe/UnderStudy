@@ -24,7 +24,8 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { basename } from 'node:path';
+import { existsSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import ts from 'typescript';
 import {
   buildRecording,
@@ -37,12 +38,16 @@ import {
 /** Playwright locator factories we understand, and what each contributes. */
 type LocatorBit = {
   role?: string;
-  name?: string;
+  name?: TextMatch;
   exact?: boolean;
   css?: string;
   testId?: string;
   frameHint?: string;
   nth?: number;
+  /** `.filter({hasText})` — narrows the bit it follows. */
+  hasText?: TextMatch;
+  /** A filter form the IR can't express, reported rather than dropped. */
+  unsupported?: string;
 };
 
 /** Terminal calls that are actions rather than refinements. */
@@ -68,24 +73,114 @@ export interface ParsedScript {
 const text = (node: ts.Node): string | undefined =>
   ts.isStringLiteralLike(node) ? node.text : undefined;
 
+/** Join a possibly-relative spec URL onto the app's base URL. */
+function absolute(url: string, base: string): string {
+  try {
+    return new URL(url, base).toString();
+  } catch {
+    // An unparseable base is not worth failing the whole import over; the
+    // literal at least records what the spec said.
+    return url;
+  }
+}
+
+/**
+ * Resolve a file path a spec passes to setInputFiles.
+ *
+ * Specs write these relative to the repo they run in ('tests/fixtures/x.png'),
+ * because that is where Playwright's cwd is. Understudy replays from its own
+ * directory, so storing the literal produced ENOENT on every upload step. Walk
+ * up from the spec file until the path resolves — that finds the repo root
+ * without needing to know how the other project is laid out.
+ */
+function resolveFixture(value: string, specPath: string): string {
+  if (isAbsolute(value)) return value;
+  let dir = dirname(specPath);
+  for (let up = 0; up < 6; up++) {
+    const candidate = join(dir, value);
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  // Not found anywhere: keep the literal so the failure names what the spec
+  // asked for rather than a path this function invented.
+  return value;
+}
+
+/**
+ * A text constraint, which Playwright lets you write either way.
+ *
+ * `{ name: 'Sign in' }` and `{ name: /^Sign in$/ }` mean different things — the
+ * first is a substring match, the second is anchored — so the regex-ness has to
+ * survive into the IR rather than being flattened to its source text.
+ */
+export interface TextMatch {
+  source: string;
+  regex: boolean;
+  flags: string;
+}
+
+function textMatch(node: ts.Node | undefined): TextMatch | undefined {
+  if (!node) return undefined;
+  if (ts.isStringLiteralLike(node)) return { source: node.text, regex: false, flags: '' };
+  if (ts.isRegularExpressionLiteral(node)) {
+    // getText() is the literal as written, e.g. `/^No$/i`.
+    const raw = node.getText();
+    const close = raw.lastIndexOf('/');
+    return { source: raw.slice(1, close), regex: true, flags: raw.slice(close + 1) };
+  }
+  return undefined;
+}
+
 /**
  * Read `{ name: 'Login', exact: true }`.
  * Only literal properties are useful; a computed name can't be known statically.
  */
-function readOptions(node: ts.Node | undefined): { name?: string; exact?: boolean } {
+function readOptions(node: ts.Node | undefined): { name?: TextMatch; exact?: boolean } {
   if (!node || !ts.isObjectLiteralExpression(node)) return {};
-  const out: { name?: string; exact?: boolean } = {};
+  const out: { name?: TextMatch; exact?: boolean } = {};
   for (const prop of node.properties) {
     if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue;
     if (prop.name.text === 'name') {
-      const literal = text(prop.initializer);
-      if (literal !== undefined) out.name = literal;
+      const match = textMatch(prop.initializer);
+      if (match !== undefined) out.name = match;
     }
     if (prop.name.text === 'exact') {
       out.exact = prop.initializer.kind === ts.SyntaxKind.TrueKeyword;
     }
   }
   return out;
+}
+
+/**
+ * Read `.filter({ hasText: ... })`.
+ *
+ * THIS IS ADDRESSING, NOT DECORATION. `filter` used to be treated as a
+ * refinement "that doesn't change which element we're addressing", which is
+ * exactly backwards: `page.locator('label').filter({hasText: 'I accept'})`
+ * narrows every label on the page down to one. Dropping it turned a precise
+ * locator into `css=label` — and silently, with no warning, so the recording
+ * looked clean and would have clicked whatever label happened to be first.
+ *
+ * `has` / `hasNot` take a Locator rather than text and cannot be represented in
+ * the IR, so they are reported instead of quietly ignored.
+ */
+function readFilter(node: ts.Node | undefined): { hasText?: TextMatch; unsupported?: string } {
+  if (!node || !ts.isObjectLiteralExpression(node)) return {};
+  for (const prop of node.properties) {
+    if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue;
+    const key = prop.name.text;
+    if (key === 'hasText') {
+      const match = textMatch(prop.initializer);
+      if (match) return { hasText: match };
+      return { unsupported: 'filter({hasText}) with a non-literal value' };
+    }
+    if (key === 'has' || key === 'hasNot' || key === 'hasNotText') {
+      return { unsupported: `filter({${key}})` };
+    }
+  }
+  return {};
 }
 
 /** What one link in a locator chain contributes to addressing the element. */
@@ -104,7 +199,7 @@ function locatorBit(method: string, args: readonly ts.Expression[]): LocatorBit 
     case 'getByText':
     case 'getByTitle':
     case 'getByAltText': {
-      const name = first ? text(first) : undefined;
+      const name = textMatch(first);
       const { exact } = readOptions(args[1]);
       return name !== undefined ? { name, ...(exact ? { exact } : {}) } : undefined;
     }
@@ -129,8 +224,16 @@ function locatorBit(method: string, args: readonly ts.Expression[]): LocatorBit 
       const n = first && ts.isNumericLiteral(first) ? Number(first.text) : undefined;
       return n !== undefined ? { nth: n } : undefined;
     }
-    // Refinements that don't change which element we're addressing.
-    case 'filter':
+    // NOT a no-op — see readFilter. This is what narrows `locator('label')`
+    // from every label on the page down to the one that says "I accept".
+    case 'filter': {
+      const { hasText, unsupported } = readFilter(first);
+      return {
+        ...(hasText ? { hasText } : {}),
+        ...(unsupported ? { unsupported } : {}),
+      };
+    }
+    // These genuinely don't narrow by anything the IR can express.
     case 'and':
     case 'or':
       return {};
@@ -228,23 +331,38 @@ export async function parseScript(
           const target: LocatorBit = targetIndex >= 0 ? bits[targetIndex]! : {};
           const scopeBits = targetIndex > 0 ? bits.slice(0, targetIndex).filter(addresses) : [];
 
-          // nth and frameHint are positional/structural: they apply to the
-          // target wherever in the chain they were written.
+          // nth, frameHint and hasText are positional/structural: they apply to
+          // the target wherever in the chain they were written. hasText takes
+          // the LAST one, matching nth — in practice a filter directly follows
+          // the locator it narrows.
           const nth = [...bits].reverse().find((b) => b.nth !== undefined)?.nth;
           const frameHint = bits.find((b) => b.frameHint !== undefined)?.frameHint;
+          const hasText = [...bits].reverse().find((b) => b.hasText !== undefined)?.hasText;
+          const unsupported = bits.find((b) => b.unsupported !== undefined)?.unsupported;
+
+          if (unsupported) {
+            warnings.push(`${unsupported} could not be represented: ${node.getText().slice(0, 70)}`);
+          }
 
           const merged: LocatorBit = {
             ...target,
             ...(nth !== undefined ? { nth } : {}),
             ...(frameHint !== undefined ? { frameHint } : {}),
+            ...(hasText !== undefined ? { hasText } : {}),
           };
           const scope = scopeBits.length
-            ? scopeBits.map((b) => (b.role ? `role=${b.role}` : b.css ? `css=${b.css}` : `name=${b.name}`))
+            ? scopeBits.map((b) => (b.role ? `role=${b.role}` : b.css ? `css=${b.css}` : `name=${b.name?.source}`))
             : undefined;
 
           if (action === 'goto') {
             const urlArg = node.arguments[0];
-            const url = urlArg ? text(urlArg) : undefined;
+            const literal = urlArg ? text(urlArg) : undefined;
+            // RESOLVE AGAINST THE BASE URL. Playwright specs are written with
+            // relative paths on purpose — `page.goto('/overview')` plus a
+            // `baseURL` in the config — so the literal alone is not navigable.
+            // Storing it raw produced "Cannot navigate to invalid URL" on the
+            // very first step of every imported spec.
+            const url = literal && fallbackUrl ? absolute(literal, fallbackUrl) : literal;
             if (url) {
               currentUrl = url;
               if (!startUrl) startUrl = url;
@@ -263,22 +381,31 @@ export async function parseScript(
             warnings.push(`unaddressable ${action}: ${node.getText().slice(0, 70)}`);
           } else {
             const raw = readArgument(node.arguments[0]);
-            const fieldHint = merged.name || merged.testId || merged.css || 'field';
-            const secretSignal = [merged.name, merged.css, merged.testId].filter(Boolean).join(' ');
+            const fieldHint = merged.name?.source || merged.testId || merged.css || 'field';
+            const secretSignal = [merged.name?.source, merged.css, merged.testId].filter(Boolean).join(' ');
 
             // A literal password in a committed test still must not reach the
             // corpus. A valueRef is already a reference and passes through.
+            // An upload's argument is a PATH, not a value to redact — and it
+            // needs resolving against the spec's own repo before it can be read.
             const valued =
-              raw.value !== undefined
-                ? redactValue(fieldHint, raw.value, undefined, secretSignal)
-                : raw;
+              action === 'upload' && raw.value !== undefined
+                ? { value: resolveFixture(raw.value, filePath) }
+                : raw.value !== undefined
+                  ? redactValue(fieldHint, raw.value, undefined, secretSignal)
+                  : raw;
 
             events.push({
               seq: events.length,
               ts: events.length,
               action,
               ...(merged.role ? { role: merged.role } : {}),
-              ...(merged.name !== undefined ? { name: merged.name } : {}),
+              // `name` stays a plain string because sig(), selector dedupe and
+              // the embeddings all key on it. When the source was a regex, the
+              // string is its SOURCE and hints carry the regex-ness so replay
+              // can rebuild the real matcher — `exact` would be wrong here, a
+              // source like `Minoxidil 2\.5mg` never equals an accessible name.
+              ...(merged.name !== undefined ? { name: merged.name.source } : {}),
               ...(merged.exact ? { exact: merged.exact } : {}),
               ...valued,
               ...(merged.css ? { css: merged.css } : {}),
@@ -286,12 +413,23 @@ export async function parseScript(
               ...(merged.frameHint ? { frameHint: merged.frameHint } : {}),
               url: currentUrl,
               resolution: 'script-literal',
-              ...(merged.nth !== undefined || unknown || scope
+              ...(merged.nth !== undefined || unknown || scope || merged.hasText || merged.name?.regex
                 ? {
                     hints: {
                       ...(merged.nth !== undefined ? { nth: merged.nth } : {}),
                       ...(scope ? { scope } : {}),
                       ...(unknown ? { unparsedChainStep: unknown } : {}),
+                      ...(merged.hasText
+                        ? {
+                            hasText: merged.hasText.source,
+                            ...(merged.hasText.regex
+                              ? { hasTextRegex: true, hasTextFlags: merged.hasText.flags }
+                              : {}),
+                          }
+                        : {}),
+                      ...(merged.name?.regex
+                        ? { nameRegex: true, nameFlags: merged.name.flags }
+                        : {}),
                     },
                   }
                 : {}),

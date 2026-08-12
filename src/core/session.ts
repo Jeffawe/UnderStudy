@@ -21,7 +21,7 @@ import { executePlan } from './execute.js';
 import { fetchVocabulary } from './vocabulary.js';
 import { recordRun } from './run.js';
 import { getPool } from './db.js';
-import type { Embedder } from './types.js';
+import type { Embedder, Reasoner } from './types.js';
 import type { ReplayResult } from './replay.js';
 
 export interface RunOutcome {
@@ -88,6 +88,73 @@ export interface StartRunOptions {
   headless?: boolean;
 }
 
+export async function resolveBaseUrl(appId: string, appSlug: string): Promise<string> {
+  const { rows } = await getPool().query<{ base_url: string }>(
+    'SELECT base_url FROM apps WHERE app_id = $1',
+    [appId],
+  );
+  const baseUrl = rows[0]?.base_url;
+  if (!baseUrl) throw new Error(`app ${appSlug} has no base URL`);
+  return baseUrl;
+}
+
+/**
+ * The pipeline itself — decompose, plan, execute — for ANY reasoner.
+ *
+ * This used to live inside `startRun`'s detached task, which quietly made it
+ * Mode B-only: the suspension machinery around it is what MCP needs, and a
+ * Bedrock reasoner needs none of it. Pulled out here, the two modes differ
+ * only in how the pipeline is CALLED — awaited directly for Mode A, raced
+ * against its own next suspension for Mode B — and not at all in what it does.
+ *
+ * Nothing in this function knows which reasoner it has. `decompose` resolves
+ * from an API call in ~2s or from a human in ten minutes; the await is
+ * identical either way.
+ */
+export async function runPipeline(
+  embedder: Embedder,
+  reasoner: Reasoner,
+  appId: string,
+  appSlug: string,
+  goal: string,
+  baseUrl: string,
+  opts: StartRunOptions = {},
+): Promise<RunOutcome> {
+  const vocabulary = await fetchVocabulary(appId);
+
+  // THE ONE MODEL CALL IN PLANNING. Everything after it is arithmetic.
+  const subGoals = await reasoner.decompose(goal, vocabularyLines(vocabulary));
+
+  const plan = await buildPlan(embedder, appId, goal, {
+    subGoals,
+    baseUrl,
+    // Rung 5 uses the same reasoner as everything else — it just asks a
+    // different question, and the answer is written back as memory.
+    onSeamProbe: async (context) => {
+      const answer = await reasoner.resolve({ kind: 'seam', context });
+      return answer as { steps?: Array<{ action: string; role?: string; name?: string; testId?: string; css?: string; value?: string }> };
+    },
+    ...(opts.env ? { env: opts.env } : {}),
+  });
+
+  if (plan.blocked) return { plan, executed: false, blocked: plan.blocked };
+  if (plan.unbound.length) return { plan, executed: false };
+  if (opts.dryRun) return { plan, executed: false };
+
+  const exec = await executePlan(plan, baseUrl, appSlug, {
+    values: opts.values ?? {},
+    ...(opts.headless === false ? { headless: false } : {}),
+    // THE MID-RUN ESCALATION. The executor drives; when it cannot decide —
+    // an unexpected page, a step that failed — it escalates here. In Mode B
+    // that suspends and the agent answers; in Mode A it is another API call.
+    // Same mechanism, different question, either reasoner.
+    onDecision: (decision) => reasoner.resolve(decision),
+  });
+  await recordRun(exec.result, { appId, goal, mode: 'execute', reasoner: reasoner.id });
+
+  return { plan, executed: true, result: exec.result, flowsRun: exec.flowsRun };
+}
+
 export async function startRun(
   embedder: Embedder,
   appId: string,
@@ -95,52 +162,13 @@ export async function startRun(
   goal: string,
   opts: StartRunOptions = {},
 ): Promise<RunStep> {
-  const { rows } = await getPool().query<{ base_url: string }>(
-    'SELECT base_url FROM apps WHERE app_id = $1',
-    [appId],
-  );
-  const baseUrl = rows[0]?.base_url;
-  if (!baseUrl) throw new Error(`app ${appSlug} has no base URL`);
+  const baseUrl = await resolveBaseUrl(appId, appSlug);
 
   const reasoner = new HostAgentReasoner(appId);
   const runId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 
   // Detached: the tool call must return at the first suspension, not sit here.
-  const settled = (async (): Promise<RunOutcome> => {
-    const vocabulary = await fetchVocabulary(appId);
-
-    // THE ONE MODEL CALL IN PLANNING. Everything after it is arithmetic.
-    const subGoals = await reasoner.decompose(goal, vocabularyLines(vocabulary));
-
-    const plan = await buildPlan(embedder, appId, goal, {
-      subGoals,
-      baseUrl,
-      // Rung 5 uses the same reasoner as everything else — it just asks a
-      // different question, and the answer is written back as memory.
-      onSeamProbe: async (context) => {
-        const answer = await reasoner.resolve({ kind: 'seam', context });
-        return answer as { steps?: Array<{ action: string; role?: string; name?: string; testId?: string; css?: string; value?: string }> };
-      },
-      ...(opts.env ? { env: opts.env } : {}),
-    });
-
-    if (plan.blocked) return { plan, executed: false, blocked: plan.blocked };
-    if (plan.unbound.length) return { plan, executed: false };
-    if (opts.dryRun) return { plan, executed: false };
-
-    const exec = await executePlan(plan, baseUrl, appSlug, {
-      values: opts.values ?? {},
-      ...(opts.headless === false ? { headless: false } : {}),
-      // THE MID-RUN ESCALATION. The executor drives; when it cannot decide —
-      // an unexpected page, a step that failed — it suspends here and the agent
-      // answers, exactly as it did for decompose. Same mechanism, different
-      // question.
-      onDecision: (decision) => reasoner.resolve(decision),
-    });
-    await recordRun(exec.result, { appId, goal, mode: 'execute', reasoner: reasoner.id });
-
-    return { plan, executed: true, result: exec.result, flowsRun: exec.flowsRun };
-  })();
+  const settled = runPipeline(embedder, reasoner, appId, appSlug, goal, baseUrl, opts);
 
   // Swallow here so an unhandled rejection cannot take the process down; the
   // error is surfaced through advance() instead.
