@@ -60,7 +60,7 @@ export interface Distiller {
 }
 
 export interface PendingDecision {
-  kind: 'gap' | 'seam' | 'unexpected_page' | 'finding_judgment' | 'parameter';
+  kind: 'gap' | 'seam' | 'unexpected_page' | 'visual_diff' | 'finding_judgment' | 'parameter';
   context: Record<string, unknown>;
 }
 

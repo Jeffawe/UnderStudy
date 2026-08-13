@@ -1,25 +1,30 @@
-# Status — 2026-08-06
+# Status — 2026-08-13
 
-Where the build actually is. `PLAN.md` is the architecture; this is the progress marker.
+Where the build actually is. `PLAN.md` is the architecture; this is the progress
+marker. **If you are here to ACT as the reasoner rather than to build, read
+`REASONER.md` instead** — this file is about how far the build has got.
 
 ## Resume in 30 seconds
 
 ```bash
-./scripts/db-start.sh                    # local node (dies with its shell otherwise)
-./scripts/db.sh -e "SELECT count(*) FROM [SHOW TABLES];"    # expect 19
-npm run typecheck                        # expect clean
+PATH="/opt/homebrew/bin:$PATH" ./scripts/db-start.sh   # cockroach is not on a bare PATH
+npm run typecheck && npm run build                     # expect clean
+npx tsx src/entry/cli.ts test providernow "start a weight loss plan" \
+  --sub-goal "log in as a member" --sub-goal "choose the weight loss service" --dry-run
 ```
 
-```bash
-npm run embedder:check                   # passes — model + DB round trip
-npm run recall:check                     # passes — seeds 9 chunks, prints distances
-```
+That last command is the end-to-end proof: it binds two segments that came from
+**different recordings** and reports the seam between them. If it prints
+`dry run — plan is executable`, the whole stack is alive.
 
-Both pass. **The memory plane is proven end to end**: text → 1024-dim vector →
-ANN index → ranked results, on real CockroachDB.
+**Mode B is live.** The `understudy` MCP server is registered in `.mcp.json` and
+exposes nine tools; the host agent is the reasoner and the distiller. Mode A
+(Bedrock) is written but has never made a real call — model access is still
+pending.
 
-Next real thing: `understudy explore` on saucedemo, to replace the synthetic
-fixture corpus with a real one.
+**Two corpora.** `saucedemo` (synthetic, first corpus, has known data defects —
+see below) and `providernow` (real telehealth app on `localhost:3000`, 19
+segments across three services, built this session).
 
 ---
 
@@ -935,24 +940,81 @@ supported) → `start_state`/`preconditions` at bind (free, deterministic, fails
 closed) → vocabulary grounding via `decompose` → reranker only if those are
 insufficient.
 
+## 2026-08-13 — real app, visual checkpoints, and the seam ladder proven
+
+**A real corpus.** Three ProviderNow intakes imported from the sibling Playwright
+suite, plus one captured from live exploration. 19 segments, 3 flows, 5 lessons.
+Shared blocks — `log-in-as-a-member`, `provide-shipping-address`,
+`provide-contact-details-and-consents`, `submit-the-intake-questionnaire` — are
+ONE row each, reused across recordings rather than duplicated as synonyms.
+
+**Nine bugs in the import path, all silent.** It had never run against a real
+app. `.filter({hasText})` was dropped entirely (turning
+`locator('div').filter(/^Services$/).nth(1)` into "the second div on the page");
+regex names dropped; `page.goto('/')` never resolved against the base URL;
+`locator.count()` does not auto-wait, so every step failed in milliseconds on a
+client-rendered app; replay threw away the parser's scope/target split;
+`setInputFiles` paths were not resolved against the source repo; `sig()` was
+computed before client-side redirects landed; the `FALLBACK_MARGIN` guard only
+covered safety refusals, not state ones; and `stateAllows` demanded exact sig
+equality, which made the corpus self-invalidating.
+
+**That last one is the interesting one.** A sig covers title, landmarks and
+control names, so `/overview` re-fingerprints once the account has a pending
+request — six distinct `/overview` sigs exist. Because segments dedupe by slug,
+ingesting one flow broke another's seams, and re-ingesting that one broke the
+first. Binding now compares the ROUTE and lets the seam ladder decide.
+
+**The ladder is real, and each service reaches it differently:** weight-loss at
+rung 1 (sigs match), hair-loss at rung 2 (bridge segment found on its own), and
+the rash flow at **rung 5** — a live probe through the MCP handshake, answered
+by the reasoner. The honest probe answer there was "no steps, because none are
+needed", which exposed that the model could not distinguish that from "I don't
+know". Added **rung 1b**: a destination whose first step is a `goto` navigates
+itself, so no bridge can be needed.
+
+**Lessons closed a loop on themselves.** Replay of the rash capture kept failing
+at OTP sign-in. A lesson for exactly that already existed, distilled from the
+weight-loss recording — but `lessonsFor` was only wired into `executePlan`, so
+the replay that VERIFIES recordings was the one place that ignored what the
+corpus knew; and the settle only fired on `kind === 'wait'` while the distiller
+had called it `timing`. Both fixed; the next replay passed 30/30.
+
+**Visual checkpoints** (`src/core/visual.ts`). `checkpoint(...)` /
+`toHaveScreenshot(...)` now parse into the schema's long-allowed `snapshot`
+action, and `executePlan` adds one at every segment boundary keyed by slug — so
+a novel composition gets visual coverage even where no recording had a
+checkpoint. Cheap pixel diff filters; anything above the floor escalates to the
+reasoner WITH IMAGE PATHS to judge as regression / expected / noise. Verified
+across three runs: baseline, unchanged (ratio 0, silent), corrupted (ratio
+0.0068, escalated).
+
 ## Not built at all
 
-- **No recorder, distiller, reasoner, or executor.** The entire upper half. The
-  memory plane is done; nothing yet writes segments into it or reads them out.
-- **Titan embedder** throws `not implemented` (intended — local ONNX is the
-  decision for both modes).
+- **Bedrock adapters have never made a real call.** Written and typechecking;
+  model access still pending. `npm run bedrock:check` is the one command that
+  answers whether it has landed.
+- **`wait_url`, `wait_text`, `scroll_container`, `dispatch_click`.** All four are
+  permitted by the schema's action CHECK and none are implemented. This is not
+  cosmetic: it is what stops a capture at the review-page scroll gate, and it is
+  why all three intake recordings are trimmed before their final submit.
+- **No session reuse.** Every replay does a cold login, and `distill` replays
+  again — so verify-then-ingest costs 2–3 logins per recording. ProviderNow
+  locks the account for 15 minutes after a handful, which cost real time this
+  session. The Playwright suite keeps `playwright/.auth` storage state precisely
+  to avoid this.
 
 ## Next, in order
 
-1. **Decide the sig sensitivity dial** (see open items) — it changes every page
-   row already written, so settle it before the corpus grows.
-2. **The recorder.** `explore` cannot produce segments, so nothing is bindable
-   until recordings exist. This is now the critical path, not an optional extra.
-3. **Re-derive `GAP_DISTANCE` / `GAP_MARGIN`** once segments exist. Current 0.92
-   comes from 9 synthetic chunks — enough to prove 0.85 was too tight, not
-   enough to ship.
-4. **Binding** — prefer one flow covering ≥2 sub-goals; filter candidates on
-   `start_state` / `preconditions` before ranking (see antonym note).
+1. **`scroll_container` and `wait_text`.** The two that unlock the rest of the
+   intake flows. Both already legal in the schema.
+2. **Execute a composed plan for real** — every plan so far has been `--dry-run`.
+   The rash flow is the candidate, but its tail files a real care request, so
+   decide that deliberately.
+3. **Session reuse in replay** (storage state), which removes the rate-limit
+   ceiling on how much can be ingested per window.
+4. **Bedrock**, once model access lands.
+5. **Dedupe lessons** — re-ingesting a recording writes a second copy of each.
 
 ---
 

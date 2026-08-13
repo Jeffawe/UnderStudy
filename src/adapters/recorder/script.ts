@@ -64,6 +64,15 @@ const ACTIONS: Record<string, RecordedAction> = {
   goto: 'goto',
 };
 
+/**
+ * Calls that mean "take a picture here".
+ *
+ * `toHaveScreenshot` is Playwright's own; the rest are the wrapper names teams
+ * put around it — a suite almost always has one, because the raw assertion
+ * needs the same masking and options at every call site. Add yours here.
+ */
+const SNAPSHOT_CALLS = new Set(['toHaveScreenshot', 'checkpoint', 'visualCheckpoint', 'snapshot']);
+
 export interface ParsedScript {
   recording: RawRecording;
   /** Calls that looked like Playwright actions but could not be mapped. */
@@ -283,6 +292,41 @@ export async function parseScript(
   let startUrl = fallbackUrl ?? '';
 
   const visit = (node: ts.Node): void => {
+    // VISUAL CHECKPOINTS, WHICH ARE NOT PAGE METHODS.
+    //
+    // `expect(page).toHaveScreenshot('x.png')` is a chain off expect(), and a
+    // helper like `checkpoint(page, testInfo, '01-bmi')` is a bare call — so
+    // neither reaches the page-rooted walker below, and both were silently
+    // dropped. They are the most valuable thing in the file for this purpose:
+    // somebody decided, by hand, exactly where a picture is worth taking.
+    if (ts.isCallExpression(node)) {
+      const callee = ts.isPropertyAccessExpression(node.expression)
+        ? node.expression.name.text
+        : ts.isIdentifier(node.expression)
+          ? node.expression.text
+          : undefined;
+
+      if (callee && SNAPSHOT_CALLS.has(callee)) {
+        // The label is the first string literal in the arguments, wherever it
+        // sits — `toHaveScreenshot('x.png')` has it first, `checkpoint(page,
+        // testInfo, 'x')` third.
+        const raw = node.arguments.map(text).find((t) => t !== undefined);
+        const label = raw?.replace(/\.png$/i, '');
+        if (label) {
+          events.push({
+            seq: events.length,
+            ts: events.length,
+            action: 'snapshot',
+            value: label,
+            url: currentUrl,
+            resolution: 'script-literal',
+          });
+        } else {
+          warnings.push(`visual checkpoint with no literal name: ${node.getText().slice(0, 70)}`);
+        }
+      }
+    }
+
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
       const method = node.expression.name.text;
       const action = ACTIONS[method];

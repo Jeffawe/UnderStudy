@@ -24,6 +24,7 @@
 
 import { chromium, type Browser, type Frame, type Locator, type Page } from 'playwright';
 import { computeSig, urlPattern, waitForAriaStable } from './sig.js';
+import { acceptBaseline, captureCheckpoint, worthJudging, VISUAL_SEVERE, type VisualCheck } from './visual.js';
 import type { RawEvent, RawRecording } from './recording.js';
 import type { PendingDecision } from './types.js';
 
@@ -49,6 +50,8 @@ export interface StepOutcome {
    * judgement about what it means belongs to the reasoner.
    */
   unexpectedPage?: { expected: string; observed: string };
+  /** Result of a visual checkpoint, when this step was one. */
+  visual?: VisualCheck;
   /** Lessons whose trigger matched this step, and therefore fired. */
   lessonsApplied?: Array<{ lessonId: string; kind: string; title: string }>;
   /**
@@ -88,6 +91,8 @@ export interface ReplayResult {
   durationMs: number;
   /** Every point the executor stopped and asked, with what came back. */
   escalations: Escalation[];
+  /** Visual checkpoints taken this run, judged or not. */
+  visualChecks: VisualCheck[];
 }
 
 export interface ReplayOptions {
@@ -115,6 +120,12 @@ export interface ReplayOptions {
    */
   onDecision?: (decision: PendingDecision) => Promise<Record<string, unknown>>;
   /**
+   * Turn visual checkpoints on. Opt-in because it only means something when
+   * the reasoner can actually look at an image — Bedrock's adapter answers
+   * from text alone, so capturing for it would produce files nobody reads.
+   */
+  visualCheck?: { appSlug: string; runId: string };
+  /**
    * Lessons that apply to a step, looked up before it runs.
    *
    * A callback again, so replay does not need to know about the database or
@@ -128,6 +139,9 @@ export interface ReplayOptions {
 
 /** What a decision may tell the executor to do. */
 export type DecisionAction = 'continue' | 'abort' | 'retry';
+
+/** Lesson kinds that mean "this page resolves late" — settle before acting. */
+const SETTLE_KINDS = new Set(['wait', 'timing']);
 
 /** Bodies above this are truncated — a findings fingerprint needs the shape, not the payload. */
 const MAX_BODY = 4000;
@@ -224,10 +238,28 @@ function locatorFor(root: Page | Frame, event: RawEvent): Locator | undefined {
  * a quiet period rather than a single reading is what distinguishes "settled"
  * from "has not started yet".
  */
-async function waitForUrlSettled(page: Page, quietMs = 400, budgetMs = 4000): Promise<void> {
+async function waitForUrlSettled(
+  page: Page,
+  opts: { mayNavigate?: boolean } = {},
+  quietMs = 400,
+  budgetMs = 5000,
+): Promise<void> {
   const deadline = Date.now() + budgetMs;
   let last = page.url();
   let unchangedSince = Date.now();
+
+  // A NAVIGATION HAS TO BE GIVEN TIME TO START.
+  //
+  // "Unchanged for 400ms" is trivially true in the instant after a click, so
+  // without this the function returned before the redirect began and the sig
+  // was taken on the page being LEFT. That is not theoretical: it put
+  // `/auth/otp` in as the end state of the login segment, and because segments
+  // dedupe by slug that wrong boundary overwrote a correct one and broke a
+  // composition that had been working.
+  //
+  // Only for actions that can navigate — adding a second to every fill would
+  // cost a minute on a sixty-step recording for nothing.
+  const graceUntil = opts.mayNavigate ? Date.now() + 1200 : 0;
 
   while (Date.now() < deadline) {
     await page.waitForTimeout(50);
@@ -235,11 +267,14 @@ async function waitForUrlSettled(page: Page, quietMs = 400, budgetMs = 4000): Pr
     if (now !== last) {
       last = now;
       unchangedSince = Date.now();
-    } else if (Date.now() - unchangedSince >= quietMs) {
+    } else if (Date.now() - unchangedSince >= quietMs && Date.now() >= graceUntil) {
       return;
     }
   }
 }
+
+/** Actions that can trigger a navigation, and therefore need the grace above. */
+const NAVIGATING_ACTIONS = new Set(['click', 'press', 'goto', 'select']);
 
 /** Resolve a step's value, whether literal or a reference. */
 function valueFor(event: RawEvent, values: Record<string, string>): string | undefined {
@@ -253,10 +288,11 @@ export async function replay(
   opts: ReplayOptions = {},
 ): Promise<ReplayResult> {
   const {
-    values = {}, headless = true, timeoutMs = 10_000, captureBodies = true,
+    values = {}, headless = true, timeoutMs = 10_000, captureBodies = true, visualCheck,
     onDecision, lessonsFor,
   } = opts;
   const escalations: Escalation[] = [];
+  const visualChecks: VisualCheck[] = [];
 
   const browser: Browser = await chromium.launch({ headless });
   const context = await browser.newContext();
@@ -342,9 +378,16 @@ export async function replay(
       if (applied.length) {
         outcome.lessonsApplied = applied.map((l) => ({ lessonId: l.lessonId, kind: l.kind, title: l.title }));
       }
-      // A `wait` lesson exists because something on this page renders late.
-      // Settling before the action is the cheapest possible form of "do Y first".
-      if (applied.some((l) => l.kind === 'wait')) {
+      // A `wait` or `timing` lesson exists because something on this page
+      // resolves late. Settling before the action is the cheapest possible
+      // form of "do Y first".
+      //
+      // `timing` is included because that is what a distiller naturally calls
+      // it: the OTP lesson ("the code is validated asynchronously after the
+      // last digit, clicking Sign in immediately submits stale state") was
+      // written as `timing`, matched the step perfectly, and then did nothing
+      // — the lesson was right and the handler was too narrow to act on it.
+      if (applied.some((l) => SETTLE_KINDS.has(l.kind))) {
         await waitForAriaStable(page, 2000).catch(() => {});
       }
     }
@@ -354,6 +397,42 @@ export async function replay(
         const url = valueFor(event, values) ?? event.url;
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
         outcome.ok = true;
+      } else if (event.action === 'snapshot') {
+        // A checkpoint addresses no element — it is a moment, not a target.
+        // Settle first for the same reason sig() does: a picture taken
+        // mid-transition shows a layout that never existed, and would fail
+        // against every baseline including one taken from itself.
+        await waitForUrlSettled(page, { mayNavigate: true });
+        await waitForAriaStable(page, 1500);
+
+        if (visualCheck) {
+          const check = await captureCheckpoint(page, {
+            appSlug: visualCheck.appSlug,
+            runId: visualCheck.runId,
+            seq: event.seq,
+            label: event.value ?? `step-${event.seq}`,
+          });
+          visualChecks.push(check);
+          outcome.visual = check;
+
+          // SEVERE MEANS STOP. A third of the page changing is not a moved
+          // button; it is a blank render or an error screen, and sig() can
+          // miss both because landmarks survive. Driving the remaining steps
+          // into that produces cascading noise, not information.
+          if (!check.isNew && (check.ratio ?? 0) >= VISUAL_SEVERE) {
+            outcome.ok = false;
+            outcome.error =
+              `visual checkpoint "${check.label}" changed by ` +
+              `${((check.ratio ?? 0) * 100).toFixed(1)}% — stopping rather than running on`;
+          } else {
+            outcome.ok = true;
+          }
+        } else {
+          // Visual checking is opt-in: without a reasoner able to look at an
+          // image there is nobody to judge the result, and an unjudged diff is
+          // just a file on disk.
+          outcome.ok = true;
+        }
       } else {
         // frame_hint is matched by SUFFIX, never exactly — iframe ids are
         // routinely generated per session, and an exact match would fail on
@@ -473,7 +552,7 @@ export async function replay(
       // transition. The planner then rejects the semantically right segment
       // ("starts at /overview, execution is at /auth/otp") and binds its
       // neighbour instead.
-      await waitForUrlSettled(page);
+      await waitForUrlSettled(page, { mayNavigate: NAVIGATING_ACTIONS.has(event.action) });
       await waitForAriaStable(page, 1500);
       const sig = await computeSig(page);
       outcome.sig = sig.sig;
@@ -544,6 +623,54 @@ export async function replay(
     if (!outcome.ok) break;
   }
 
+  // THE VISUAL VERDICT, ONCE, AT THE END.
+  //
+  // Deliberately not per-checkpoint: a visual diff is a quality signal, not a
+  // safety one, so there is nothing to protect by stopping. Suspending mid-run
+  // would hold an open browser while a human-speed judge thinks, and a run
+  // cannot survive its process dying. Batching also lets the judge read the
+  // whole story — a diff at step 12 often only makes sense given step 40.
+  //
+  // The severe case already aborted above, where stopping did buy something.
+  const judgeable = worthJudging(visualChecks);
+  if (judgeable.length && onDecision) {
+    const question = {
+      checkpoints: judgeable.map((c) => ({
+        label: c.label,
+        step: c.seq,
+        changedFraction: Number((c.ratio ?? 0).toFixed(4)),
+        ...(c.resized ? { resized: true } : {}),
+        baselineImage: c.baselinePath,
+        currentImage: c.currentPath,
+        ...(c.diffPath ? { diffImage: c.diffPath } : {}),
+      })),
+      expects: {
+        verdicts: '[{ label, verdict: "regression" | "expected" | "noise", why }]',
+        note:
+          'OPEN THE IMAGE FILES before answering — the paths above are real files on ' +
+          'disk and the changed fraction alone cannot tell a moved timestamp from a ' +
+          'missing button. regression -> recorded as a finding; expected -> the current ' +
+          'shot becomes the new baseline so it stops firing; noise -> ignored, baseline kept.',
+      },
+    };
+    const answer: Record<string, unknown> = await onDecision({
+      kind: 'visual_diff',
+      context: question,
+    }).catch(() => ({}));
+    escalations.push({ step: -1, kind: 'visual_diff', question, answer });
+
+    // ACCEPTING A BASELINE IS THE POINT. Without it an intentional redesign
+    // fires on every run forever, which is exactly how visual testing gets
+    // switched off.
+    const verdicts = Array.isArray(answer.verdicts) ? answer.verdicts : [];
+    for (const raw of verdicts) {
+      const v = raw as { label?: string; verdict?: string };
+      if (v.verdict !== 'expected') continue;
+      const check = judgeable.find((c) => c.label === v.label);
+      if (check) await acceptBaseline(check).catch(() => {});
+    }
+  }
+
   await browser.close().catch(() => {});
 
   const failed = steps.filter((s) => !s.ok);
@@ -558,5 +685,6 @@ export async function replay(
     signals,
     durationMs: Date.now() - startedAt,
     escalations,
+    visualChecks,
   };
 }

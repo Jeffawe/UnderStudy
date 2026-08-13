@@ -21,6 +21,7 @@
  */
 
 import { getPool } from './db.js';
+import { patternOf } from './lessons.js';
 import { recall, isGap, GAP_DISTANCE, type RecalledChunk } from './recall.js';
 import { resolveSeam, persistProbedBridge, type Seam } from './seams.js';
 import type { Embedder } from './types.js';
@@ -165,7 +166,26 @@ interface FlowMeta {
 function stateAllows(current: string | null, flow: FlowMeta): boolean {
   if (current === null) return true;
   if (!flow.start_state) return true;
-  return flow.start_state === current;
+  if (flow.start_state === current) return true;
+
+  // SAME ROUTE, DIFFERENT FINGERPRINT IS A SEAM, NOT A REFUSAL.
+  //
+  // Exact sig equality as the BINDING gate makes the corpus self-invalidating.
+  // A sig covers title, landmarks and top control names, so /overview
+  // fingerprints differently once the account has a pending request — and
+  // segments dedupe by slug, so `log-in-as-a-member` carries whichever
+  // recording last wrote it. The result was that only the most recently
+  // ingested flow could compose: ingesting the rash capture broke hair loss,
+  // re-ingesting hair loss broke rash, and so on round the loop.
+  //
+  // The ladder already has the right answer for this. Rung 1 is "sigs match,
+  // concatenate"; rungs 2-4 exist precisely to bridge two states that don't.
+  // So bind when the ROUTE agrees and let seam resolution decide whether a
+  // bridge is needed — an unresolved seam still refuses to execute, which is
+  // where the real safety lives.
+  // patternOf splits a SIG ('/overview#71a7dc7c'), not a URL — urlPattern()
+  // normalises routes and leaves the fingerprint attached, so it never matched.
+  return patternOf(flow.start_state) === patternOf(current);
 }
 
 /**
@@ -348,7 +368,7 @@ export async function buildPlan(
     if (bound) {
       if (previous) {
         const fromEp = { slug: previous.slug, endState: previous.endState, startState: previous.startState };
-        const toEp = { slug: bound.slug, endState: bound.endState, startState: bound.startState };
+        const toEp = { slug: bound.slug, endState: bound.endState, startState: bound.startState, flowId: bound.flowId };
         let seam = await resolveSeam(appId, fromEp, toEp, opts.baseUrl ?? 'http://localhost');
 
         // RUNG 5 — everything cheaper has failed, so ask someone who can look.

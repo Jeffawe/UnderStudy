@@ -55,6 +55,23 @@ export interface SeamEndpoint {
   slug: string;
   endState: string | null;
   startState: string | null;
+  /** Needed to ask whether this segment navigates itself — see rung 1b. */
+  flowId?: string;
+}
+
+/**
+ * Does this flow open by navigating?
+ *
+ * A segment whose first step is a `goto` reaches its own starting page from
+ * wherever execution happens to be, so there is nothing for a bridge to do.
+ */
+async function opensWithGoto(flowId: string): Promise<boolean> {
+  const { rows } = await getPool().query<{ action: string }>(
+    `SELECT s.action FROM flow_steps fs JOIN steps s ON s.step_id = fs.step_id
+     WHERE fs.flow_id = $1 ORDER BY fs.ordinal LIMIT 1`,
+    [flowId],
+  );
+  return rows[0]?.action === 'goto';
 }
 
 const patternOf = (sig: string) => sig.slice(0, sig.lastIndexOf('#')) || sig;
@@ -173,6 +190,27 @@ export async function resolveSeam(
       kind: 'contiguous',
       rung: 1,
       detail: 'states match — concatenate, no bridging steps',
+      steps: [],
+    };
+  }
+
+  // --- rung 1b: the destination navigates itself ---------------------------
+  //
+  // A live probe found this one. Login ends on /overview and the rash segment
+  // starts on /overview, but with a different fingerprint — six distinct
+  // /overview sigs have been recorded, because the page renders request status
+  // and notifications that change over time. No bridge exists because none is
+  // needed: the segment's first step is `goto /select-condition`.
+  //
+  // Without this the honest probe answer ("no steps") is indistinguishable
+  // from "I could not work it out", and both block. That is the wrong shape:
+  // fail-closed should mean "I do not know", not "I know it is vacuous".
+  if (to.flowId && (await opensWithGoto(to.flowId))) {
+    return {
+      ...base,
+      kind: 'contiguous',
+      rung: 1,
+      detail: 'destination opens with its own goto — it navigates itself, no bridge needed',
       steps: [],
     };
   }

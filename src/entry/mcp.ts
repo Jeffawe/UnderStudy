@@ -361,9 +361,16 @@ server.registerTool(
       values: z.record(z.string(), z.string()).optional().describe('e.g. {"SECRET.password": "hunter2"}'),
       dryRun: z.boolean().optional().describe('plan only, never open a browser'),
       allowPurchases: z.boolean().optional().describe('permit a destructive plan (default: refuse)'),
+      visualCheck: z
+        .boolean()
+        .optional()
+        .describe(
+          'capture visual checkpoints and ask you to judge any that changed (default: on). ' +
+            'You will be given image PATHS — open them before answering.',
+        ),
     },
   },
-  async ({ appSlug, goal, values, dryRun, allowPurchases }) => {
+  async ({ appSlug, goal, values, dryRun, allowPurchases, visualCheck }) => {
     const appId = await appIdFor(appSlug);
     if (!appId) return fail(`unknown app '${appSlug}'`);
     try {
@@ -374,6 +381,10 @@ server.registerTool(
           ...(allowPurchases
             ? { env: { allowsPurchases: true, allowsIrreversible: true, name: 'tool --allowPurchases' } }
             : {}),
+          // Default ON here and nowhere else: reaching this tool means the
+          // reasoner is an agent that can open a PNG. The Bedrock path cannot,
+          // and leaves it off.
+          visualCheck: visualCheck ?? true,
         }),
       );
     } catch (err) {
