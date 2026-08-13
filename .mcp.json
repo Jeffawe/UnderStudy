@@ -1,5 +1,9 @@
 {
   "mcpServers": {
+    "understudy": {
+      "command": "npx",
+      "args": ["tsx", "src/entry/mcp.ts"]
+    },
     "playwright": {
       "command": "npx",
       "args": ["-y", "@playwright/mcp@latest"]
