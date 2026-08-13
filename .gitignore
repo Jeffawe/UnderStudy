@@ -17,6 +17,11 @@ dist/
 # that is customer data. Opt in per recording by force-adding a fixture.
 .understudy/recordings/
 
+# Exploration specs written up after driving an unknown flow by hand. Same
+# reasoning as recordings: the steps carry whatever was typed into a real form,
+# and the fixtures beside them can be patient photos.
+.understudy/explorations/
+
 # Distiller cache, keyed by recording hash — regenerable, but expensive to lose
 .understudy/cache/
 .understudy/distilled/
@@ -37,3 +42,6 @@ playwright-report/
 *.tunnel.json
 
 .DS_Store
+
+# Playwright MCP scratch output: page snapshots, console logs, screenshots
+.playwright-mcp/
