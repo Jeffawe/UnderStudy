@@ -147,6 +147,36 @@ export async function executePlan(
       events.push({ ...e, seq: events.length, ts: events.length });
     }
     flowsRun.push(sub.bound.slug);
+
+    // A VISUAL CHECKPOINT AT EVERY SEGMENT BOUNDARY.
+    //
+    // Recorded checkpoints only exist where whoever wrote the original spec
+    // happened to put one, so a novel composition could run end to end with no
+    // visual coverage at all — and a novel composition is exactly the case
+    // nobody has ever looked at.
+    //
+    // The boundary is the right place, and one shot per segment is the right
+    // density. A segment already IS the unit of reuse and its end already IS a
+    // state boundary as far as sig() is concerned; shooting every step instead
+    // would produce sixty images and drown the judge.
+    //
+    // KEYED BY SLUG, which is what makes the baseline reusable: every goal that
+    // ends up running `provide-shipping-address` compares against the same
+    // reference, no matter which flow it was spliced into. Visual memory then
+    // belongs to the segment, exactly as step memory does.
+    if (opts.visualCheck && events[events.length - 1]?.action !== 'snapshot') {
+      // Skipped when the segment already ends in a recorded checkpoint —
+      // shooting the same page twice teaches nothing and costs a settle.
+      const last = events[events.length - 1];
+      events.push({
+        seq: events.length,
+        ts: events.length,
+        action: 'snapshot',
+        value: sub.bound.slug,
+        url: last?.url ?? startUrl,
+        resolution: 'synthesized',
+      });
+    }
   }
 
   const recording = buildRecording(

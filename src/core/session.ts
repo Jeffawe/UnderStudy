@@ -86,6 +86,14 @@ export interface StartRunOptions {
   env?: { allowsPurchases: boolean; allowsIrreversible: boolean; name?: string };
   dryRun?: boolean;
   headless?: boolean;
+  /**
+   * Capture visual checkpoints and have the reasoner judge them.
+   *
+   * Gated on the reasoner rather than always-on: judging a diff means looking
+   * at an image, which the host agent can do and the Bedrock adapter cannot.
+   * Capturing for a reasoner that can't look just fills a directory.
+   */
+  visualCheck?: boolean;
 }
 
 export async function resolveBaseUrl(appId: string, appSlug: string): Promise<string> {
@@ -118,6 +126,7 @@ export async function runPipeline(
   appSlug: string,
   goal: string,
   baseUrl: string,
+  runId: string,
   opts: StartRunOptions = {},
 ): Promise<RunOutcome> {
   const vocabulary = await fetchVocabulary(appId);
@@ -144,6 +153,7 @@ export async function runPipeline(
   const exec = await executePlan(plan, baseUrl, appSlug, {
     values: opts.values ?? {},
     ...(opts.headless === false ? { headless: false } : {}),
+    ...(opts.visualCheck ? { visualCheck: { appSlug, runId } } : {}),
     // THE MID-RUN ESCALATION. The executor drives; when it cannot decide —
     // an unexpected page, a step that failed — it escalates here. In Mode B
     // that suspends and the agent answers; in Mode A it is another API call.
@@ -168,7 +178,7 @@ export async function startRun(
   const runId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 
   // Detached: the tool call must return at the first suspension, not sit here.
-  const settled = runPipeline(embedder, reasoner, appId, appSlug, goal, baseUrl, opts);
+  const settled = runPipeline(embedder, reasoner, appId, appSlug, goal, baseUrl, runId, opts);
 
   // Swallow here so an unhandled rejection cannot take the process down; the
   // error is surfaced through advance() instead.

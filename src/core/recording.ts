@@ -27,6 +27,10 @@ export type RecordedAction =
   | 'uncheck'
   | 'upload'
   | 'wait_url'
+  // A visual checkpoint: take a picture here and compare it to the baseline.
+  // Carried by the schema's action CHECK from the start; nothing emitted it
+  // until the parser learned to read the spec's own checkpoint calls.
+  | 'snapshot'
   | 'assert';
 
 /**
@@ -45,7 +49,13 @@ export type RecordedAction =
  *                   statically. The replay stage can upgrade these by looking
  *                   at the live element.
  */
-export type Resolution = 'accname' | 'script-literal' | 'unresolved';
+export type Resolution =
+  | 'accname'
+  | 'script-literal'
+  // Not from a recording at all: a step the planner invented while splicing,
+  // such as the visual checkpoint it adds at each segment boundary.
+  | 'synthesized'
+  | 'unresolved';
 
 export interface RawEvent {
   /** Position in the recording. Dense, 0-based, assigned by the source. */
