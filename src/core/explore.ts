@@ -23,6 +23,7 @@
 import { chromium, type Browser, type Page } from 'playwright';
 import type { Embedder } from './types.js';
 import { getPool, tx, ensureMeta } from './db.js';
+import { selectorIdentity } from './selector-identity.js';
 import { computeSig, parseAria, waitForAriaStable, type PageSig } from './sig.js';
 import { toVector } from './recall.js';
 
@@ -201,13 +202,19 @@ export async function explore(
     const key = `${role}|${name}`;
     const cached = selectorIds.get(key);
     if (cached) return cached;
+    // Never null here: explore REFUSES controls with no accessible name (they
+    // become `unnamed` boundary facts), so `name` is always non-empty by the
+    // time this is reached — but compute it through the shared helper anyway,
+    // so the three writers cannot drift apart.
+    const identity = selectorIdentity({ role, name, frameHint: '' });
+    if (!identity) throw new Error(`explore tried to store an unidentifiable element (role=${role})`);
     const { rows } = await pool.query<{ selector_id: string }>(
-      `INSERT INTO selectors (app_id, role, name, frame_hint, fragility, observed_only)
-       VALUES ($1, $2, $3, '', 'stable', true)
-       ON CONFLICT (app_id, role, name, frame_hint)
+      `INSERT INTO selectors (app_id, identity, role, name, frame_hint, fragility, observed_only)
+       VALUES ($1, $4, $2, $3, '', 'stable', true)
+       ON CONFLICT (app_id, identity)
          DO UPDATE SET last_seen_at = now()
        RETURNING selector_id`,
-      [appId, role, name],
+      [appId, role, name, identity],
     );
     const id = rows[0]!.selector_id;
     selectorIds.set(key, id);

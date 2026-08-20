@@ -27,7 +27,7 @@
 
 import { createHash } from 'node:crypto';
 import type pg from 'pg';
-import { tx } from './db.js';
+import { tx, getPool } from './db.js';
 import type { CapturedSignal, ReplayResult } from './replay.js';
 import { detectDrift, recordDrift, type Drift } from './drift.js';
 import { rollUpSelectorHealth, type HealthRollup } from './health.js';
@@ -190,6 +190,64 @@ export function extractFindings(result: ReplayResult, goal: string): FindingDraf
 
 /** `/inventory.html#bf3dd322` → `/inventory.html`. */
 const patternOf = (sig: string) => sig.slice(0, sig.lastIndexOf('#')) || sig;
+
+export interface AttributedRunOptions {
+  appId: string;
+  goal: string;
+  passed: boolean;
+  /**
+   * Page fingerprints observed, in order, if the driver captured any.
+   *
+   * Optional because a hand-written script usually has URLs, not sigs. An
+   * empty sequence still records that the goal ran and what the outcome was;
+   * it simply cannot serve as a drift baseline, and `detectDrift` already
+   * skips zero-length histories rather than reporting a phantom diff.
+   */
+  sigSequence?: string[];
+  /** How it was actually driven — recorded so the claim stays honest. */
+  drivenBy?: string;
+  note?: string;
+}
+
+/**
+ * Record a run that Understudy did NOT drive.
+ *
+ * The operating contract permits reaching a goal by any means — a script, the
+ * browser directly, an API call — and for a third-party checkout or an
+ * unimplemented IR action that is the only option. What nobody noticed is that
+ * taking the escape hatch opted out of the whole feedback loop: no run row, no
+ * drift baseline, no trace that the goal had ever succeeded. On providernow a
+ * paid intake completed on 2026-08-20 while the newest run row still read
+ * 2026-08-13.
+ *
+ * This is deliberately NOT `recordRun`. There is no ReplayResult here, so there
+ * are no step outcomes, no signals, and no selector health to fold — claiming
+ * otherwise would put unearned confidence into the health model. What it does
+ * record is exactly what an outside driver can honestly attest: this goal ran,
+ * this was the outcome, this is the path if I saw one, and Understudy was not
+ * the one driving.
+ */
+export async function recordAttributedRun(opts: AttributedRunOptions): Promise<{ runId: string; drift?: Drift }> {
+  const { appId, goal, passed, sigSequence = [], drivenBy, note } = opts;
+
+  // Measured BEFORE the row is written, so the baseline excludes this run.
+  const drift = sigSequence.length ? await detectDrift(appId, goal, sigSequence) : undefined;
+
+  const { rows } = await getPool().query<{ run_id: string }>(
+    `INSERT INTO runs (app_id, goal, mode, status, sig_sequence, plan, finished_at)
+     VALUES ($1,$2,'attributed',$3,$4,$5, now())
+     RETURNING run_id`,
+    [
+      appId,
+      goal,
+      passed ? 'passed' : 'failed',
+      JSON.stringify(sigSequence),
+      JSON.stringify({ drivenBy: drivenBy ?? 'external', ...(note ? { note } : {}) }),
+    ],
+  );
+
+  return { runId: rows[0]!.run_id, ...(drift ? { drift } : {}) };
+}
 
 export async function recordRun(
   result: ReplayResult,

@@ -1,4 +1,4 @@
-# Status — 2026-08-19
+# Status — 2026-08-20
 
 Where the build actually is. `PLAN.md` is the architecture; this is the progress
 marker. **If you are here to ACT as the reasoner rather than to build, read
@@ -20,15 +20,15 @@ That last command is the end-to-end proof: it binds two segments that came from
 `dry run — plan is executable`, the whole stack is alive.
 
 **Mode B is live.** The `understudy` MCP server is registered in `.mcp.json` and
-exposes nine tools; the host agent is the reasoner and the distiller. Mode A
+exposes eleven tools; the host agent is the reasoner and the distiller. Mode A
 (Bedrock) is written but has never made a real call — model access is still
 pending.
 
 **Two corpora.** `saucedemo` (synthetic, first corpus, has known data defects —
 see below) and `providernow` (real telehealth app on `localhost:3000`, **29
 flows** — 4 recorded, 20 named segments, 5 mined macros — across four services:
-hair loss, weight loss, general rash, and sore throat). 34 facts, 14 lessons, 49
-page states mapped after the 2026-08-19 exploration fix (below).
+hair loss, weight loss, general rash, and sore throat). 37 facts, 15 lessons, 49
+page states, 66 memory chunks, 16 open findings as of 2026-08-20.
 
 ---
 
@@ -1285,8 +1285,163 @@ facts/lessons, confirm with the user first but batch the ask at a natural
 pause rather than blocking per-row). Corrected the `scroll_container` and
 macro-retrieval gotchas to match the fixes above.
 
-Corpus after this session: providernow at 29 flows (4 recorded, 20 segments,
-5 macros), 34 facts, 14 lessons, 49 page states, 63 memory chunks.
+Corpus after that session: providernow at 29 flows (4 recorded, 20 segments,
+5 macros), 34 facts, 14 lessons, 49 page states, 63 memory chunks. (See
+2026-08-20 below for the current numbers.)
+
+## 2026-08-20 — a real paid run, and five fixes aimed at the cost of using it
+
+**The hair loss intake was booked, paid and verified end to end.** Goal: book
+hair loss (male), pay, and check whether it actually appeared. Corpus consulted
+first (`recall`, vocabulary, `flows.corrections`), then driven by
+`.understudy/explorations/hair-loss-full-checkout.ts` rather than the executor —
+the payment tail is a Stripe-hosted page the IR cannot express, and ingest
+replays every recording, so a stored "Confirm & Submit" would file a real order
+on every ingest.
+
+```
+VERDICT: virtual request CREATED        order /success/4
+Overview        Aug 20, 2026 · Hair Loss (Male) · Pending
+Visit History   11 -> 13 rows, incl. the same row
+Messages        newest 2026-08-19T14:35:56 -> 2026-08-20T15:35:27
+```
+
+**This contradicts 2026-08-19, and the difference is probably the tunnel.** That
+run paid successfully and created nothing. This one checked ngrok and the
+Laravel API were up *before* starting. Recorded as a fact so nobody files a
+phantom backend bug: check the tunnel first. Browser run 90s; whole task ~6 min
+of agent time, 668k new tokens (11.5M processed, 94% cache reads).
+
+**Retrieval is in good shape; COMPOSITION was the weak part.** Decomposing into
+7 segments bound all 7 at 0.37–0.48 — no wrong-service confusion at all — but
+produced 2 unresolved seams and 1 unbound. Binding the parent recording as a
+single sub-goal gave 59 steps and **zero** seams.
+
+### Five fixes, in the order they pay off
+
+**1. The decompose payload was 48% crawler noise.** `fetchVocabulary` now takes
+a `purpose`; planning gets authored facts only. The discriminator is NOT `kind`
+or `source` — the genuinely useful "Visit History is at /uploaded-documents" is
+`structure`+`explored`, and filtering on either would have deleted it. It is
+`scope.key`, which `explore` stamps on every claim it generates. **4,402 → 2,764
+tokens per decompose**, all 15 authored facts kept.
+
+**2. Seam rung 1a — adjacent slices of the same recording.** Segments share the
+parent's step rows, so if A ends at parent ordinal *j* and B starts at *j+1*,
+running A then B IS the recording and no bridge can be needed, whatever the
+fingerprints say. The original plan here was to collapse the run into its parent
+flow; reading the code killed that — the 6 bound segments were 51 steps against
+the parent's 59, so collapsing would have silently executed 8 extra steps
+including the submit. Rung 1a changes nothing about what executes.
+
+**3. `understudy_remember` + `understudy remember <slug> <file>`.** The first
+write path that is not a side effect of `explore`/`ingest`/`triage`. Batched,
+validates everything up front, returns every problem at once, writes nothing
+unless the whole batch is clean. Refuses an empty lesson `trigger` (contained by
+every step context, so it would fire on all of them) and a fact carrying
+`scope.key` (it would hide itself from fix 1 forever).
+
+**4. Seam probes now carry EVIDENCE.** `seamEvidence()` sends the destination's
+opening steps, the source's closing steps, edges out of the current state, and
+segments touching either end. Answering rung 5 used to mean four hand-written
+SQL queries per seam, re-deriving what the process already held. This is the
+question where a wrong answer is *permanent*, so the point is not only cheapness:
+handed the evidence, the correct refusal is obvious.
+
+**5. Unnamed controls flagged at ingest** as `addressability` findings
+(`db/07` adds that kind — it had no slot, so a real automation blocker had to be
+filed as `other`). Verified against saucedemo's sort dropdown.
+
+### THE SELECTOR KEY WAS WRONG IN BOTH DIRECTIONS — `db/08`
+
+Found while implementing fix 5. `UNIQUE (app_id, role, name, frame_hint)` was
+inert when those columns were nullable (`db/02`, `db/04` fixed that). Making
+them `NOT NULL DEFAULT ''` swung it the other way: **every unnamed element
+shared the key `('','','')`**. On providernow, 92 steps pointed at 2 rows, one
+holding **52 distinct elements** — OTP digits, "I accept", "Raised bumps", the
+Services nav div and the review pane, as one element with one health score.
+
+**It corrupted execution, not just metrics.** `execute.ts` reads `css` from this
+table, so all 52 reconstructed with `.review-pane` — one element's selector
+handed to fifty-one others.
+
+Now keyed on a computed `identity` (`src/core/selector-identity.ts`): accessible
+name → test id → css → **no row at all**. Rule 1 is byte-identical to the old
+key, so all 100 named elements dedupe exactly as before. Applied to both
+targets; local 121 rows / 121 distinct identities, cloud 15 / 15.
+
+**Not repaired: history.** The migration cannot un-merge those rows — the
+per-element css was overwritten when they collapsed. providernow still carries
+the two corrupt rows (52 and 40 steps). Only re-ingesting rebuilds them from the
+recording files, and that is ~4 logins on a rate-limited account. The bug cannot
+recur; the existing data stays wrong until someone spends them.
+
+Corpus after this session: providernow at 29 flows, **37 facts, 15 lessons**,
+49 page states, 66 memory chunks, 16 open findings.
+
+### The reinforcement loop was idle — three fixes
+
+Asked whether succeeding at a goal reinforces the memory. It should; it was not.
+Evidence at the time: newest providernow run row **2026-08-13** despite a
+successful paid run that day, **all 15 lessons at `times_applied = 0`**, and
+1213 selector successes against **0 recorded failures**.
+
+Root cause: the whole feedback loop was coupled to `execute.ts`. Driving a goal
+any other way — which the contract explicitly permits, and which a Stripe
+checkout forces — silently opted out of every counter, and nothing said so.
+
+**1. `mode='attributed'` runs (`db/09`, `recordAttributedRun`).** A goal driven
+by a script can now record that it ran, what happened, and the path if one was
+observed. Kept distinct from `'execute'` on purpose: "this goal works" and "the
+executor can do this" are different claims and only one is self-verifying.
+Surfaced as `understudy_record_run` and `understudy attribute`. Today's paid run
+is now recorded. Verified drift feeds off it: same path twice → no drift, changed
+path → `DRIFT vs the last 2 passing run(s)`.
+
+**2. Lessons are consulted and counted on the replay paths too.** `lessonsFor`
+was passed only by `execute.ts`, and `markApplied` lived only there — so the
+verification replay inside `ingest`/`distill` neither consulted the corpus nor
+moved a counter. Extracted `foldLessonOutcomes` into `lessons.ts`; all three CLI
+replay sites now bind it. Verified on a real replay: `lessons 1 fired, 0 on
+steps with a history of failing`.
+
+**3. `times_helped` redefined, because the old one was unfalsifiable.** It meant
+"the step passed" — but on a healthy flow every step passes, so it tracked
+`times_applied` almost exactly and could not distinguish a load-bearing lesson
+from a harmless one. Now: the step passed **and** a step of that fingerprint has
+failed before (`fingerprintHasFailed`, over `run_events`). Verified both ways —
+no failure history: applied +1 / helped +0; with one: applied +1 / helped +1.
+`stepFingerprint` moved to `src/core/fingerprint.ts` so `lessons.ts` need not
+import all of `ingest.ts`.
+
+Consequence worth expecting: `times_helped` will read 0 across this corpus for a
+while. That is now *informative* rather than broken — there are currently **zero**
+fingerprints with a recorded failure anywhere, since the single timeout event has
+a NULL `step_id` (detached by a re-ingest, per `db/03`).
+
+### GOTCHA: `npm run explore:check` deletes the saucedemo corpus
+
+`explore-check.ts:25` opens with `DELETE FROM apps WHERE slug = 'saucedemo'`,
+which cascades through flows, steps, selectors, findings and chunks. It is a
+fixture builder, not a read-only test. Run as a routine regression check, it
+destroyed the addressability finding verified ten minutes earlier — the
+verification was real, the evidence simply stopped existing. Re-ingested to
+restore it. `recall:check` is safe; it scopes to its own `recall-check` slug.
+Do not store anything you care about under `saucedemo`.
+
+### Sub-goal ORDER is load-bearing, and I got it wrong
+
+Rung 1a did not fire where expected, which exposed the real cause of two of the
+"unresolved" seams: the decomposition was in the wrong sequence. The recorded
+order is contact details → date of birth → address → **health questions last**,
+not the order a person would describe it in. Re-run in the recorded order, all
+six seams resolve. Documented in `REASONER.md` with the query to check it.
+
+Also re-scoped `submit-the-intake-questionnaire` →
+`submit-the-urgent-primary-care-questionnaire` (it is cut from one UPC recording
+and starts at `/select-condition`, but its generic name made it compete for the
+submit slot on hair-loss and weight-loss routes it cannot serve), chunk
+re-embedded.
 
 ## Not built at all
 
@@ -1323,18 +1478,34 @@ Corpus after this session: providernow at 29 flows (4 recorded, 20 segments,
 2. **`wait_text`.** The remaining blocker on intake flows that gate behind
    async validation text rather than a scroll. `scroll_container` no longer
    blocks anything (shipped 2026-08-19).
-3. **Execute a composed plan for real** — every plan so far has been `--dry-run`.
-   The sore throat flow is now the best candidate: on the one-time visit route
-   nothing is filed until "Pay Now", so it can be run end to end without
-   creating a care request.
-4. **Session reuse in replay** (storage state), which removes the rate-limit
+3. **Give the corpus a real failure history.** `times_helped` now requires
+   evidence that a step of that fingerprint has failed before, and there are
+   currently **zero** such fingerprints — the one timeout event has a NULL
+   `step_id`. Until a genuine failure is recorded against a live step row, every
+   lesson will read `helped = 0`. Nothing to build; it just needs runs.
+4. **Re-ingest providernow to repair its selector rows.** `db/08` fixed the key
+   going forward but cannot un-merge what already merged — the per-element css
+   was overwritten. Two rows still stand for 92 steps (52 and 40). Costs ~4
+   logins on a rate-limited account, so batch it with anything else that needs
+   a replay, and do it before trusting selector health or quarantine on this
+   corpus.
+5. **Execute a composed plan for real** — every plan so far has been `--dry-run`,
+   and 2026-08-20's paid run was driven by a script, not the executor. The sore
+   throat flow is still the best candidate: on the one-time visit route nothing
+   is filed until "Pay Now", so it can be run end to end without creating a care
+   request. The hair loss composition now resolves all seams (rung 1a), so it is
+   a candidate too, up to the payment tail.
+6. **Session reuse in replay** (storage state), which removes the rate-limit
    ceiling on how much can be ingested per window. This bit hard again on
-   2026-08-14 — a replay failed mid-run purely from lockout.
-5. **Test variants** — see "Missing testing layer" above. The upload-size work
+   2026-08-14 — a replay failed mid-run purely from lockout, and it is what
+   makes item 3 expensive.
+7. **Test variants** — see "Missing testing layer" above. The upload-size work
    on 2026-08-14 is the second one-off harness written for want of this.
-6. **Bedrock**, once model access lands.
-7. **Dedupe lessons** — re-ingesting a recording writes a second copy of each.
-8. **Env-var fallback for `--value`**, so credentials never have to be typed
+8. **Bedrock**, once model access lands.
+9. **Dedupe lessons** — re-ingesting a recording writes a second copy of each.
+   `understudy_remember` already dedupes on title; `ingest` does not, so the two
+   write paths disagree. Lift the same check into `ingest`.
+10. **Env-var fallback for `--value`**, so credentials never have to be typed
    on a command line. See "Not built at all" above.
 
 ---

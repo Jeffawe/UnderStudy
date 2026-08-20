@@ -23,7 +23,7 @@
 import { getPool } from './db.js';
 import { patternOf } from './lessons.js';
 import { recall, isGap, GAP_DISTANCE, type RecalledChunk } from './recall.js';
-import { resolveSeam, persistProbedBridge, type Seam } from './seams.js';
+import { resolveSeam, persistProbedBridge, type Seam, seamEvidence } from './seams.js';
 import type { Embedder } from './types.js';
 
 export interface BoundStep {
@@ -87,6 +87,14 @@ export interface PlanOptions {
     toSlug: string;
     fromState: string;
     toState: string;
+    /**
+     * What the server already knows about this gap — the destination's opening
+     * steps, the source's closing steps, edges out of the current state, and
+     * any segment touching either end. Sent because the answer is PERSISTED
+     * and reused forever, so the probe must not have to guess. See
+     * seamEvidence() for why each field is there.
+     */
+    evidence?: Record<string, unknown>;
   }) => Promise<{ steps?: Array<{ action: string; role?: string; name?: string; testId?: string; css?: string; value?: string }> }>;
   /**
    * What is already true when the plan starts.
@@ -367,7 +375,9 @@ export async function buildPlan(
 
     if (bound) {
       if (previous) {
-        const fromEp = { slug: previous.slug, endState: previous.endState, startState: previous.startState };
+        // flowId on BOTH endpoints: rung 1a asks whether these two are adjacent
+        // slices of one recording, which needs to identify both sides.
+        const fromEp = { slug: previous.slug, endState: previous.endState, startState: previous.startState, flowId: previous.flowId };
         const toEp = { slug: bound.slug, endState: bound.endState, startState: bound.startState, flowId: bound.flowId };
         let seam = await resolveSeam(appId, fromEp, toEp, opts.baseUrl ?? 'http://localhost');
 
@@ -378,6 +388,11 @@ export async function buildPlan(
             toSlug: bound.slug,
             fromState: previous.endState,
             toState: bound.startState,
+            evidence: await seamEvidence(
+              appId,
+              { slug: previous.slug, flowId: previous.flowId, endState: previous.endState },
+              { slug: bound.slug, flowId: bound.flowId, startState: bound.startState },
+            ),
           });
 
           if (probed.steps?.length) {

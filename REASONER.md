@@ -47,6 +47,23 @@ browser actually gets driven is an implementation detail you are free to choose.
   flow is known, what its traps are, and — via `flows.corrections` — where a
   recording deliberately stops and why. Reading that before acting routinely
   saves an entire wasted run.
+- **Decompose before you recall, no matter which path you end up driving with.**
+  `understudy_run_plan` does this unconditionally — the deterministic pipeline
+  calls `decompose` before recall ever runs, every time, whether or not it
+  turns out to need a second question. That is not incidental: a single
+  unbroken goal is a weak semantic-search query, and a multi-part goal binds
+  one flow where several sub-goals would have bound the right ones. If you are
+  driving by hand instead of through `run_plan` — a script, the browser
+  directly, calling `understudy_recall` yourself — do the same decomposition
+  yourself before you query. Not every model reaches for this on its own; do
+  it deliberately, every run, not only when the pipeline forces it on you. See
+  `decompose` below for how — phrase sub-goals in the app's own vocabulary.
+- **Say the decomposition out loud, not just inside the tool call.** `subGoals`
+  is an argument the user does not see. State it in your own turn too —
+  "decomposing into: log in as a member, choose the hair loss service" —
+  before you act on it. It is the single highest-leverage judgment call in a
+  run; one the user cannot see is one they cannot correct before it drives
+  twenty minutes of the wrong retrieval.
 - **If Understudy's executor cannot achieve the goal, use whatever can.** A
   Playwright script, the browser directly, MCP calls, curl against the app's
   API. Reaching the goal is the job; the executor is not sacred. A tail that
@@ -71,7 +88,7 @@ gain it.
 
 ## Setup
 
-The `understudy` MCP server is in `.mcp.json`. Nine tools, prefixed
+The `understudy` MCP server is in `.mcp.json`. Eleven tools, prefixed
 `understudy_`. It needs CockroachDB running:
 
 ```bash
@@ -115,11 +132,65 @@ understudy_save_distilled(hash, distilled)   → validates, then writes
 Nothing is written until it validates. Invalid input returns **every** problem at
 once so you can fix and retry.
 
+### Writing down what you learned
+
+```
+understudy_remember(appSlug, { facts?, lessons?, findings? })
+```
+
+The only tool here that WRITES on your initiative rather than answering a
+question the pipeline asked. One call takes all three kinds — batched on
+purpose, because the rule below is to gather what you learned and put the whole
+list to the user at a natural pause, and an API that took one item at a time
+would quietly push you into interrupting them per row.
+
+Same contract as `save_distilled`: validated first, **every** problem returned
+at once, and nothing written unless the whole batch is clean. A `--dry-run`
+equivalent is not needed — send the batch, and a bad one costs nothing.
+
+`understudy remember <slug> <file.json>` is the same thing from the CLI.
+
+### Recording a goal you drove yourself
+
+```
+understudy_record_run(appSlug, goal, passed, sigSequence?, drivenBy?, note?)
+```
+
+**Call this every time you reach a goal without the executor.** Driving it
+yourself is allowed and often necessary — but it used to leave no trace at all:
+no run row, no drift baseline, nothing showing the goal had ever worked.
+Measured on providernow, a paid intake succeeded on 2026-08-20 while the newest
+run row still read 2026-08-13. The reinforcement loop only turns when a run is
+recorded.
+
+Stored as `mode='attributed'`, deliberately never `'execute'` — *"this goal
+works"* and *"the executor can do this"* are different claims, and only the
+second is self-verifying. Supply `sigSequence` **only if you actually observed
+page fingerprints**; a path you did not watch is not a baseline, and an empty
+one is honest (drift skips it rather than reporting a phantom diff).
+
+`understudy attribute <slug> <goal> [--failed] [--sig …] [--driven-by …] [--note …]`
+from the CLI.
+
+Two rejections worth knowing before they surprise you:
+
+- **An empty `trigger` on a lesson is refused.** JSONB containment means `{}` is
+  contained by every step context, so the lesson would fire on all of them.
+- **A fact carrying `scope.key` is refused.** That key marks a crawler-generated
+  page-map claim, and the planning vocabulary filters those out — so an authored
+  fact wearing one would hide itself from every future `decompose`.
+
 ---
 
 ## The four questions you will be asked
 
 ### 1. `decompose` — split a goal into sub-goals
+
+Always do this — see *What Understudy is for* above if you are not driving
+through `run_plan` and so have to trigger it yourself rather than the pipeline
+doing it for you. And say the sub-goals in your own reply, not only inside the
+tool call — the user should see the breakdown before it drives retrieval, not
+only the flows it eventually binds.
 
 You get the goal and the app's **entire vocabulary**. Answer:
 
@@ -135,6 +206,32 @@ interaction: "log in as a member" is one sub-goal, not five.
 
 Include prerequisites the user left implicit. Someone asking to "check out" on
 an app that requires login means log in first.
+
+**A sub-goal list is an ORDER, not a set.** Each binding is judged from the
+state its predecessor leaves behind, so listing the right segments in the wrong
+sequence manufactures seams that do not exist and can send you probing a gap
+across nothing. This is easy to get wrong because a *sensible* order and the
+*recorded* order are often different: on the ProviderNow hair loss intake the
+contact details come before the date of birth, and the health questions come
+**last** — decomposing it in the order a person would describe it produced two
+"unresolved" seams that vanished once the order matched the recording.
+
+When the segments you are about to name all came from one recording, check what
+that recording actually did before committing to an order:
+
+```sql
+SELECT seg.slug, min(pfs.ordinal), max(pfs.ordinal)
+FROM flows seg
+JOIN flow_steps sfs ON sfs.flow_id = seg.flow_id
+JOIN flow_steps pfs ON pfs.step_id = sfs.step_id
+JOIN flows p ON p.flow_id = pfs.flow_id AND p.source = 'recorded'
+WHERE p.slug = '<the recording>' AND seg.source = 'sliced'
+GROUP BY seg.slug ORDER BY 2;
+```
+
+And if a whole recording already covers the goal, **one sub-goal naming that
+flow beats seven naming its parts** — it binds the parent directly and has no
+seams to resolve at all.
 
 ### 2. `seam` — how do we get from one segment to the next?
 
@@ -282,6 +379,12 @@ what you propose to store, keep working, and put the whole list to the user at a
 natural pause: one message, one line per item, each tagged with the kind you
 propose. They approve or cut, then you write. Nothing blocks.
 
+**Write it with `understudy_remember`** (see *Writing down what you learned*
+above) — one call for the whole approved batch. Do not hand-write SQL for this:
+a fact and its `memory_chunks` row must go in as one transaction, and a fact
+written without its chunk is invisible to `recall()` **forever**, with nothing
+ever reporting it missing.
+
 Which kind it is:
 
 > A **fact** is declarative and retrieved BY MEANING at planning time.
@@ -308,6 +411,15 @@ what an environment does or forbids.
 never matched anything, and a trigger that never matches looks exactly like one
 that was never right. When you write a lesson, check the trigger against a
 plausible step context rather than assuming containment does what you meant.
+
+**`times_helped` means something specific and strict:** the guarded step passed
+**and** a step of that same fingerprint has failed before. Simply "the step
+passed" was the old definition and it was nearly useless — on a healthy flow
+every step passes, so the two counters moved together and the ratio could not
+tell a load-bearing lesson from a harmless one. So `applied` high with `helped`
+at zero is not a bug; it reads *"this has never fired on a step with a history
+of going wrong"*, which usually means the trigger is too broad or the lesson has
+outlived its cause.
 
 ---
 
@@ -370,6 +482,27 @@ selector.** On ProviderNow, `/select-condition` renders nothing but the sidebar
 on the first visit after login; a second `goto` renders the list. Two replays
 were spent blaming the locator. Before rewriting a selector, check whether the
 page rendered at all — `body.innerText` answers it in one call.
+
+**A seam probe now arrives with EVIDENCE — read it before answering.** The
+request carries the destination's opening steps, the source's closing steps,
+the known page edges out of the state you are stuck in, and any segment
+touching either end. That is there so you do not have to go digging, and so the
+honest refusal is visible: if `knownEdgesFromHere` says the only way out is via
+`(unnamed control)`, the answer is `[]`, not an approximation.
+
+**Unnamed controls are flagged at ingest**, as `addressability` findings. A
+recording containing one is telling you that some step cannot be expressed as
+`{role, name}` — exactly what makes a seam involving it unresolvable later.
+`understudy ingest` prints `UNNAMED n control(s)` when it happens; that line is
+worth acting on rather than scrolling past.
+
+**`npm run explore:check` DELETES the whole saucedemo corpus.** It opens with
+`DELETE FROM apps WHERE slug = 'saucedemo'`, which cascades away every flow,
+step, selector, finding and chunk stored under it — it is a fixture builder, not
+a read-only test. (`recall:check` is safe; it scopes to its own `recall-check`
+slug.) This bit during a routine regression pass and silently destroyed evidence
+gathered ten minutes earlier. Do not keep anything you care about under
+`saucedemo`, and re-ingest after running it.
 
 **An unresolved seam blocks execution, and that is correct.** It means "I don't
 know how to get from here to there". Do not work around it by loosening

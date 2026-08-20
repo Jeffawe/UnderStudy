@@ -30,6 +30,21 @@ export interface VocabularySegment {
   outcome: string | null;
 }
 
+/**
+ * Why the vocabulary is being fetched. It changes which FACTS come back.
+ *
+ *   'distill'  everything. The distiller is naming a recording and may want the
+ *              page map to phrase a segment consistently with the app's wording.
+ *
+ *   'plan'     authored facts only. `decompose` needs SEGMENT and FLOW names to
+ *              phrase sub-goals against; it does not need the site's link graph,
+ *              and on a real corpus that graph is the bulk of the payload.
+ *              Measured on providernow: 22 mechanical claims = 6,477 chars of a
+ *              9,007-char fact payload, i.e. 72% of it, none of which helps
+ *              phrase a sub-goal — and it grows with every page explored.
+ */
+export type VocabularyPurpose = 'distill' | 'plan';
+
 export interface Vocabulary {
   /** Reusable segments — the primary vocabulary, what a sub-goal binds to. */
   segments: VocabularySegment[];
@@ -44,7 +59,11 @@ export interface Vocabulary {
  * runs before the reasoner is consulted, and it must be cheap enough to run on
  * every goal.
  */
-export async function fetchVocabulary(appId: string, limits = { facts: 40 }): Promise<Vocabulary> {
+export async function fetchVocabulary(
+  appId: string,
+  opts: { facts?: number; purpose?: VocabularyPurpose } = {},
+): Promise<Vocabulary> {
+  const { facts: factLimit = 40, purpose = 'distill' } = opts;
   const pool = getPool();
 
   const { rows: segments } = await pool.query<{
@@ -72,12 +91,22 @@ export async function fetchVocabulary(appId: string, limits = { facts: 40 }): Pr
 
   // Boundary facts first: they are the ones that say what is NOT known or NOT
   // safe, which is the context most likely to change a decision.
+  //
+  // For planning, drop the mechanically-generated page-map claims. `explore`
+  // groups an aria snapshot into claims and stores the grouping key in
+  // `scope.key`, so the presence of that key is exactly "a crawler wrote this",
+  // and its absence is exactly "a person or the distiller wrote this".
+  //
+  // Note this is NOT the same as filtering on kind or source: the authored fact
+  // "Visit History is served at /uploaded-documents" is also kind='structure'
+  // AND source='explored', and filtering on either would have discarded it.
+  const onlyAuthored = purpose === 'plan' ? "AND (scope->'key') IS NULL" : '';
   const { rows: facts } = await pool.query<{ statement: string }>(
     `SELECT statement FROM facts
-     WHERE app_id = $1 AND superseded_by IS NULL
+     WHERE app_id = $1 AND superseded_by IS NULL ${onlyAuthored}
      ORDER BY (kind = 'boundary') DESC, observed_count DESC
      LIMIT $2`,
-    [appId, limits.facts],
+    [appId, factLimit],
   );
 
   return {

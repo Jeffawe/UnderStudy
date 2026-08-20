@@ -26,6 +26,7 @@
 
 import { createHash } from 'node:crypto';
 import { getPool, tx } from './db.js';
+import { selectorIdentity } from './selector-identity.js';
 import { toVector } from './recall.js';
 import type { RawEvent } from './recording.js';
 import type { Embedder } from './types.js';
@@ -65,6 +66,56 @@ export interface SeamEndpoint {
  * A segment whose first step is a `goto` reaches its own starting page from
  * wherever execution happens to be, so there is nothing for a bridge to do.
  */
+/**
+ * Are these two flows ADJACENT SLICES OF THE SAME RECORDING?
+ *
+ * Segments do not copy steps — they share the parent recording's rows through
+ * `flow_steps`. So if segment A occupies parent ordinals [i..j] and segment B
+ * begins at j+1, then running A and then B is exactly running the parent from
+ * i to k. The recording already proved that sequence end to end, which means
+ * NO BRIDGE CAN BE NEEDED, whatever the two fingerprints say.
+ *
+ * This exists because the fingerprints frequently DON'T agree, for a reason
+ * that is not a real gap: `sig()` is state-granular, so a segment boundary
+ * lands on two different fingerprints of the same page (a request appears on
+ * /overview, a menu opens, a validation message renders). Observed on
+ * providernow: decomposing one hair loss intake into its seven own segments
+ * produced two "unresolved" seams between slices that are literally
+ * consecutive in the recording they were cut from — each one a live-probe
+ * request for a bridge across nothing.
+ *
+ * Returns the parent's slug when they are adjacent, else null.
+ */
+async function adjacentInSameRecording(
+  fromFlowId: string,
+  toFlowId: string,
+): Promise<string | null> {
+  const { rows } = await getPool().query<{ slug: string; a_end: string; b_start: string }>(
+    `WITH a AS (
+       SELECT pfs.flow_id AS parent, max(pfs.ordinal) AS a_end
+       FROM flow_steps afs
+       JOIN flow_steps pfs ON pfs.step_id = afs.step_id
+       JOIN flows p ON p.flow_id = pfs.flow_id AND p.source = 'recorded'
+       WHERE afs.flow_id = $1
+       GROUP BY pfs.flow_id
+     ), b AS (
+       SELECT pfs.flow_id AS parent, min(pfs.ordinal) AS b_start
+       FROM flow_steps bfs
+       JOIN flow_steps pfs ON pfs.step_id = bfs.step_id
+       JOIN flows p ON p.flow_id = pfs.flow_id AND p.source = 'recorded'
+       WHERE bfs.flow_id = $2
+       GROUP BY pfs.flow_id
+     )
+     SELECT f.slug, a.a_end::string, b.b_start::string
+     FROM a JOIN b ON b.parent = a.parent
+     JOIN flows f ON f.flow_id = a.parent
+     WHERE b.b_start = a.a_end + 1
+     LIMIT 1`,
+    [fromFlowId, toFlowId],
+  );
+  return rows[0]?.slug ?? null;
+}
+
 async function opensWithGoto(flowId: string): Promise<boolean> {
   const { rows } = await getPool().query<{ action: string }>(
     `SELECT s.action FROM flow_steps fs JOIN steps s ON s.step_id = fs.step_id
@@ -194,6 +245,24 @@ export async function resolveSeam(
     };
   }
 
+  // --- rung 1a: adjacent slices of the same recording ----------------------
+  //
+  // Cheaper and MORE certain than comparing fingerprints: the recording itself
+  // is the evidence. Checked before rung 1b because it is direct proof rather
+  // than an inference about how the destination behaves.
+  if (from.flowId && to.flowId) {
+    const parent = await adjacentInSameRecording(from.flowId, to.flowId);
+    if (parent) {
+      return {
+        ...base,
+        kind: 'contiguous',
+        rung: 1,
+        detail: `adjacent slices of the same recording (${parent}) — the gap is a fingerprint artefact, not a real one`,
+        steps: [],
+      };
+    }
+  }
+
   // --- rung 1b: the destination navigates itself ---------------------------
   //
   // A live probe found this one. Login ends on /overview and the rash segment
@@ -298,6 +367,88 @@ export async function resolveSeam(
  * They are stored exactly as a distilled segment would be — same tables, same
  * shape — so nothing downstream can tell the difference or needs to.
  */
+/**
+ * Everything the server already knows about a gap, gathered for whoever has to
+ * answer rung 5.
+ *
+ * The probe request used to carry four strings: two slugs and two opaque
+ * fingerprints. Nobody can answer from that, so the operating contract tells
+ * the reasoner to go and look — which in practice meant four hand-written SQL
+ * queries per seam, re-deriving facts this process was holding when it built
+ * the request.
+ *
+ * The cost of NOT sending it is not just round trips, it is wrong answers.
+ * Whatever comes back is persisted into the page graph and reused forever
+ * without being asked again, so an under-informed reasoner guessing plausibly
+ * is the worst case here. Handed the destination's actual first steps, the
+ * honest answer ("that click has no accessible name, I cannot express this")
+ * is visible immediately; handed two hashes, "just navigate to /overview" looks
+ * reasonable and would be wrong.
+ *
+ * Deliberately capped: this is evidence for one decision, not a database dump.
+ */
+export async function seamEvidence(
+  appId: string,
+  from: { slug: string; flowId?: string; endState: string },
+  to: { slug: string; flowId?: string; startState: string },
+): Promise<Record<string, unknown>> {
+  const pool = getPool();
+
+  const stepsOf = async (flowId: string, end: 'first' | 'last') => {
+    const { rows } = await pool.query<{ ordinal: string; action: string; semantic: string }>(
+      `SELECT fs.ordinal::STRING, s.action, s.semantic
+       FROM flow_steps fs JOIN steps s ON s.step_id = fs.step_id
+       WHERE fs.flow_id = $1
+       ORDER BY fs.ordinal ${end === 'first' ? 'ASC' : 'DESC'}
+       LIMIT 3`,
+      [flowId],
+    );
+    const out = rows.map((r) => `${r.ordinal}. ${r.semantic}`);
+    return end === 'first' ? out : out.reverse();
+  };
+
+  // Edges out of the state we are stuck in. This is the rung-3 evidence, and
+  // it is what turns "how do I get there" into a graph question.
+  const { rows: edges } = await pool.query<{ to_sig: string; via: string | null }>(
+    `SELECT p2.sig AS to_sig, nullif(concat_ws(' ', sel.role, sel.name), ' ') AS via
+     FROM page_edges pe
+     JOIN pages p1 ON p1.page_id = pe.from_page
+     JOIN pages p2 ON p2.page_id = pe.to_page
+     LEFT JOIN selectors sel ON sel.selector_id = pe.via_selector
+     WHERE pe.app_id = $1 AND p1.sig = $2
+     LIMIT 12`,
+    [appId, from.endState],
+  );
+
+  // Segments that touch either end. A named segment beats a bare click, so if
+  // one of these spans the gap it is the answer and no probing is needed.
+  const { rows: touching } = await pool.query<{ slug: string; start_state: string; end_state: string }>(
+    `SELECT slug, start_state, end_state FROM flows
+     WHERE app_id = $1 AND source IN ('sliced','mined')
+       AND (start_state = $2 OR end_state = $3)
+     LIMIT 8`,
+    [appId, from.endState, to.startState],
+  );
+
+  const pattern = (sig: string) => sig.slice(0, sig.lastIndexOf('#')) || sig;
+
+  return {
+    sourceEndsWith: from.flowId ? await stepsOf(from.flowId, 'last') : [],
+    destinationOpensWith: to.flowId ? await stepsOf(to.flowId, 'first') : [],
+    sameRoute: pattern(from.endState) === pattern(to.startState),
+    route: { from: pattern(from.endState), to: pattern(to.startState) },
+    knownEdgesFromHere: edges.map((e) => ({ to: e.to_sig, via: e.via ?? '(unnamed control)' })),
+    segmentsTouchingEitherEnd: touching.map((t) => ({
+      slug: t.slug, startState: t.start_state, endState: t.end_state,
+    })),
+    howToAnswer:
+      'Return [] unless you actually know. Whatever you return is written into the page graph as a ' +
+      'permanent bridge and reused without being asked again — a plausible guess does not fail once, ' +
+      'it becomes a wrong fact the system trusts. If the bridging control has no accessible name, it ' +
+      'cannot be expressed as {role, name}: say so and return [] rather than approximating it.',
+  };
+}
+
 export async function persistProbedBridge(
   embedder: Embedder,
   appId: string,
@@ -326,15 +477,27 @@ export async function persistProbedBridge(
     for (const [ordinal, step] of steps.entries()) {
       let selectorId: string | null = null;
       if (step.action !== 'goto') {
-        const { rows: sel } = await client.query<{ selector_id: string }>(
-          `INSERT INTO selectors (app_id, role, name, frame_hint, test_id, css, fragility, observed_only)
-           VALUES ($1,$2,$3,'',$4,$5,'stable',false)
-           ON CONFLICT (app_id, role, name, frame_hint) DO UPDATE SET last_seen_at = now()
-           RETURNING selector_id`,
-          [appId, step.role ?? '', step.name ?? '', step.testId ?? null, step.css ?? null],
-        );
-        selectorId = sel[0]!.selector_id;
-        lastSelector = selectorId;
+        // A probed bridge step with nothing to identify it by gets no selector
+        // row — sharing one would corrupt every other unnamed element on the
+        // app. See src/core/selector-identity.ts.
+        const identity = selectorIdentity({
+          role: step.role ?? '',
+          name: step.name ?? '',
+          frameHint: '',
+          testId: step.testId ?? null,
+          css: step.css ?? null,
+        });
+        if (identity) {
+          const { rows: sel } = await client.query<{ selector_id: string }>(
+            `INSERT INTO selectors (app_id, identity, role, name, frame_hint, test_id, css, fragility, observed_only)
+             VALUES ($1,$6,$2,$3,'',$4,$5,'stable',false)
+             ON CONFLICT (app_id, identity) DO UPDATE SET last_seen_at = now()
+             RETURNING selector_id`,
+            [appId, step.role ?? '', step.name ?? '', step.testId ?? null, step.css ?? null, identity],
+          );
+          selectorId = sel[0]!.selector_id;
+          lastSelector = selectorId;
+        }
       }
 
       const { rows: sr } = await client.query<{ step_id: string }>(
