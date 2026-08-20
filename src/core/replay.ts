@@ -534,6 +534,44 @@ export async function replay(
             await target.setInputFiles(value, { timeout: timeoutMs });
             break;
           }
+          case 'scroll_container': {
+            // TWO PHRASINGS, because scroll gates come in two shapes and the
+            // IR should be able to say which one it means.
+            //
+            //   value 'bottom'/'top' — the TARGET IS THE PANE. Set its own
+            //     scrollTop. This is the "scroll the summary to the end"
+            //     gate, where the thing to scroll has no landmark inside it
+            //     worth addressing and is reached by CSS.
+            //   no value            — the TARGET IS CONTENT INSIDE the pane.
+            //     Ask Playwright to bring it into view and let it work out
+            //     which ancestor actually scrolls. Preferred where a real
+            //     element marks the end of the content, because it survives
+            //     the pane's class names changing.
+            const where = valueFor(event, values);
+            if (where === 'bottom' || where === 'top') {
+              // Typed structurally rather than as `Element`: this project's
+              // tsconfig has no DOM lib, and the two properties used are the
+              // whole contract.
+              await target.evaluate(
+                (el: { scrollTop: number; scrollHeight: number }, edge: string) => {
+                  el.scrollTop = edge === 'bottom' ? el.scrollHeight : 0;
+                },
+                where,
+              );
+            } else {
+              await target.scrollIntoViewIfNeeded({ timeout: timeoutMs });
+            }
+
+            // The gate is driven by a scroll LISTENER, and listeners are
+            // routinely throttled to an animation frame or debounced. Setting
+            // scrollTop and clicking in the same tick lands the click while the
+            // control is still disabled — which fails as "element is not
+            // enabled", pointing at the button rather than at the scroll that
+            // never registered. Two frames is enough for rAF-based handlers
+            // and costs nothing on flows that don't need it.
+            await page.waitForTimeout(120);
+            break;
+          }
           default:
             throw new Error(`replay does not implement action '${event.action}'`);
         }

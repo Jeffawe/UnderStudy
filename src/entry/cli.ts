@@ -559,7 +559,11 @@ async function cmdMine(positional: string[]) {
   const appId = await appIdOrFail(slug);
 
   const result = await mineMacros(createEmbedder(), appId);
-  console.log(`scanned ${result.flowsScanned} recorded flow(s), ${result.candidates} shared block(s)\n`);
+  console.log(
+    `scanned ${result.flowsScanned} recorded flow(s), ${result.candidates} shared block(s)` +
+      (result.retired ? `, retired ${result.retired} stale macro(s)` : '') +
+      '\n',
+  );
 
   if (!result.macros.length) {
     console.log(result.flowsScanned < 2

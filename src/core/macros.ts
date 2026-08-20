@@ -40,6 +40,52 @@ interface FlowSteps {
   fingerprints: string[];
   stepIds: string[];
   semantics: string[];
+  /** sig() after each step — '/overview#ab12cd34'. Route span comes from these. */
+  states: Array<string | null>;
+}
+
+/** How many step descriptions a macro's text may carry. See macroText. */
+const TEXT_STEPS = 6;
+
+/**
+ * What a mined macro says about itself.
+ *
+ * THE OLD TEXT WAS TWO BUGS AT ONCE, and both are the averaging failure this
+ * codebase already diagnosed for facts.
+ *
+ *   1. It opened with "A block of N steps that recurs in M recorded flows",
+ *      which is boilerplate: semantically empty, and IDENTICAL across every
+ *      macro. Every macro's embedding was dragged toward one shared centroid,
+ *      and toward any query, because generic English is near everything.
+ *   2. It then concatenated EVERY step's semantic. A 29-step macro became a
+ *      wall of "Go to …; Click the "Login"; Fill the textbox …", which averages
+ *      into a vector that is mediocre for every query and wrong for some. That
+ *      is how "cancel my weight loss subscription" bound at 0.7915 to a block
+ *      that neither cancels nor subscribes — it merely contains the word-shapes
+ *      of a weight loss flow.
+ *
+ * So: no preamble, the ROUTE SPAN first (where this block takes you is the most
+ * intent-like thing mining can honestly know), then a capped, deduplicated set
+ * of the steps that actually name something. Mining still does not know what a
+ * block is FOR — nothing here pretends otherwise — but it can describe what it
+ * does without smearing.
+ */
+function macroText(semantics: string[], states: Array<string | null>): string {
+  const route = states
+    .map((s) => s?.split('#')[0])
+    .filter((p): p is string => Boolean(p));
+  const from = route[0];
+  const to = route[route.length - 1];
+
+  const span = from && to ? (from === to ? `Within ${from}` : `From ${from} to ${to}`) : 'Recorded steps';
+
+  // Named controls carry the meaning; a bare "Click the element" carries none.
+  // Dedupe because intake forms repeat "None of the above" and "No" many times,
+  // and a repeated phrase would otherwise dominate the average.
+  const named = [...new Set(semantics.filter((s) => /"[^"]+"/.test(s)))];
+  const chosen = (named.length ? named : [...new Set(semantics)]).slice(0, TEXT_STEPS);
+
+  return `${span}: ${chosen.join('; ')}`;
 }
 
 interface Candidate {
@@ -62,6 +108,8 @@ export interface MineResult {
   flowsScanned: number;
   candidates: number;
   macros: MinedMacro[];
+  /** Macros deleted because this pass no longer found their block. */
+  retired: number;
 }
 
 /**
@@ -115,8 +163,9 @@ export async function mineMacros(embedder: Embedder, appId: string): Promise<Min
     step_id: string;
     fingerprint: string;
     semantic: string;
+    state_after: string | null;
   }>(
-    `SELECT f.flow_id, f.slug, fs.ordinal, s.step_id, s.fingerprint, s.semantic
+    `SELECT f.flow_id, f.slug, fs.ordinal, s.step_id, s.fingerprint, s.semantic, s.state_after
      FROM flows f
      JOIN flow_steps fs ON fs.flow_id = f.flow_id
      JOIN steps s ON s.step_id = fs.step_id
@@ -133,15 +182,17 @@ export async function mineMacros(embedder: Embedder, appId: string): Promise<Min
       fingerprints: [],
       stepIds: [],
       semantics: [],
+      states: [],
     };
     f.fingerprints.push(r.fingerprint);
     f.stepIds.push(r.step_id);
     f.semantics.push(r.semantic);
+    f.states.push(r.state_after);
     flows.set(r.flow_id, f);
   }
 
   if (flows.size < MIN_FLOWS) {
-    return { flowsScanned: flows.size, candidates: 0, macros: [] };
+    return { flowsScanned: flows.size, candidates: 0, macros: [], retired: 0 };
   }
 
   // Count how many distinct flows contain each window.
@@ -195,13 +246,13 @@ export async function mineMacros(embedder: Embedder, appId: string): Promise<Min
     const source = flows.get(firstFlowId)!;
     const stepIds = source.stepIds.slice(offset, offset + c.length);
     const semantics = source.semantics.slice(offset, offset + c.length);
+    const states = source.states.slice(offset, offset + c.length);
 
     const slug = `macro-${c.key.slice(0, 8)}-${c.length}`;
-    // Mechanical text, honestly labelled. Mining knows a block RECURS; it does
-    // not know what the block is for. The distiller can rename it later.
-    const text =
-      `A block of ${c.length} steps that recurs in ${usedBy} recorded flows: ` +
-      semantics.join('; ');
+    // Describes what the block DOES, without boilerplate and without smearing
+    // every step into one average. The "recurs in N flows" bookkeeping lives in
+    // the title and the chunk meta, where it informs without being embedded.
+    const text = macroText(semantics, states);
 
     const vector = await embedder.embedDocument(text);
 
@@ -242,5 +293,46 @@ export async function mineMacros(embedder: Embedder, appId: string): Promise<Min
     if (i > 50) break;
   }
 
-  return { flowsScanned: flows.size, candidates: candidates.length, macros };
+  // RETIRE MACROS THIS PASS NO LONGER FINDS.
+  //
+  // Mining was insert-or-update only, so a macro survived forever once written
+  // — including after the block it described stopped recurring. Two of them
+  // (a 29-step and a 33-step block, mined 2026-08-14) outlived the corpus that
+  // produced them and kept their original text, which is how a stale,
+  // boilerplate-worded chunk was still winning retrieval a week later. Nothing
+  // referenced them; they were simply never cleaned up.
+  //
+  // Safe to delete rather than tombstone: a mined macro owns no steps of its
+  // own (flow_steps points at the recorded flow's rows), so this removes a view
+  // over steps, never the steps themselves. Segments and recordings are
+  // untouched — `is_macro` is the guard.
+  // THE CHUNK MUST GO FIRST. memory_chunks.ref_id is not a foreign key, so
+  // deleting the flow does not cascade to it — it leaves an ORPHANED chunk that
+  // is invisible to every join, permanent in the vector index, and still
+  // winning retrieval. That is not hypothetical: retiring the two stale macros
+  // dropped their flows and the 29-step block kept answering "cancel my weight
+  // loss subscription" at 0.7915 out of a row nothing pointed at any more.
+  const keptSlugs = macros.map((m) => m.slug);
+  const retired = await tx(async (client: pg.PoolClient) => {
+    const { rows: doomed } = await client.query<{ flow_id: string }>(
+      `SELECT flow_id FROM flows
+       WHERE app_id = $1 AND is_macro AND source = 'mined'
+         AND NOT (slug = ANY($2::STRING[]))`,
+      [appId, keptSlugs],
+    );
+    if (!doomed.length) return 0;
+
+    const ids = doomed.map((d) => d.flow_id);
+    await client.query(
+      `DELETE FROM memory_chunks WHERE app_id = $1 AND ref_id = ANY($2::UUID[])`,
+      [appId, ids],
+    );
+    const { rowCount } = await client.query(
+      `DELETE FROM flows WHERE flow_id = ANY($1::UUID[])`,
+      [ids],
+    );
+    return rowCount ?? 0;
+  });
+
+  return { flowsScanned: flows.size, candidates: candidates.length, macros, retired };
 }

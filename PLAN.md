@@ -86,6 +86,17 @@ Two model calls in Mode A because Haiku is cheap and slicing is mechanical. One 
 
 **Cache by recording hash in both modes.** Build this on day one, not day seven.
 
+**`record` and `import` are not yet interchangeable, and the difference is a
+file input.** The live recorder has no `type === 'file'` branch, so it captures
+an upload as a `fill` holding the browser's masked `C:\fakepath\…` string: the
+step cannot replay and the file is not in the recording. `import` maps
+`setInputFiles` to `upload` correctly. Until the recorder gains that branch, any
+flow with an upload has to be written as a script and imported, which means the
+"human clicks" path above does not actually cover the whole app. Closing this is
+the top item in `STATUS.md`'s build order — it needs a decision about how a
+recorded file resolves to a path at replay time, since the browser will not give
+one up.
+
 ---
 
 ## Testing

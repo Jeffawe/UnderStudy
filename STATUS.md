@@ -1,8 +1,10 @@
-# Status — 2026-08-13
+# Status — 2026-08-19
 
 Where the build actually is. `PLAN.md` is the architecture; this is the progress
 marker. **If you are here to ACT as the reasoner rather than to build, read
-`REASONER.md` instead** — this file is about how far the build has got.
+`REASONER.md` instead** — it is the base for every new session, has the current
+rules of engagement (memory first, executor is not sacred, batch fact/lesson
+asks), and this file is only about how far the build has got.
 
 ## Resume in 30 seconds
 
@@ -23,8 +25,10 @@ exposes nine tools; the host agent is the reasoner and the distiller. Mode A
 pending.
 
 **Two corpora.** `saucedemo` (synthetic, first corpus, has known data defects —
-see below) and `providernow` (real telehealth app on `localhost:3000`, 19
-segments across three services, built this session).
+see below) and `providernow` (real telehealth app on `localhost:3000`, **29
+flows** — 4 recorded, 20 named segments, 5 mined macros — across four services:
+hair loss, weight loss, general rash, and sore throat). 34 facts, 14 lessons, 49
+page states mapped after the 2026-08-19 exploration fix (below).
 
 ---
 
@@ -420,6 +424,86 @@ Destructive marking must be consistent across a flow and the segments cut from
 it, or the gate is advisory. Ties into destructive inference signals 2–5 still
 being unimplemented — today only commit-word matching runs, and it never looked
 at "Add to cart".
+
+### Missing testing layer: variants over known flows
+
+Understudy now remembers flows and segments, but it does **not yet remember test
+variants**: "run this known composition, but bend it in these specific ways and
+assert these things." Today this was proven by hand with the ProviderNow upload
+limit retest: the corpus knew the hair-loss and weight-loss intakes, but the
+agent had to write a one-off Playwright harness to upload `3 x 5 MiB` hair-loss
+photos and `1 x 5 MiB` weight-loss torso selfie, submit through Stripe, and
+record the evidence.
+
+That one-off script is exactly the missing product shape:
+
+```
+variant = base flow/segment composition
+        + overrides
+        + inserted/skipped steps
+        + assertions
+        + fixtures/artifacts
+        + stop/completion policy
+```
+
+A variant is **not** just another flow. A flow is canonical app behaviour ("start
+a hair loss intake"). A variant is a regression recipe over that behaviour
+("start a hair loss intake, replace the photo upload with three exact 5 MiB PNGs,
+complete Stripe test checkout, assert success and no quota/upload failures").
+Putting that directly into `flows` would pollute general planning with
+test-specific details, but throwing it away means the next agent has to rediscover
+the same test.
+
+Important distinction:
+
+- **Promote reusable behaviour to segments.** If a variant discovers generally
+  useful steps — `wait-for-file-upload-to-complete`,
+  `scroll-review-summary-to-enable-confirm-submit`,
+  `complete-stripe-test-checkout`,
+  `choose-a-weight-loss-medication-on-direct-assessment-route` — those should be
+  distilled into ordinary reusable segments.
+- **Keep test particulars on the variant.** Exact fixture files, byte sizes,
+  "expect Azure blob PUT 201", "expect no QuotaExceededError", "complete through
+  Stripe", and "success URL must be reached" belong to the variant, not the
+  segment.
+
+Sketch of the needed model:
+
+```
+test_variants
+  app_id, slug, title, intent
+  base_flow_id OR base_goal/composition
+  destructive_allowed
+  stop_condition / completion_policy
+  expected_outcome
+
+variant_overrides
+  variant_id
+  target: segment_slug | flow_slug | step_fingerprint | selector/action/name
+  kind: replace_args | insert_segment | insert_step | skip_step | value | file_set
+  args JSONB
+
+variant_assertions
+  variant_id
+  kind: url | response | request_failure_absence | console_absence |
+        page_error_absence | storage | visual | finding_absence
+  expected JSONB
+
+variant_artifacts
+  variant_id
+  kind: fixture | screenshot | json_result | trace
+  path / content_hash / metadata
+```
+
+For the retest just run, the remembered variants should become:
+
+- `hair-loss-3x5mb-photos-submit-stripe`
+- `weight-loss-5mb-torso-selfie-submit-stripe`
+
+Next time the user asks to rerun upload-size coverage, Understudy should recall
+those variants, bind the base composition, apply the upload overrides, execute
+the assertions, and return pass/fail evidence — without asking the host agent to
+invent a fresh harness.
 
 **Reasoner adapter built — `src/adapters/reasoner/host-agent.ts` +
 `src/core/session.ts` + `understudy_run_plan` / `understudy_resume_run`.**
@@ -989,32 +1073,269 @@ reasoner WITH IMAGE PATHS to judge as regression / expected / noise. Verified
 across three runs: baseline, unchanged (ratio 0, silent), corrupted (ratio
 0.0068, escalated).
 
+## 2026-08-14 — sore throat intake captured; upload limits mapped
+
+The goal that started it: *"fill in a sore throat intake, put in a video greater
+than 50MB, and submit."* The corpus did not know the sore throat intake at all —
+`recall` returned the general-rash photo-upload segment at **0.8613**, the
+textbook close-but-wrong match that reads as "known" but is a different intake.
+It is now ingested, and that same query returns **0.5653**.
+
+### The upload limits were wrong in our notes
+
+The Sore Throat video control states its own limit: **"Max 25MB for photos,
+140MB for video."** The older "~18 MB fails" note is stale for video, and the
+two limits are asymmetric — 60 MB as a *photo* would be rejected, as a *video*
+it is fine. Both sides of the cap were driven for real:
+
+| Fixture | Size | Attached | Submitted |
+|---|---|---|---|
+| `upc-sore-throat-video-60mb.webm` | 62.9 MB | `60.0 MB · Uploaded`, blob PUT 201 | **yes** — request id 490, transaction 546 |
+| `upc-sore-throat-video-150mb.webm` | 157.3 MB | **silently dropped** | no — blocked at validation |
+
+The cap is enforced **client-side, before any network call**: the 157 MB run
+made one `/api/blob/upload-url` request and one blob PUT, both for the 6.5 MB
+photo. The video never reached the network. Upload time is the tell — 35 s for
+the 60 MB run, **6 s** for the whole 157 MB one.
+
+`POST /api/virtual-request/store` carried only **8,515 bytes** on the passing
+run. Files go to Azure blob storage first and the submit carries references, not
+bytes, so video size can never surface as a large-payload error at submit — any
+size rejection happens at the client/blob layer.
+
+Runner: `.understudy/explorations/upc-sore-throat-video-60mb-submit.mjs`,
+parameterised as `VIDEO_FIXTURE=<file> RUN_TAG=<tag> node …`.
+Write-up: `.understudy/explorations/results/upc-sore-throat-video-size-summary.md`.
+
+### APP BUG — oversize video is dropped silently, then blamed as "required"
+
+Over 140 MB the file is discarded, the control reverts to "No file chosen", and
+**no size error appears anywhere** — not in the UI, not in the console, which
+logs only `[VALIDATION] Validating question: {questionType: file, isRequired:
+true}`. The only feedback is "…is required" beneath a red-outlined empty input.
+
+The user *did* select a video and is told they did not, with nothing tying the
+failure to file size — even though the "Max 25MB for photos, 140MB for video."
+helper text sits directly above the error. Suggested fix: name the actual cause,
+e.g. "That video is 157 MB. The maximum is 140 MB."
+Evidence: `results/upc-sore-throat-150mb-blocked.png`.
+
+### APP BUG — /select-condition renders empty on the first visit after login
+
+The first navigation to `/select-condition` after signing in renders only the
+sidebar chrome: no "Choose Your Symptom" heading, no condition buttons at all. A
+second navigation to the same URL renders the list. Reproduced deliberately:
+
+```
+1st goto -> attached: false | body: "Overview Messages Services … Evans"
+2nd goto -> attached: true
+```
+
+Arriving via `/urgent-primary-care` → "Select One-Time Visit" → "Continue with
+per visit selection" lands on the same empty page, so this is the **page**, not
+the route. It killed two replays before it was found. The capture works around
+it with two consecutive `goto` steps, and it is recorded as a lesson triggering
+on `goto /select-condition` so it fires on flows nobody has recorded yet.
+
+### TOOL BUG — the live recorder cannot capture file uploads
+
+`src/adapters/recorder/injected.ts` special-cases `checkbox` and `radio` but has
+**no branch for `type === 'file'`**, so a file input records as an ordinary
+`fill` carrying the browser's masked value:
+
+```
+31  fill  textbox  Please click the camera… = "C:\fakepath\731e4990-….png"
+```
+
+That step is unreplayable, and the file itself is absent from the recording —
+here that meant the symptom video, the entire point of the capture, was never
+recorded. **It fails silently:** `record` reports success and only replay dies,
+much later. Script import is unaffected (`setInputFiles` → `upload`), which is
+the route this capture ultimately took.
+
+**So `record` alone cannot capture any flow containing an upload today.** The
+three intakes already in the corpus all came through `import`, which is why this
+had never surfaced.
+
+### What the corpus gained
+
+`providernow` is now **20 segments across four services**. The sore throat flow
+is `click-login-click-member-fill-email-address-signup-for-05227e` — 34
+replay-proven steps in 8 segments:
+
+- `choose-the-sore-throat-condition` (3)
+- `answer-the-sore-throat-questionnaire` (8)
+- `upload-a-video-of-the-throat` (1)
+- `answer-the-throat-examination-questions` (2)
+- `upload-a-photo-of-the-throat` (1)
+- `answer-the-sore-throat-medical-history` (5)
+- plus `log-in-as-a-member` (13) and `submit-the-intake-questionnaire` (1),
+  both **reused by slug** so they merged rather than duplicating.
+
+Source spec: `.understudy/explorations/sore-throat-intake.spec.ts`. Fixtures are
+deliberately small — `throat-symptom-video.webm` (2 MB) and `throat-photo.png`
+(0.9 MB) — because every ingest replays them. Size testing belongs in a variant,
+not in the base memory.
+
+### Uncommitted: `live.ts` stop-signal fix
+
+`src/adapters/recorder/live.ts` carries an uncommitted change — `page.on('close',
+finish)` alongside the existing `context`/`browser` listeners, and a `.catch()`
+on the post-close `waitForTimeout`. Without it, closing the *tab* rather than
+the whole browser did not end the recording, and the flush could throw against
+an already-gone page. Commit or discard deliberately; the recording done on
+2026-08-14 relied on it.
+
+**Note that `CLAUDE.md` is untracked** — `~/.gitignore_global` ignores
+`Claude.md`, which matches case-insensitively on macOS. It will not travel with
+the repo and is not in any commit. If it matters, force-add it
+(`git add -f CLAUDE.md`) or drop that global pattern.
+
+### The commit point differs by route
+
+On the **one-time visit** route, "Confirm & Submit" only advances to the Pay Now
+step; nothing is filed until "Pay Now" is clicked. Verified directly —
+`/api/virtual-request/store` fired only after Pay Now. On **bundle** routes,
+"Confirm & Submit" itself creates the request. A bundle capture must therefore
+stop one step earlier than a one-time capture, for a real reason rather than a
+mechanical one.
+
+This capture still stops at "Next", but because of `scroll_container`, not
+commit risk: the review modal gates "Confirm & Submit" behind a nested scroll
+pane, and replay failed that click with "locator matched no elements" while all
+34 steps above it passed.
+
+---
+
+## 2026-08-19 — exploration fixed, scroll_container shipped, macros stopped lying, a real payment run
+
+**`explore` was silently learning nothing against a client-rendered app.**
+ProviderNow's initial HTML is an empty Next.js shell; `explore` snapshotted
+right after `domcontentloaded`, before hydration, and reported `1 page, 0
+edges, 0 selectors, 0 facts` in 4 seconds with no error. `waitForAriaStable`
+now takes a `requireContent` flag — two identical polls of an EMPTY tree no
+longer count as settled — and every navigation point in `explore` waits on it.
+A second, separate bug compounded it: a bare `catch {}` around every click was
+swallowing `locator.click: Timeout … exceeded` from a cold dev-server route
+compile, so the failure was invisible twice over. Gated behind
+`UNDERSTUDY_DEBUG=1` now. Result on providernow: 1→16 pages, 0→83 edges,
+0→48 selectors, 0→28 facts in one corrected run.
+
+**`scroll_container` implemented end to end** — recording type, replay
+executor, script-importer capture (`scrollIntoViewIfNeeded`, plus a narrow
+`page.evaluate(el => el.scrollTop = …)` recognizer), Playwright/Cypress emit,
+and embedded semantic text. Verified against the real gate on the hair loss
+intake: before scrolling the pane, `Confirm & Submit` is not merely disabled,
+it is **absent from the DOM** (`isEnabled()` throws); after, `enabled: true`.
+This is what previously made all four intake recordings stop before their
+final submit — see `flows.corrections` on any of them.
+
+**Mined macros were actively poisoning retrieval, and it took two passes to
+fix properly.** Their embedded text opened with identical boilerplate ("A
+block of N steps that recurs in M flows…") then concatenated every step's
+semantic — the same averaging failure already diagnosed for facts. That put a
+29-step unrelated macro as the top BINDABLE hit (0.7915) for "cancel my weight
+loss subscription". Fixed the text (route span + deduped named steps, capped),
+made mining retire macros a pass no longer finds (previously write-only, so
+two stale ones from 2026-08-14 outlived their corpus), and then discovered the
+retirement itself orphaned `memory_chunks` rows (`ref_id` is not a FK) — the
+stale macro kept answering at the same distance out of a row nothing pointed
+at. Measuring properly (by `flows.is_macro`, not by the old boilerplate text
+the first probe was blind to) showed the text fix alone made things *worse* —
+sharper mechanical text started outranking real named segments 4/8 goals vs.
+2/8 before. Root cause: mining knows a block recurs, never what it's for, so a
+description of mechanics should never outrank a description of purpose at any
+distance. `recall.ts` now excludes `meta.source === 'mined'` from `bindable`
+entirely; macros stay visible in `context` and the seam ladder still selects
+them directly via `source IN ('sliced','mined')`. Final: 0/8 false binds,
+`recall:check` passes.
+
+**The script importer used to drop unmappable calls in total silence.** An
+unrecognized method (`evaluate`, `dispatchEvent`, `hover`, …) just fell
+through the AST walk with no warning — which is exactly how the hair loss
+spec's `page.evaluate` scroll (the step that unlocks `Confirm & Submit`)
+vanished on import while the CLI reported a clean 74-step parse. Added
+`UNEXPRESSIBLE` with a mandatory `step DROPPED` warning, and a narrow
+recognizer that reads the one `evaluate` shape worth capturing (a literal
+`querySelector` assigning `.scrollTop`) as a real `scroll_container` step
+instead of warning about it.
+
+**Ran a real hair loss intake through Stripe test-mode payment** (browser +
+script, not the Understudy executor — the payment tail needs
+`scroll_container`, which didn't exist yet at run time, and a real Stripe
+Link SMS-verification screen the sibling Playwright spec already handles
+correctly with a plain auto-waiting `.click()`). Payment succeeded — Stripe
+webhook `checkout.session.completed` confirmed `payment_status: paid`,
+`amount: 5900`, backend responded 200 — but **no virtual request appeared on
+Overview, none in Visit History, no message sent**. `GET
+/api/dashboard/processing-data` returned `total: 1` (only the pre-existing
+General Rash request) both before and 5+ minutes after payment. This reads as
+a real backend bug: the webhook handler acknowledges Stripe with 200 without
+performing fulfilment on this transaction type. Not yet filed as a `finding`
+— pending user confirmation on scope. Also noted in passing:
+`POST /api/broadcasting/auth` fires ~400× on a single Overview page load, and
+`GET 127.0.0.1:8080/api/v1/pauli/notifications` fails every load (port 8080 is
+squatted by an unrelated local PHP process, likely environment-specific).
+
+**`REASONER.md` rewritten with the actual operating contract.** Added "What
+Understudy is for" (memory is the contract, the executor is not — use
+whatever can reach the goal unless the user explicitly asks for the Understudy
+executor) and "Adding to memory as you work" (write down what you learn as
+facts/lessons, confirm with the user first but batch the ask at a natural
+pause rather than blocking per-row). Corrected the `scroll_container` and
+macro-retrieval gotchas to match the fixes above.
+
+Corpus after this session: providernow at 29 flows (4 recorded, 20 segments,
+5 macros), 34 facts, 14 lessons, 49 page states, 63 memory chunks.
+
 ## Not built at all
 
 - **Bedrock adapters have never made a real call.** Written and typechecking;
   model access still pending. `npm run bedrock:check` is the one command that
   answers whether it has landed.
-- **`wait_url`, `wait_text`, `scroll_container`, `dispatch_click`.** All four are
-  permitted by the schema's action CHECK and none are implemented. This is not
-  cosmetic: it is what stops a capture at the review-page scroll gate, and it is
-  why all three intake recordings are trimmed before their final submit.
+- **`wait_url`, `wait_text`, `dispatch_click`.** Still permitted by the schema's
+  action CHECK, still unimplemented. `scroll_container` shipped 2026-08-19 (see
+  below) — this list is now three, not four.
+- **File uploads in the LIVE recorder.** `injected.ts` has no branch for
+  `type === 'file'`, so `record` turns a file input into a `fill` carrying the
+  browser's masked `C:\fakepath\…` value — unreplayable, and the file is absent
+  from the recording entirely. It fails silently, so `record` alone cannot
+  capture any flow with an upload. `import` handles them correctly
+  (`setInputFiles` → `upload`); see 2026-08-14 above.
 - **No session reuse.** Every replay does a cold login, and `distill` replays
   again — so verify-then-ingest costs 2–3 logins per recording. ProviderNow
   locks the account for 15 minutes after a handful, which cost real time this
   session. The Playwright suite keeps `playwright/.auth` storage state precisely
   to avoid this.
+- **No env-var fallback for replay values.** `--value REF=value` on the command
+  line is still the only way in; nothing reads `.env` for `MEMBER_EMAIL` /
+  `MEMBER_PASSWORD` the way the emitted test code does. Not started — flagged
+  2026-08-19, deferred because execution is not the current focus (see
+  REASONER.md, "What Understudy is for").
 
 ## Next, in order
 
-1. **`scroll_container` and `wait_text`.** The two that unlock the rest of the
-   intake flows. Both already legal in the schema.
-2. **Execute a composed plan for real** — every plan so far has been `--dry-run`.
-   The rash flow is the candidate, but its tail files a real care request, so
-   decide that deliberately.
-3. **Session reuse in replay** (storage state), which removes the rate-limit
-   ceiling on how much can be ingested per window.
-4. **Bedrock**, once model access lands.
-5. **Dedupe lessons** — re-ingesting a recording writes a second copy of each.
+1. **File uploads in the live recorder.** A `type === 'file'` branch in
+   `injected.ts` emitting `upload`. The browser will not hand over a real path,
+   so this needs a decision: record `input.files[0].name` and resolve it against
+   a fixtures directory at replay time. Until then every upload flow must be
+   written as a script and imported.
+2. **`wait_text`.** The remaining blocker on intake flows that gate behind
+   async validation text rather than a scroll. `scroll_container` no longer
+   blocks anything (shipped 2026-08-19).
+3. **Execute a composed plan for real** — every plan so far has been `--dry-run`.
+   The sore throat flow is now the best candidate: on the one-time visit route
+   nothing is filed until "Pay Now", so it can be run end to end without
+   creating a care request.
+4. **Session reuse in replay** (storage state), which removes the rate-limit
+   ceiling on how much can be ingested per window. This bit hard again on
+   2026-08-14 — a replay failed mid-run purely from lockout.
+5. **Test variants** — see "Missing testing layer" above. The upload-size work
+   on 2026-08-14 is the second one-off harness written for want of this.
+6. **Bedrock**, once model access lands.
+7. **Dedupe lessons** — re-ingesting a recording writes a second copy of each.
+8. **Env-var fallback for `--value`**, so credentials never have to be typed
+   on a command line. See "Not built at all" above.
 
 ---
 
@@ -1181,6 +1502,10 @@ across three runs: baseline, unchanged (ratio 0, silent), corrupted (ratio
   Login button as `"login-button"`. And `textContent` of a `<select>` is every
   option concatenated — it produced `"Name (A to Z)Name (Z to A)Price (low to
   high)…"` as an element name.
+- **File inputs are not handled at all.** `injected.ts` branches on `checkbox`
+  and `radio`; `type === 'file'` falls through to the text path and records the
+  masked `C:\fakepath\…` value the browser exposes. Silent — the recording looks
+  complete and only replay reveals it. See "Not built at all".
 - **saucedemo's login is a SAME-DOCUMENT navigation.** The init script does not
   re-run, so the in-page stamp counter continues across what look like separate
   pages. Stamps are per-document-lifetime, not per-URL — do not assume a fresh

@@ -62,6 +62,12 @@ const ACTIONS: Record<string, RecordedAction> = {
   selectOption: 'select',
   setInputFiles: 'upload',
   goto: 'goto',
+  // Playwright's own name for "scroll whatever container holds this until it
+  // is visible". Chosen as the capture form over a raw
+  // `evaluate(el => el.scrollTop = el.scrollHeight)` deliberately: it is
+  // element-addressed, so it fits the role/name/css model the rest of the IR
+  // uses, and importing it needs no evaluation of arbitrary page script.
+  scrollIntoViewIfNeeded: 'scroll_container',
 };
 
 /**
@@ -72,6 +78,53 @@ const ACTIONS: Record<string, RecordedAction> = {
  * needs the same masking and options at every call site. Add yours here.
  */
 const SNAPSHOT_CALLS = new Set(['toHaveScreenshot', 'checkpoint', 'visualCheckpoint', 'snapshot']);
+
+/**
+ * Calls that DO something to the page but that the IR cannot express.
+ *
+ * These exist to be warned about, not to be mapped. An unmapped call used to
+ * fall through the walk in silence, which is the worst possible outcome: the
+ * import "succeeds", the step count looks plausible, and the recording is
+ * quietly missing a step the flow depends on. That is exactly how the hair loss
+ * spec's `page.evaluate` scroll — the thing that unlocks Confirm & Submit —
+ * disappeared between a spec that passes and a recording that cannot.
+ *
+ * A missing step must cost a warning, every time.
+ */
+const UNEXPRESSIBLE = new Set([
+  'evaluate', 'evaluateHandle', '$eval', '$$eval',
+  'dispatchEvent', 'hover', 'dragTo', 'focus', 'blur', 'tap',
+  'setChecked', 'clear', 'selectText', 'waitForTimeout', 'waitForFunction',
+  'addStyleTag', 'addScriptTag', 'route', 'unroute',
+]);
+
+/**
+ * Recognise the one `evaluate` shape worth reading rather than warning about:
+ * scrolling a nested pane to an edge.
+ *
+ * Deliberately narrow. This matches on SOURCE TEXT, which is a heuristic and
+ * not a parse, so it only claims a call when both halves are unambiguous — a
+ * `querySelector` with a literal argument, and an assignment to `scrollTop`.
+ * Anything else falls through to the warning, because guessing at arbitrary
+ * page script is how you get a recording that lies.
+ *
+ * Worth special-casing because a scroll gate is not exotic: any "review your
+ * answers before submitting" screen has one, and without this the whole tail of
+ * such a flow is uncapturable.
+ */
+function scrollContainerFrom(node: ts.CallExpression): { css: string; edge: 'bottom' | 'top' } | undefined {
+  const body = node.arguments.map((a) => a.getText()).join(' ');
+  if (!/\.scrollTop\s*=/.test(body)) return undefined;
+
+  const css = body.match(/querySelector(?:All)?\(\s*['"`]([^'"`]+)['"`]\s*\)/)?.[1];
+  if (!css) return undefined;
+
+  // `= el.scrollHeight` means bottom; `= 0` means top. Anything else is a
+  // partial scroll the IR has no way to say, so leave it to the warning.
+  if (/\.scrollTop\s*=\s*[^;]*scrollHeight/.test(body)) return { css, edge: 'bottom' };
+  if (/\.scrollTop\s*=\s*0\b/.test(body)) return { css, edge: 'top' };
+  return undefined;
+}
 
 export interface ParsedScript {
   recording: RawRecording;
@@ -330,6 +383,26 @@ export async function parseScript(
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
       const method = node.expression.name.text;
       const action = ACTIONS[method];
+
+      // An unmappable call is REPORTED, never dropped. See UNEXPRESSIBLE.
+      if (!action && UNEXPRESSIBLE.has(method)) {
+        const scroll = method.startsWith('evaluate') ? scrollContainerFrom(node) : undefined;
+        if (scroll) {
+          events.push({
+            seq: events.length,
+            ts: events.length,
+            action: 'scroll_container',
+            css: scroll.css,
+            value: scroll.edge,
+            url: currentUrl,
+            // The pane was addressed by CSS in the spec and nothing resolved a
+            // role or name for it, which is precisely what 'unresolved' means.
+            resolution: 'unresolved',
+          });
+        } else {
+          warnings.push(`${method}() cannot be expressed by the IR, step DROPPED: ${node.getText().slice(0, 70)}`);
+        }
+      }
 
       if (action) {
         // Unwind the chain back to its root, collecting addressing bits.

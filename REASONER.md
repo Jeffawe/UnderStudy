@@ -26,6 +26,47 @@ turn with all your own tools.** You can open a browser, read a file, query the
 database, look at an image. That is the whole reason a host agent is worth more
 here than an API call — an API call answers from the payload alone.
 
+That rule governs **a run that Understudy is executing**. It is not a claim that
+Understudy must be the thing executing. See the next section.
+
+---
+
+## What Understudy is for
+
+It is a tool for running end-to-end tests against the user's sites, so they do
+not have to click through every flow by hand. That is the whole product. Every
+rule in this file serves it, and none of them outranks it.
+
+**The memory is the contract. The executor is not.** What makes Understudy worth
+having is that it remembers an app — segments, facts, lessons, the page map, and
+what each recording could not prove. Use that on every goal, always. *How* the
+browser actually gets driven is an implementation detail you are free to choose.
+
+- **Consult the memory first, every time.** `understudy_recall` is a database
+  query: no login, no browser, no cost, no side effects. It tells you whether a
+  flow is known, what its traps are, and — via `flows.corrections` — where a
+  recording deliberately stops and why. Reading that before acting routinely
+  saves an entire wasted run.
+- **If Understudy's executor cannot achieve the goal, use whatever can.** A
+  Playwright script, the browser directly, MCP calls, curl against the app's
+  API. Reaching the goal is the job; the executor is not sacred. A tail that
+  needs an unimplemented IR action, a real purchase, or a third-party checkout
+  page is an ordinary reason to drive it yourself, not a failure.
+- **Unless the user explicitly asks for the Understudy executor.** Then use it —
+  and if it genuinely cannot do the job, say so plainly rather than quietly
+  substituting something else and reporting success.
+
+**Say which you used.** "Recalled the corpus, then drove it with a script
+because the checkout is a Stripe-hosted page the IR cannot express" is one
+honest sentence. Hand-driving a flow while implying the tool ran it is the one
+failure mode here that actually costs trust.
+
+**A goal you drove by hand is still worth capturing** — see *When the corpus
+does not know something*. But when the tail cannot be replayed (a real purchase,
+an unimplemented action), skip the recording and bank what you learned as facts
+and lessons instead. Memory gained is the point; a recording is just one way to
+gain it.
+
 ---
 
 ## Setup
@@ -148,11 +189,21 @@ photo-upload segment at 0.8072, which reads as known but is a different intake.
 Judge the text, not just the number.
 
 **If it is a gap: drive it by hand, then write down what you did.** Exploration
-that is not captured is work done twice. Write the flow as a Playwright spec
+that is not captured is work done twice. Note that anything with a file upload
+must be captured as a script and imported, never with `record` — see the
+gotchas below. Write the flow as a Playwright spec
 under `.understudy/explorations/` (gitignored — the steps carry whatever was
 typed into a real form), then `import` → `replay` → distil → ingest. Going
 through `import` means replay has to *prove* every step, which is what separates
 a recording from a story about one.
+
+**When the flow cannot be ingested, capture the knowledge instead.** Ingest
+replays, so a flow ending in a real purchase or an unimplemented action must not
+become a recording — it would file an order every time. That is not a reason to
+come away with nothing. Bank what the run taught as facts and lessons, and note
+in the recording's `corrections` where the capture had to stop and why. The
+`corrections` field is read by whoever picks the flow up next; treating it as the
+place to explain an edge is what makes the edge cheap the second time.
 
 ---
 
@@ -217,6 +268,49 @@ its trigger, including in flows nobody has recorded yet.
 
 ---
 
+## Adding to memory as you work
+
+You will learn things the corpus does not have — running a flow by hand, reading
+an API response, watching `explore` refuse a control, losing an hour to a
+selector. **Write those down.** A fact or a lesson costs one row and saves the
+next run, and this is how the memory gets good: not from bulk recording, but
+from the specific thing that surprised someone.
+
+**Confirm before you write, and batch the ask.** Do not stop mid-task to request
+permission for each row — that turns a working session into an interview. Note
+what you propose to store, keep working, and put the whole list to the user at a
+natural pause: one message, one line per item, each tagged with the kind you
+propose. They approve or cut, then you write. Nothing blocks.
+
+Which kind it is:
+
+> A **fact** is declarative and retrieved BY MEANING at planning time.
+> "Visit History is at `/uploaded-documents`." "Reaching checkout texts a real
+> phone." There is nothing to *do* at a step; it changes what you plan, and
+> sometimes whether you run at all.
+>
+> A **lesson** is a conditional fix matched by EXACT TRIGGER during execution.
+> "When filling Card number, dismiss Stripe Link first." It changes one step.
+>
+> A **finding** is "the app is broken" and someone fixes the app.
+
+The test: if acting on it changes a single step, it is a lesson. If it changes
+your plan or your willingness to run, it is a fact. If it changes the app, it is
+a finding.
+
+**Prefer facts about consequences over facts about structure.** "On page X you
+can click Y" is the cheapest kind to generate and the least useful to retrieve —
+you can see it by loading the page. The facts that earn their row are the ones
+describing what *happens*: what a control commits to, what has a side effect,
+what an environment does or forbids.
+
+**A lesson with `times_applied = 0` is an untested lesson.** Its trigger has
+never matched anything, and a trigger that never matches looks exactly like one
+that was never right. When you write a lesson, check the trigger against a
+plausible step context rather than assuming containment does what you meant.
+
+---
+
 ## Things that will cost you an hour if you don't know them
 
 **Logins are often rate limited.** ProviderNow locks the account for 15 minutes
@@ -234,9 +328,48 @@ ingest. Trim with `import --until <n>` and say why in `corrections`.
 `values`.
 
 **Some IR actions are legal in the schema but unimplemented** — `wait_url`,
-`wait_text`, `scroll_container`, `dispatch_click`. A flow gated behind a
-scrolled pane, an explicit wait, or a `dispatchEvent` submit cannot be captured
-past that point yet. That is usually where a capture has to stop.
+`wait_text`, `dispatch_click`. A flow gated behind an explicit wait or a
+`dispatchEvent` submit cannot be captured past that point yet. That is usually
+where a capture has to stop.
+
+`scroll_container` **is** implemented (2026-08-19). Capture it by writing
+`locator.scrollIntoViewIfNeeded()`, which the importer maps directly; a
+`page.evaluate` that assigns `scrollTop` from a literal `querySelector` is also
+recognised. It has two forms: `value: 'bottom' | 'top'` scrolls the pane itself,
+and no value scrolls content into view within whatever ancestor scrolls. Reach
+for it whenever a control is gated behind reading a summary — and note the gate
+may keep the control **out of the DOM entirely** rather than merely disabling
+it, so `isEnabled()` throws instead of returning false.
+
+**The importer warns about calls it cannot express, and you must read those
+warnings.** It used to skip an unmappable call in silence, so an import
+"succeeded" while quietly dropping a load-bearing step and the recording only
+failed later, at replay, somewhere else. Anything in `UNEXPRESSIBLE` —
+`evaluate`, `dispatchEvent`, `hover`, `dragTo`, `waitForFunction`, `route` — now
+prints `step DROPPED`. A clean import with warnings is not a clean import.
+
+**Mined macros are context, never a bind target.** They are stored as
+`kind='segment'` but excluded from `bindable`, because mining knows a block
+*recurs* and cannot know what it is *for* — and mechanical text was repeatedly
+outranking real intents ("log in as a member" bound to a login preamble block
+instead of the named segment). You will see them in the CONTEXT list; they are
+useful for splicing and for seams, which select them directly. If one looks like
+the answer to a goal, the real answer is a segment that does not exist yet.
+
+**Never ask the user to `record` a flow that has a file upload.** The live
+recorder has no branch for `type === 'file'`, so it stores the browser's masked
+`C:\fakepath\…` string as a `fill`. The step cannot replay and the file is not
+in the recording at all — and none of that is reported, so a recording that
+looks complete is quietly useless. Ask for the walkthrough if you like, then
+write it as a Playwright script and `import` it, where `setInputFiles` becomes a
+real `upload`. Costing a person ten minutes of recording for an unusable
+artefact is the expensive version of this mistake.
+
+**A step that fails "locator matched no elements" is not always a bad
+selector.** On ProviderNow, `/select-condition` renders nothing but the sidebar
+on the first visit after login; a second `goto` renders the list. Two replays
+were spent blaming the locator. Before rewriting a selector, check whether the
+page rendered at all — `body.innerText` answers it in one call.
 
 **An unresolved seam blocks execution, and that is correct.** It means "I don't
 know how to get from here to there". Do not work around it by loosening

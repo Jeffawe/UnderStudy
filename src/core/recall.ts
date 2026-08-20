@@ -266,8 +266,30 @@ export async function recallByVector(
   // Split BEFORE slicing. Facts are often the closest thing in the corpus, so
   // cutting to `limit` first can leave zero runnable rows and make a goal look
   // like a gap purely because context crowded it out of the window.
-  const bindable = ranked.filter((c) => isExecutable(c.kind)).slice(0, limit);
-  const context = ranked.filter((c) => !isExecutable(c.kind)).slice(0, limit);
+  // A MINED MACRO IS NEVER WHAT A GOAL BINDS TO.
+  //
+  // Macros are stored with kind 'segment', so kind alone made them bindable —
+  // and this has now bitten the planner four separate times (see plan.ts: a
+  // 0.4124 match losing to a 0.8936 macro; a macro bound for a cart goal it
+  // never touches; "reset my password" and "log in as a member" both taken from
+  // real named segments by the login preamble block).
+  //
+  // Improving their text was necessary and fixed the pathological case — a
+  // 29-step blob that matched "cancel my weight loss subscription" at 0.7915 —
+  // but it cannot fix this, and made it sharper: crisper mechanical text
+  // competes BETTER against real intents. That is the actual problem. Mining
+  // knows a block recurs; it cannot know what it is for. A description of
+  // mechanics should never outrank a description of purpose, at any distance.
+  //
+  // This is the module's own stated rule ("it must never compete with a segment
+  // that has one") finally applied where it was always needed. Macros stay in
+  // `chunks` and keep their rows, so the seam ladder — which selects them
+  // directly via source IN ('sliced','mined') — is unaffected. They lose the
+  // right to ANSWER a goal, not the right to exist.
+  const isMined = (c: RecalledChunk) => c.meta?.source === 'mined';
+
+  const bindable = ranked.filter((c) => isExecutable(c.kind) && !isMined(c)).slice(0, limit);
+  const context = ranked.filter((c) => !isExecutable(c.kind) || isMined(c)).slice(0, limit);
 
   // Both numbers come from RAW distances over the BINDABLE set. The re-rank
   // decides what to show; it does not get to claim confidence it didn't earn,
