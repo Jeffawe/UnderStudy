@@ -92,6 +92,12 @@ function semanticFor(event: RawEvent): string {
       return `Press ${event.value ?? 'Enter'} on the${role} ${target}`;
     case 'upload':
       return `Upload a file to the${role} ${target}`;
+    case 'scroll_container':
+      // Says WHY, not just what: this text is what gets embedded, and "scroll
+      // the pane" retrieves nothing useful for a goal about submitting a form.
+      return event.value === 'bottom' || event.value === 'top'
+        ? `Scroll the ${target} panel to the ${event.value} to satisfy a scroll gate`
+        : `Scroll the${role} ${target} into view to satisfy a scroll gate`;
     default:
       return `Click the${role} ${target}`;
   }

@@ -170,6 +170,23 @@ export async function emitFlow(
       case 'upload':
         lines.push(pw ? `await ${loc}.setInputFiles(${value});` : `${loc}.selectFile(${value});`);
         break;
+      case 'scroll_container':
+        // Cypress has no scrollIntoViewIfNeeded; `scrollIntoView` is the
+        // closest real equivalent and scrolls the nearest scrollable ancestor
+        // the same way. The 'bottom'/'top' form addresses the pane itself.
+        {
+        const edge = step.args.value;
+        if (edge === 'bottom' || edge === 'top') {
+          lines.push(
+            pw
+              ? `await ${loc}.evaluate((el) => { el.scrollTop = ${edge === 'bottom' ? 'el.scrollHeight' : '0'}; });`
+              : `${loc}.scrollTo('${edge}');`,
+          );
+        } else {
+          lines.push(pw ? `await ${loc}.scrollIntoViewIfNeeded();` : `${loc}.scrollIntoView();`);
+        }
+        }
+        break;
       default:
         lines.push(pw ? `await ${loc}.click();` : `${loc}.click();`);
     }

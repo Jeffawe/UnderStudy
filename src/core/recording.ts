@@ -27,6 +27,11 @@ export type RecordedAction =
   | 'uncheck'
   | 'upload'
   | 'wait_url'
+  // Scroll a nested scroll pane, not the window. Gating controls ("Confirm &
+  // Submit" stays disabled until you have read the summary) watch a scroll
+  // event on their own container, so `window.scrollTo` never satisfies them
+  // and the flow simply cannot be captured past that point without this.
+  | 'scroll_container'
   // A visual checkpoint: take a picture here and compare it to the baseline.
   // Carried by the schema's action CHECK from the start; nothing emitted it
   // until the parser learned to read the spec's own checkpoint calls.

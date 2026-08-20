@@ -192,6 +192,7 @@ export async function recordLive(opts: LiveRecordOptions): Promise<RawRecording>
         closed = true;
         resolve();
       };
+      page.on('close', finish);
       context.on('close', finish);
       browser.on('disconnected', finish);
       setTimeout(finish, maxMinutes * 60_000);
@@ -205,7 +206,7 @@ export async function recordLive(opts: LiveRecordOptions): Promise<RawRecording>
     // esbuild __name helper to be serialized into the page.
     await p.evaluate('window.__understudyFlush && window.__understudyFlush()').catch(() => {});
   }
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(250).catch(() => {});
 
   await browser.close().catch(() => {});
 

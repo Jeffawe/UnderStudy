@@ -58,6 +58,25 @@ export function classify(role: string, name: string | null): Refusal | null {
 
 const CLICKABLE = new Set(['link', 'button']);
 
+/**
+ * Budget for a page to render after navigation resolves.
+ *
+ * Generous because it is only ever paid IN FULL by a page that renders nothing
+ * at all — a hydrated app returns on the first pair of matching polls. A Next.js
+ * dev server compiling a route cold took 9.3s on first hit, and that is the case
+ * this has to survive: `domcontentloaded` fires on the empty shell, so without
+ * this the crawl reads a page that has not rendered yet and learns nothing.
+ */
+const HYDRATION_MS = 15_000;
+
+/**
+ * Navigation resolves when the DOCUMENT arrives; a client-rendered app has not
+ * drawn anything yet at that point. Every read of the tree goes through here so
+ * the crawl never fingerprints an empty shell. Returns the settled snapshot so
+ * callers can hand it to computeSig rather than recomputing it.
+ */
+const settle = (page: Page) => waitForAriaStable(page, HYDRATION_MS, 120, true);
+
 
 
 export interface ExploreOptions {
@@ -208,7 +227,7 @@ export async function explore(
 
   // ---- authenticate, if given credentials ---------------------------------
   await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
-  const landing = await computeSig(page);
+  const landing = await computeSig(page, await settle(page));
 
   if (login) {
     await page.getByRole('textbox', { name: /user/i }).first().fill(login.username);
@@ -216,7 +235,7 @@ export async function explore(
     await page.getByRole('button', { name: /log ?in|sign ?in/i }).first().click();
     await page.waitForLoadState('domcontentloaded');
 
-    const after = await computeSig(page);
+    const after = await computeSig(page, await settle(page));
     const worked = after.sig !== landing.sig;
     facts.push({
       kind: 'auth',
@@ -228,7 +247,7 @@ export async function explore(
   }
 
   // ---- breadth-first over page states -------------------------------------
-  const start = await computeSig(page);
+  const start = await computeSig(page, await settle(page));
 
   /**
    * A queued state carries HOW TO GET BACK TO IT, not just where it lives.
@@ -266,6 +285,7 @@ export async function explore(
     if (page.url() !== current.url) {
       await page.goto(current.url, { waitUntil: 'domcontentloaded' });
     }
+    let tree = await settle(page);
     if (current.via) {
       // Replay the reveal. Best-effort: if the control is gone the state simply
       // isn't reachable any more, which is itself worth not crashing over.
@@ -274,10 +294,10 @@ export async function explore(
         .first()
         .click({ timeout: 4000 })
         .catch(() => {});
-      await waitForAriaStable(page);
+      tree = await waitForAriaStable(page);
     }
 
-    const nodes = parseAria(await page.locator('body').ariaSnapshot());
+    const nodes = parseAria(tree);
 
     // Accumulate per PAGE, not per sig. Pages are deliberately state-granular —
     // that's what edges connect, and it's how `Logout` behind a menu is found
@@ -362,6 +382,10 @@ export async function explore(
         // poison the graph with edges that don't reproduce.
         if (page.url() !== current.url) {
           await page.goto(current.url, { waitUntil: 'domcontentloaded' });
+          // Not optional: the visibility check below runs against whatever has
+          // rendered so far, so on a client-rendered app EVERY candidate is
+          // invisible and the loop skips the entire page without a word.
+          await settle(page);
         }
 
         const target = page.getByRole(candidate.role as 'link' | 'button', { name, exact: true }).first();
@@ -382,7 +406,11 @@ export async function explore(
         // the sig would otherwise be taken mid-animation and discarded as
         // "changed nothing". Poll to stability instead of sleeping a constant,
         // so clicks that reveal nothing cost one poll rather than the worst case.
-        const settled = page.url() === urlBefore ? await waitForAriaStable(page) : undefined;
+        // A navigation needs the same treatment for the opposite reason: the
+        // DESTINATION is the thing that hasn't rendered. Left undefined,
+        // computeSig snapshots the new page's empty shell and fingerprints it.
+        const settled =
+          page.url() === urlBefore ? await waitForAriaStable(page) : await settle(page);
 
         const next = await computeSig(page, settled);
         if (next.sig === current.sig.sig) continue; // revealed nothing
@@ -401,9 +429,19 @@ export async function explore(
             ...(revealed ? { via: { role: candidate.role, name } } : {}),
           });
         }
-      } catch {
+      } catch (err) {
         // A control that won't click is not an error — it's a dead end in the
         // map. Exploration is best-effort by design.
+        //
+        // Silent by default, but NOT unobservable: a swallowed exception here
+        // is indistinguishable from "the app has no links", and a crawl that
+        // learns nothing looks identical to a crawl of a page with nothing on
+        // it. UNDERSTUDY_DEBUG=1 is the difference between diagnosing that in
+        // one run and guessing at it.
+        if (process.env.UNDERSTUDY_DEBUG) {
+          const why = err instanceof Error ? err.message.split('\n')[0] : String(err);
+          console.error(`  [explore] "${name}" on ${current.sig.urlPattern}: ${why}`);
+        }
       }
     }
   }
