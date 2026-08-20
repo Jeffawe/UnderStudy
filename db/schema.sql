@@ -107,6 +107,17 @@ CREATE TABLE IF NOT EXISTS selectors (
   -- nothing and one element became many rows, splitting its health score.
   -- See db/02-selector-frame-hint-not-null.sql.
   frame_hint    STRING NOT NULL DEFAULT '', -- iframe matched by id SUFFIX, never exact
+  -- THE dedupe key. Computed by src/core/selector-identity.ts: the accessible
+  -- name when there is one, else the test id, else the css. An element with
+  -- none of the three is NOT IDENTIFIED and gets no row at all — the writers
+  -- store selector_id = NULL for it.
+  --
+  -- Why not (role, name, frame_hint) directly: with those NOT NULL DEFAULT ''
+  -- (db/02, db/04), every UNNAMED element shared the key ('','',''), so they
+  -- all merged into one row. Observed on a real corpus: 92 steps on 2 rows,
+  -- one holding 52 distinct elements — one health score for all of them, and
+  -- execute.ts handing one element's css to the other 51. See db/08.
+  identity      STRING NOT NULL DEFAULT '',
   fallbacks     JSONB NOT NULL DEFAULT '[]',
   fragility     STRING NOT NULL DEFAULT 'unknown'
                 CHECK (fragility IN ('stable','positional','hashed','unknown')),
@@ -117,8 +128,8 @@ CREATE TABLE IF NOT EXISTS selectors (
   quarantined   BOOL NOT NULL DEFAULT false,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  -- dedupe key: same role+name+frame on one app is ONE row
-  UNIQUE (app_id, role, name, frame_hint),
+  -- dedupe key: same identity on one app is ONE row
+  UNIQUE (app_id, identity),
   INDEX selectors_health_idx (app_id, quarantined, health)
 );
 
@@ -243,7 +254,12 @@ CREATE TABLE IF NOT EXISTS runs (
   goal          STRING NOT NULL,
   plan          JSONB NOT NULL DEFAULT '{}',   -- sub-goals, bindings, seams, distances
   mode          STRING NOT NULL DEFAULT 'execute'
-                CHECK (mode IN ('execute','emit-only','dry-run')),
+                -- 'attributed' = the goal was genuinely run and the result is
+                -- true, but Understudy did not drive it (a hand-written script,
+                -- a third-party checkout the IR cannot express). Distinct from
+                -- 'execute' so it is never mistaken for evidence the EXECUTOR
+                -- works. See db/09.
+                CHECK (mode IN ('execute','emit-only','dry-run','attributed')),
   status        STRING NOT NULL DEFAULT 'running'
                 CHECK (status IN ('running','passed','failed','blocked','needs_context')),
   sig_sequence  JSONB NOT NULL DEFAULT '[]',   -- observed fingerprint path — flow-drift diff
@@ -284,7 +300,7 @@ CREATE TABLE IF NOT EXISTS findings (
   app_id        UUID NOT NULL REFERENCES apps(app_id) ON DELETE CASCADE,
   kind          STRING NOT NULL CHECK (kind IN (
                   'console_error','network_error','data_mismatch','persistence',
-                  'nondeterminism','flow_drift','perf','other')),
+                  'nondeterminism','flow_drift','perf','addressability','other')),
   severity      STRING NOT NULL DEFAULT 'unknown'
                 CHECK (severity IN ('high','medium','low','unknown')),
   statement     STRING NOT NULL,

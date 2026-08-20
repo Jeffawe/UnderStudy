@@ -34,6 +34,9 @@ import { replay } from '../core/replay.js';
 import { ingestRecording } from '../core/ingest.js';
 import { buildDistillRequest, validateDistilled, saveDistilled, loadDistilled } from '../core/distill.js';
 import { fetchVocabulary } from '../core/vocabulary.js';
+import { remember, validateRemember } from '../core/remember.js';
+import { recordAttributedRun } from '../core/run.js';
+import type { RememberFact, RememberLesson, RememberFinding } from '../core/remember.js';
 import { recall, isGap, GAP_DISTANCE } from '../core/recall.js';
 import { startRun, resumeRun, type RunStep } from '../core/session.js';
 import { listOpenFindings, suppressThirdParty, applyTriage, triageSummary } from '../core/triage.js';
@@ -206,6 +209,121 @@ server.registerTool(
 );
 
 server.registerTool(
+  'understudy_record_run',
+  {
+    title: 'Attribute a run Understudy did not drive',
+    description:
+      'Record that a goal really was run and how it turned out, when something OTHER than the ' +
+      'Understudy executor drove it — a Playwright script, the browser directly, an API call. ' +
+      'Reaching a goal that way is explicitly allowed, but it used to leave NO trace: no run row, ' +
+      'no drift baseline, nothing showing the goal had ever succeeded.\n\n' +
+      'Call this whenever you achieve a goal by hand. It is the difference between a corpus that ' +
+      'accumulates evidence and one that only grows when someone remembers to write a fact.\n\n' +
+      'Recorded as mode=attributed, never mode=execute — "the goal works" and "the executor can do ' +
+      'it" are different claims and only one of them is self-verifying. Supply sigSequence only if ' +
+      'you actually captured page fingerprints; a path you did not observe is not a baseline.',
+    inputSchema: {
+      appSlug: z.string(),
+      goal: z.string().describe('what was attempted, in the words you would use to ask for it again'),
+      passed: z.boolean(),
+      sigSequence: z.array(z.string()).optional().describe('page fingerprints in order, if observed'),
+      drivenBy: z.string().optional().describe('e.g. "playwright script: hair-loss-full-checkout.ts"'),
+      note: z.string().optional().describe('why the executor was not used, or what the outcome proved'),
+    },
+  },
+  async ({ appSlug, goal, passed, sigSequence, drivenBy, note }) => {
+    const appId = await appIdFor(appSlug);
+    if (!appId) return fail(`unknown app '${appSlug}'`);
+    const out = await recordAttributedRun({
+      appId, goal, passed,
+      ...(sigSequence ? { sigSequence } : {}),
+      ...(drivenBy ? { drivenBy } : {}),
+      ...(note ? { note } : {}),
+    });
+    return json({
+      result: 'recorded',
+      runId: out.runId,
+      mode: 'attributed',
+      ...(out.drift ? { drift: out.drift } : { drift: 'not measured — no sigSequence supplied' }),
+    });
+  },
+);
+
+server.registerTool(
+  'understudy_remember',
+  {
+    title: 'Write what you learned to memory',
+    description:
+      'Record facts, lessons and findings you learned while working — the counterpart to every other ' +
+      'tool here, which only READ. Batched on purpose: gather what you learned, confirm the whole list ' +
+      'with the user at a natural pause, then write it in one call.\n\n' +
+      'A FACT is declarative and retrieved BY MEANING at planning time ("reaching checkout texts a real ' +
+      'phone") — it changes what you plan. A LESSON is a conditional fix matched by EXACT TRIGGER during ' +
+      'execution ("when filling Card number, dismiss Stripe Link first") — it changes one step. A FINDING ' +
+      'is "the app is broken" and someone fixes the app.\n\n' +
+      'Prefer facts about CONSEQUENCES over facts about structure: "on page X you can click Y" is visible ' +
+      'by loading the page and is the least useful kind to retrieve.\n\n' +
+      'Nothing is written unless the whole batch validates, and every problem comes back at once.',
+    inputSchema: {
+      appSlug: z.string(),
+      facts: z
+        .array(z.object({
+          kind: z.enum(['structure', 'capability', 'entity', 'auth', 'environment', 'boundary', 'constraint']),
+          statement: z.string(),
+          scope: z.record(z.string(), z.unknown()).optional().describe('e.g. {url_pattern: "/overview"}'),
+          confidence: z.number().optional(),
+        }))
+        .optional(),
+      lessons: z
+        .array(z.object({
+          kind: z.string().describe('e.g. timing, gate, addressing, workaround, state'),
+          title: z.string(),
+          body: z.string(),
+          trigger: z.record(z.string(), z.unknown())
+            .describe('matched by EXACT containment at execution: url_pattern, action, role, name. An absent key is a wildcard, so keep it as narrow as the lesson really is.'),
+          fixSnippet: z.string().optional(),
+          confidence: z.number().optional(),
+        }))
+        .optional(),
+      findings: z
+        .array(z.object({
+          kind: z.enum(['console_error', 'network_error', 'data_mismatch', 'persistence',
+            'nondeterminism', 'flow_drift', 'perf', 'addressability', 'other']),
+          severity: z.enum(['high', 'medium', 'low', 'unknown']),
+          statement: z.string(),
+          fingerprint: z.string().describe('stable dedupe key across runs — the same defect must produce the same string'),
+          evidence: z.record(z.string(), z.unknown()).optional(),
+        }))
+        .optional(),
+    },
+  },
+  async ({ appSlug, facts, lessons, findings }) => {
+    const appId = await appIdFor(appSlug);
+    if (!appId) return fail(`unknown app '${appSlug}'`);
+
+    const input = {
+      ...(facts ? { facts: facts as RememberFact[] } : {}),
+      ...(lessons ? { lessons: lessons as RememberLesson[] } : {}),
+      ...(findings ? { findings: findings as RememberFinding[] } : {}),
+    };
+
+    // Validate before touching the embedder: a bad batch should cost nothing.
+    const problems = validateRemember(input);
+    if (problems.length) return fail(`nothing was written. Problems:\n- ${problems.join('\n- ')}`);
+
+    const out = await remember(createEmbedder(), appId, input);
+    return json({
+      result: 'remembered',
+      ...out,
+      note:
+        'Facts are retrievable immediately via understudy_recall. A lesson only ever fires if its trigger ' +
+        'is CONTAINED by a real step context — times_applied = 0 means it has never matched anything, which ' +
+        'looks identical to a trigger that was never right.',
+    });
+  },
+);
+
+server.registerTool(
   'understudy_vocabulary',
   {
     title: "The app's own vocabulary",
@@ -217,7 +335,7 @@ server.registerTool(
   async ({ appSlug }) => {
     const appId = await appIdFor(appSlug);
     if (!appId) return fail(`unknown app '${appSlug}'`);
-    return json(await fetchVocabulary(appId));
+    return json(await fetchVocabulary(appId, { purpose: 'plan' }));
   },
 );
 

@@ -30,6 +30,10 @@ import {
   buildDistillRequest, validateDistilled, saveDistilled, loadDistilled, distilledPath,
 } from '../core/distill.js';
 import { fetchVocabulary } from '../core/vocabulary.js';
+import { remember, validateRemember } from '../core/remember.js';
+import { recordAttributedRun } from '../core/run.js';
+import { lessonsFor, foldLessonOutcomes } from '../core/lessons.js';
+import type { RememberInput } from '../core/remember.js';
 import { recordRun } from '../core/run.js';
 import { mineMacros } from '../core/macros.js';
 import { buildPlan } from '../core/plan.js';
@@ -55,6 +59,8 @@ COMMANDS
   mine <slug>           find step blocks that recur across recorded flows
   flows <slug>          list what this app knows how to do
   findings <slug>       what looks wrong, filtered and ranked
+  remember <slug> <file> write facts/lessons/findings from a JSON batch
+  attribute <slug> <goal> record a goal Understudy did not drive itself
   emit <slug> <flow>    print a flow as runnable test code
   test <slug> <goal>    plan and execute a goal against an app
 
@@ -338,10 +344,19 @@ async function cmdReplay(positional: string[], flags: Flags) {
     console.log('');
   }
 
+  // Consult what the corpus has learned, exactly as the executor does. Without
+  // this a verification replay is the one place that ignores the memory — and
+  // it is also where lesson counters would otherwise never move.
+  const replayAppId = await appIdFor(recording.appSlug);
   const result = await replay(recording, {
     values,
     ...(flags.has('headed') ? { headless: false } : {}),
+    ...(replayAppId ? { lessonsFor: (context) => lessonsFor(replayAppId, context) } : {}),
   });
+  if (replayAppId) {
+    const folded = await foldLessonOutcomes(replayAppId, result.steps, recording.events);
+    if (folded.fired) console.log(`lessons  ${folded.fired} fired, ${folded.helped} on steps with a history of failing`);
+  }
 
   console.log(`replay ${result.ok ? 'PASSED' : 'FAILED'} in ${(result.durationMs / 1000).toFixed(1)}s\n`);
   for (const s of result.steps) {
@@ -367,6 +382,21 @@ async function cmdReplay(positional: string[], flags: Flags) {
     console.log('\nNEEDS REVIEW — this recording will not be promoted to memory.');
     process.exitCode = 3;
   }
+}
+
+/**
+ * App id, or null when this app has no corpus yet.
+ *
+ * Soft on purpose: a replay must still work against an app nothing has been
+ * ingested for. Lesson lookup is an enhancement to a replay, never a
+ * precondition for one.
+ */
+async function appIdFor(slug: string): Promise<string | null> {
+  const { rows } = await getPool().query<{ app_id: string }>(
+    'SELECT app_id FROM apps WHERE slug = $1',
+    [slug],
+  );
+  return rows[0]?.app_id ?? null;
 }
 
 async function appIdOrFail(slug: string): Promise<string> {
@@ -396,7 +426,12 @@ async function cmdIngest(positional: string[], flags: Flags) {
   // fingerprints come from.
   console.log(`target: ${describeTarget()}`);
   console.log('replaying to verify…');
-  const result = await replay(recording, { values: valuesFromFlags(flags) });
+  const replayAppId = await appIdFor(recording.appSlug);
+  const result = await replay(recording, {
+    values: valuesFromFlags(flags),
+    ...(replayAppId ? { lessonsFor: (context) => lessonsFor(replayAppId, context) } : {}),
+  });
+  if (replayAppId) await foldLessonOutcomes(replayAppId, result.steps, recording.events);
 
   const failed = result.steps.find((s) => !s.ok);
   if (failed) {
@@ -426,6 +461,12 @@ async function cmdIngest(positional: string[], flags: Flags) {
   console.log(`${ing.created ? 'created' : 'updated'} flow  ${ing.slug}`);
   console.log(`  steps       ${ing.steps}`);
   console.log(`  selectors   ${ing.selectorsCreated} new, ${ing.selectorsReused} already known`);
+  if (ing.unnamedControls) {
+    console.log(
+      `  UNNAMED     ${ing.unnamedControls} control(s) have no accessible name — filed as addressability findings.`,
+    );
+    console.log('              Steps reaching them cannot be addressed as {role, name}, which is what makes a seam unresolvable.');
+  }
   console.log(`  destructive ${ing.destructive}`);
   console.log(`  bindable    ${ing.chunkWritten ? 'yes — embedded and searchable' : 'no (needs_review)'}`);
   console.log(`  run         ${run.events} events, ${run.edges} page edge(s)`);
@@ -450,7 +491,12 @@ async function cmdDistill(positional: string[], flags: Flags) {
   // Replay first, always. The distiller must only ever see VERIFIED steps —
   // an unreplayable step could otherwise be named, segmented, and bound like
   // a real one.
-  const result = await replay(recording, { values: valuesFromFlags(flags) });
+  const replayAppId = await appIdFor(recording.appSlug);
+  const result = await replay(recording, {
+    values: valuesFromFlags(flags),
+    ...(replayAppId ? { lessonsFor: (context) => lessonsFor(replayAppId, context) } : {}),
+  });
+  if (replayAppId) await foldLessonOutcomes(replayAppId, result.steps, recording.events);
   if (result.needsReview) {
     console.error('cannot distill — the recording did not replay cleanly.');
     const bad = result.steps.find((s) => !s.ok);
@@ -600,7 +646,7 @@ async function cmdTest(positional: string[], flags: Flags) {
   const reasoner = flags.has('reasoner') ? createReasoner(str(flags.get('reasoner'))) : undefined;
 
   if (reasoner && !subGoals.length) {
-    const vocabulary = await fetchVocabulary(appId);
+    const vocabulary = await fetchVocabulary(appId, { purpose: 'plan' });
     subGoals = await reasoner.decompose(goal, vocabularyLines(vocabulary));
     console.log(`decomposed by ${reasoner.id}:`);
     for (const sg of subGoals) console.log(`  - ${sg}`);
@@ -750,6 +796,79 @@ async function cmdEmit(positional: string[], flags: Flags) {
   }
 }
 
+/**
+ * Write knowledge by hand, from a JSON batch.
+ *
+ * A file rather than flags because these are multi-line prose with structured
+ * triggers, and because a batch is the unit the operating contract asks for:
+ * gather what you learned, confirm the list, write it once.
+ */
+/**
+ * Record a goal that something other than the executor drove.
+ *
+ * `--failed` rather than `--passed` because the honest default for "I ran this
+ * and I am telling you about it" is that it worked; a failure is the thing
+ * worth spelling out.
+ */
+async function cmdAttribute(positional: string[], flags: Flags) {
+  const slug = positional[0] ?? fail('attribute needs an app slug');
+  const goal = positional.slice(1).join(' ') || fail('attribute needs a goal');
+  const appId = await appIdOrFail(slug);
+
+  const drivenBy = str(flags.get('driven-by'));
+  const note = str(flags.get('note'));
+
+  const out = await recordAttributedRun({
+    appId,
+    goal,
+    passed: !flags.has('failed'),
+    sigSequence: all(flags, 'sig'),
+    ...(drivenBy ? { drivenBy } : {}),
+    ...(note ? { note } : {}),
+  });
+
+  console.log(`recorded run ${out.runId}  mode=attributed  status=${flags.has('failed') ? 'failed' : 'passed'}`);
+  if (out.drift) {
+    console.log(
+      out.drift.baselineRuns === 0
+        ? 'first run of this goal — nothing to compare against yet'
+        : out.drift.changed
+          ? `DRIFT vs the last ${out.drift.baselineRuns} passing run(s)`
+          : `drift none (matches the last ${out.drift.baselineRuns} passing run(s))`,
+    );
+  } else {
+    console.log('drift not measured — pass --sig <fingerprint> per step to lay down a baseline');
+  }
+}
+
+async function cmdRemember(positional: string[]) {
+  const slug = positional[0] ?? fail('remember needs an app slug');
+  const file = positional[1] ?? fail('remember needs a JSON file: understudy remember <slug> <file>');
+  const appId = await appIdOrFail(slug);
+
+  let input: RememberInput;
+  try {
+    input = JSON.parse(await readFile(file, 'utf8')) as RememberInput;
+  } catch (err) {
+    return fail(`could not read ${file}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Validate before the embedder loads — a bad batch should cost nothing, and
+  // every problem is reported at once so one pass is enough to fix it.
+  const problems = validateRemember(input);
+  if (problems.length) {
+    console.error(`nothing written — ${problems.length} problem(s):`);
+    for (const p of problems) console.error(`  - ${p}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  const out = await remember(createEmbedder(), appId, input);
+  console.log(`facts     ${out.facts.written} written, ${out.facts.alreadyPresent} already present`);
+  console.log(`lessons   ${out.lessons.written} written, ${out.lessons.alreadyPresent} already present`);
+  console.log(`findings  ${out.findings.written} written, ${out.findings.reoccurred} re-occurred`);
+}
+
 async function cmdFlows(positional: string[]) {
   const slug = positional[0] ?? fail('flows needs an app slug');
   const appId = await appIdOrFail(slug);
@@ -897,6 +1016,12 @@ async function main() {
       break;
     case 'emit':
       await cmdEmit(rest, flags);
+      break;
+    case 'remember':
+      await cmdRemember(rest);
+      break;
+    case 'attribute':
+      await cmdAttribute(rest, flags);
       break;
     case 'flows':
       await cmdFlows(rest);

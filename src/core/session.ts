@@ -129,7 +129,7 @@ export async function runPipeline(
   runId: string,
   opts: StartRunOptions = {},
 ): Promise<RunOutcome> {
-  const vocabulary = await fetchVocabulary(appId);
+  const vocabulary = await fetchVocabulary(appId, { purpose: 'plan' });
 
   // THE ONE MODEL CALL IN PLANNING. Everything after it is arithmetic.
   const subGoals = await reasoner.decompose(goal, vocabularyLines(vocabulary));

@@ -25,6 +25,8 @@
 import { createHash } from 'node:crypto';
 import type pg from 'pg';
 import { getPool, tx } from './db.js';
+import { selectorIdentity } from './selector-identity.js';
+import { stepFingerprint } from './fingerprint.js';
 import { urlPattern } from './sig.js';
 import { toVector } from './recall.js';
 import type { Embedder } from './types.js';
@@ -49,6 +51,13 @@ export interface IngestResult {
   lessons: number;
   /** Distillation corrections recorded against the flow. */
   corrections: number;
+  /**
+   * Controls captured with no accessible name, each filed as an
+   * `addressability` finding. Non-zero means this recording contains steps that
+   * cannot be addressed as {role, name} — which is what makes a seam
+   * unresolvable later, so it is worth seeing at ingest time.
+   */
+  unnamedControls: number;
   /** Step ids in ordinal order — lets the caller record a run against them. */
   stepIds: string[];
   /** Selector per step, parallel to stepIds. */
@@ -56,18 +65,6 @@ export interface IngestResult {
   appId: string;
   /** True when intent came from a distiller rather than being enumerated. */
   distilled: boolean;
-}
-
-/**
- * A step's fingerprint: `sha1(action|role|name|url_pattern)`.
- * Used by macro mining to spot the same step recurring across flows, and by
- * destructive inference to match a step against an already-destructive flow.
- */
-function stepFingerprint(event: RawEvent): string {
-  return createHash('sha1')
-    .update([event.action, event.role ?? '', event.name ?? '', urlPattern(event.url)].join('|'))
-    .digest('hex')
-    .slice(0, 16);
 }
 
 /**
@@ -306,6 +303,8 @@ export async function ingestRecording(
     // duplicated just because two flows contain it.
     const stepIds: string[] = [];
     const stepSelectorIds: Array<string | null> = [];
+    /** Controls captured with no accessible name — see the flag below. */
+    const unnamed: Array<{ action: string; css: string | null; testId: string | null; semantic: string }> = [];
 
     for (const [ordinal, event] of events.entries()) {
       const outcome = outcomeBySeq.get(event.seq);
@@ -313,49 +312,86 @@ export async function ingestRecording(
 
       // goto addresses no element.
       if (event.action !== 'goto') {
-        // Selectors are per-APP and deduped on (role, name, frame_hint) — one
-        // row per element, so a rename degrades every flow at once and you see
-        // ONE cause rather than twelve.
-        // Ask BEFORE upserting whether this element is already known.
-        // RETURNING cannot answer it: the ON CONFLICT branch sets
-        // observed_only = false, so the returned row looks identical either
-        // way and every selector would report as "reused".
-        const { rows: prior } = await client.query<{ selector_id: string }>(
-          `SELECT selector_id FROM selectors
-           WHERE app_id = $1 AND role IS NOT DISTINCT FROM $2
-             AND name = $3 AND frame_hint = $4`,
-          [appId, event.role ?? '', event.name ?? '', event.frameHint ?? ''],
-        );
-        if (prior.length) selectorsReused++;
-        else selectorsCreated++;
+        // AN ELEMENT WITH NO ACCESSIBLE NAME IS NOT IDENTIFIED.
+        //
+        // `explore` already refuses to click one and records a boundary fact
+        // about it, but a RECORDING captures them silently — `codegen` happily
+        // emits `locator('div').filter({hasText:/^Services$/}).nth(1)`, which
+        // imports as a step with role='' and name=''. Nothing complained, and
+        // the cost surfaced much later and somewhere else: such a step cannot
+        // be expressed as {role, name}, so any seam that needs it is
+        // unresolvable and the flow can only ever bind as one whole recording.
+        //
+        // Flag it HERE, where it is cheap to fix, instead of at bind time.
+        if (!event.name) {
+          unnamed.push({
+            action: event.action,
+            css: event.css ?? null,
+            testId: event.testId ?? null,
+            semantic: semanticFor(event),
+          });
+        }
+        // Selectors are per-APP and deduped on `identity` — one row per
+        // element, so a rename degrades every flow at once and you see ONE
+        // cause rather than twelve.
+        //
+        // identity is the accessible name when there is one (byte-identical to
+        // the old role|name|frame key), else the test id, else the css. `null`
+        // means the element cannot be identified AT ALL — and then it gets no
+        // row, rather than sharing one with every other unnamed element on the
+        // app. See src/core/selector-identity.ts for what that was costing.
+        const identity = selectorIdentity({
+          role: event.role ?? '',
+          name: event.name ?? '',
+          frameHint: event.frameHint ?? '',
+          testId: event.testId ?? null,
+          css: event.css ?? null,
+        });
 
-        const { rows: sel } = await client.query<{ selector_id: string; observed_only: boolean }>(
-          `INSERT INTO selectors (app_id, role, name, frame_hint, test_id, css, fragility,
-                                  observed_only, success_count, health)
-           VALUES ($1,$2,$3,$7,$4,$5,$6,false,1,0.6)
-           ON CONFLICT (app_id, role, name, frame_hint) DO UPDATE
-             SET last_seen_at = now(),
-                 -- a replayed step PROVES the element: it is no longer merely observed
-                 observed_only = false,
-                 success_count = selectors.success_count + 1,
-                 test_id = coalesce(selectors.test_id, excluded.test_id),
-                 css = coalesce(selectors.css, excluded.css),
-                 fragility = excluded.fragility
-           RETURNING selector_id, observed_only`,
-          [
-            appId,
-            // '' not NULL: a NULL component makes the unique key inert.
-            event.role ?? '',
-            event.name ?? '',
-            event.testId ?? null,
-            event.css ?? null,
-            fragilityFor(event, outcome),
-            // '' is the main frame. Writing NULL here would put the row back
-            // outside the unique index and re-introduce the duplicate bug.
-            event.frameHint ?? '',
-          ],
-        );
-        selectorId = sel[0]!.selector_id;
+        if (identity) {
+          // Ask BEFORE upserting whether this element is already known.
+          // RETURNING cannot answer it: the ON CONFLICT branch sets
+          // observed_only = false, so the returned row looks identical either
+          // way and every selector would report as "reused".
+          const { rows: prior } = await client.query<{ selector_id: string }>(
+            'SELECT selector_id FROM selectors WHERE app_id = $1 AND identity = $2',
+            [appId, identity],
+          );
+          if (prior.length) selectorsReused++;
+          else selectorsCreated++;
+
+          const { rows: sel } = await client.query<{ selector_id: string; observed_only: boolean }>(
+            `INSERT INTO selectors (app_id, identity, role, name, frame_hint, test_id, css, fragility,
+                                    observed_only, success_count, health)
+             VALUES ($1,$8,$2,$3,$7,$4,$5,$6,false,1,0.6)
+             ON CONFLICT (app_id, identity) DO UPDATE
+               SET last_seen_at = now(),
+                   -- a replayed step PROVES the element: it is no longer merely observed
+                   observed_only = false,
+                   success_count = selectors.success_count + 1,
+                   test_id = coalesce(selectors.test_id, excluded.test_id),
+                   css = coalesce(selectors.css, excluded.css),
+                   fragility = excluded.fragility
+             RETURNING selector_id, observed_only`,
+            [
+              appId,
+              // '' not NULL: a NULL component makes the unique key inert.
+              event.role ?? '',
+              event.name ?? '',
+              event.testId ?? null,
+              event.css ?? null,
+              fragilityFor(event, outcome),
+              // '' is the main frame. Writing NULL here would put the row back
+              // outside the unique index and re-introduce the duplicate bug.
+              event.frameHint ?? '',
+              identity,
+            ],
+          );
+          selectorId = sel[0]!.selector_id;
+        }
+        // else: selectorId stays null. The step still runs — its addressing is
+        // in `steps.args` (nth, hasText) — it just does not claim to be a
+        // health-tracked element, because it is not one.
       }
 
       const fp = stepFingerprint(event);
@@ -556,14 +592,49 @@ export async function ingestRecording(
 
     return {
       flowId, created, chunkWritten, segmentCount, lessonCount, stepIds, stepSelectorIds,
+      unnamed,
       destructive: destRows[0]?.destructive ?? false,
     };
   });
+
+  // ---- flag controls that cannot be addressed -----------------------------
+  //
+  // Deliberately AFTER the transaction: a finding is a report about the
+  // ingest, not part of it, and failing to file one must never roll back a
+  // recording that otherwise ingested cleanly.
+  //
+  // Deduped per element by fingerprint, so re-ingesting the same recording
+  // increments occurrences instead of filing a new finding every time.
+  const unnamedFindings = new Map<string, { semantic: string; action: string; css: string | null; testId: string | null }>();
+  for (const u of result.unnamed) {
+    // css/testId, when present, is what actually distinguishes one unnamed
+    // element from another — without either there is nothing to key on but the
+    // step's own description.
+    unnamedFindings.set(`unnamed:${slug}:${u.css ?? u.testId ?? u.semantic}`, u);
+  }
+  let unnamedFiled = 0;
+  for (const [fingerprint, u] of unnamedFindings) {
+    await getPool().query(
+      `INSERT INTO findings (app_id, kind, severity, statement, evidence, fingerprint)
+       VALUES ($1,'addressability','medium',$2,$3,$4)
+       ON CONFLICT (app_id, fingerprint)
+       DO UPDATE SET occurrences = findings.occurrences + 1, last_seen_at = now()`,
+      [
+        appId,
+        `A control used by "${slug}" has no accessible name (${u.semantic}), so it cannot be addressed as {role, name}. ` +
+          `Steps that reach it are unreplayable outside this recording, and any seam that needs it cannot be resolved.`,
+        JSON.stringify({ flow: slug, action: u.action, css: u.css, testId: u.testId, semantic: u.semantic }),
+        fingerprint,
+      ],
+    );
+    unnamedFiled++;
+  }
 
   return {
     flowId: result.flowId,
     slug,
     created: result.created,
+    unnamedControls: unnamedFiled,
     steps: events.length,
     selectorsCreated,
     selectorsReused,

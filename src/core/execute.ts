@@ -19,7 +19,7 @@ import { getPool } from './db.js';
 import { replay, type ReplayOptions, type ReplayResult } from './replay.js';
 import { buildRecording, type RawEvent, type RawRecording } from './recording.js';
 import type { Plan } from './plan.js';
-import { lessonsFor, markApplied } from './lessons.js';
+import { lessonsFor, foldLessonOutcomes } from './lessons.js';
 
 interface StepRow {
   action: string;
@@ -191,11 +191,10 @@ export async function executePlan(
   });
 
   // Bookkeeping: a lesson that fires constantly and never helps is noise with a
-  // trigger attached, and only the ratio shows that.
-  for (const step of result.steps) {
-    if (!step.lessonsApplied?.length) continue;
-    await markApplied(step.lessonsApplied.map((l) => l.lessonId), step.ok);
-  }
+  // trigger attached, and only the ratio shows that. Shared with the CLI replay
+  // paths — this loop used to live only here, which is why lessons fired during
+  // a verification replay were never counted.
+  await foldLessonOutcomes(plan.appId, result.steps, recording.events);
 
   return { result, recording, flowsRun };
 }
