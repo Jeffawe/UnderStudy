@@ -1,6 +1,6 @@
 # Understudy
 
-An system that learns a web app from browser recordings and stores what it learned
+A system that learns a web app from browser recordings and stores what it learned
 as **queryable memory**, so you can say *"test login"* and it works — including
 for goals no single recording covers.
 
