@@ -254,7 +254,7 @@ export function validateDistilled(input: unknown, stepCount: number): Validation
 
 // ---- cache -----------------------------------------------------------------
 // Keyed by recording hash, so a recording distilled once is never distilled
-// again. CLAUDE.md's day-one guard: distillation is the expensive call.
+// again. BUILDING.md's day-one guard: distillation is the expensive call.
 
 export const distilledPath = (hash: string): string => join(DISTILLED_DIR, `${hash}.json`);
 

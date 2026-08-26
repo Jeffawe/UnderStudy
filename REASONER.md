@@ -1,8 +1,13 @@
 # Being the reasoner
 
 You are the **reasoner** (and the distiller) for Understudy. This file is how to
-do that job. It is not about building Understudy — that is `STATUS.md` for
-progress and `PLAN.md` for architecture.
+do that job, and in a local checkout it is loaded into every session
+automatically, so you should never have to be told to read it.
+
+It is not about *building* Understudy. The architecture, the concepts behind the
+code and the running build status are working documents kept out of this repo —
+they carry infrastructure detail no visitor needs. In a checkout that has them,
+`CLAUDE.md` routes you.
 
 Works the same whether you are Claude Code, Codex, Cursor or anything else that
 speaks MCP. Nothing in the protocol is model-specific.
@@ -60,7 +65,7 @@ browser actually gets driven is an implementation detail you are free to choose.
   `decompose` below for how — phrase sub-goals in the app's own vocabulary.
 - **Say the decomposition out loud, not just inside the tool call.** `subGoals`
   is an argument the user does not see. State it in your own turn too —
-  "decomposing into: log in as a member, choose the hair loss service" —
+  "decomposing into: log in as a member, choose the premium plan" —
   before you act on it. It is the single highest-leverage judgment call in a
   run; one the user cannot see is one they cannot correct before it drives
   twenty minutes of the wrong retrieval.
@@ -159,8 +164,8 @@ understudy_record_run(appSlug, goal, passed, sigSequence?, drivenBy?, note?)
 **Call this every time you reach a goal without the executor.** Driving it
 yourself is allowed and often necessary — but it used to leave no trace at all:
 no run row, no drift baseline, nothing showing the goal had ever worked.
-Measured on myapp, a paid intake succeeded on 2026-08-20 while the newest
-run row still read 2026-08-13. The reinforcement loop only turns when a run is
+Measured on a real corpus, a paid checkout succeeded while the newest run row
+was still a week older. The reinforcement loop only turns when a run is
 recorded.
 
 Stored as `mode='attributed'`, deliberately never `'execute'` — *"this goal
@@ -195,7 +200,7 @@ only the flows it eventually binds.
 You get the goal and the app's **entire vocabulary**. Answer:
 
 ```json
-{ "subGoals": ["log in as a member", "choose the hair loss service"] }
+{ "subGoals": ["log in as a member", "choose the premium plan"] }
 ```
 
 **This is the highest-leverage thing you do.** Each sub-goal becomes a semantic
@@ -211,8 +216,8 @@ an app that requires login means log in first.
 state its predecessor leaves behind, so listing the right segments in the wrong
 sequence manufactures seams that do not exist and can send you probing a gap
 across nothing. This is easy to get wrong because a *sensible* order and the
-*recorded* order are often different: on the MyApp hair loss intake the
-contact details come before the date of birth, and the health questions come
+*recorded* order are often different: on one real multi-step intake the contact
+details came before the date of birth, and the eligibility questions came
 **last** — decomposing it in the order a person would describe it produced two
 "unresolved" seams that vanished once the order matched the recording.
 
@@ -281,9 +286,9 @@ fires forever on every run, which is how visual testing gets switched off.
 query. No login, no browser.
 
 A top distance near or above **0.92** is a gap. So is a *close* match that is
-plainly the wrong thing: "complete a general rash intake" returned the hair-loss
-photo-upload segment at 0.8072, which reads as known but is a different intake.
-Judge the text, not just the number.
+plainly the wrong thing: "complete a business account application" returned the
+personal-account ID-upload segment at 0.8072, which reads as known but is a
+different flow. Judge the text, not just the number.
 
 **If it is a gap: drive it by hand, then write down what you did.** Exploration
 that is not captured is work done twice. Note that anything with a file upload
@@ -301,6 +306,169 @@ come away with nothing. Bank what the run taught as facts and lessons, and note
 in the recording's `corrections` where the capture had to stop and why. The
 `corrections` field is read by whoever picks the flow up next; treating it as the
 place to explain an edge is what makes the edge cheap the second time.
+
+---
+
+## Recording a flow without recording how you got there
+
+**Shipped 2026-08-21.** You no longer have to capture the login (or anything
+else upstream) to capture the thing you actually care about.
+
+```bash
+understudy record myapp --arm-manually \
+    --value MEMBER.email=… --value SECRET.password=…
+```
+
+The browser opens, **nothing is captured**, and you drive to wherever the flow
+you want actually starts. Press Enter in the terminal and capture arms from
+there. Step 0 becomes a `goto` to wherever you armed, so the recording is still
+self-contained and still replays.
+
+**The session is saved at arm time and reused next run.** Keyed on a hash of
+the `--value` credentials you passed, so a different member is a different
+session and misses the cache. Miss means you sign in by hand once and it is
+banked for next time. `--fresh` ignores the cache and signs in again.
+
+This matters beyond convenience: every replay does a cold login and `distill`
+replays *again*, so verify-then-ingest used to cost 2–3 logins per recording
+against an app that locks the account for 15 minutes. `replay`, `ingest` and
+`distill` all restore the session automatically for recordings that need one.
+
+Three things to know before it surprises you:
+
+- **A saved session may only satisfy what was NOT recorded.** If the flow you
+  are capturing IS the login, do not arm late — the steps have to run, or
+  ingest "proves" a login it never performed.
+- **A stale session announces itself properly.** The arm-time fingerprint rides
+  on step 0 as an ordinary `expectedSig`, so an expired session surfaces as an
+  unexpected page (the app serves the login page at the URL that used to be the
+  account page — exactly what `sig()` catches and a URL check cannot). The
+  cached entry then deletes itself; re-record with `--arm-manually` to refresh.
+- **To skip an INTAKE, use `--after` — a session alone cannot.** Wizard progress
+  is server-side and is not in `storageState`, so it has to be walked. See
+  *Starting a recording after a whole intake* below.
+
+`.understudy/sessions/` is gitignored and written 0600. It holds live tokens;
+treat it like a password file and never mirror it to the database.
+
+---
+
+## Starting a recording after a whole intake
+
+**Shipped 2026-08-24.** `--arm-manually` skips a login; this skips anything the
+corpus already knows how to do.
+
+```bash
+understudy record myapp \
+    --after log-in-as-a-member --after complete-onboarding-intake \
+    --value MEMBER.email=… --value SECRET.password=…
+```
+
+Those flows are replayed in the browser about to be recorded, **unrecorded**,
+and capture arms where they finish. Repeatable and ORDERED. Add
+`--arm-manually` as well to adjust by hand before capture arms.
+
+The recording stores the prelude **by reference** — the flow slugs, not their
+steps — so `replay`, `ingest` and `distill` all walk it automatically, and
+fixing the referenced segment once fixes every recording built on it.
+
+Five things worth knowing before they surprise you:
+
+- **Name a flow slug that exists.** `understudy flows <app>` lists them. An
+  unknown slug fails before the browser opens, which is the cheap failure.
+- **A prelude that will not replay aborts the recording**, and reports
+  `preludeOk: false` rather than blaming the recording — its own steps never
+  ran. Fix or re-ingest the referenced flow.
+- **A destructive prelude is refused** unless you pass `--allow-purchases`. It
+  would otherwise run on record, replay, ingest *and* distill — four real
+  orders per recording.
+- **Prelude flows that fill credentials need the same `--value` here**, because
+  they are actually executed.
+- **The planner blocks a bound flow whose prelude the plan does not run**,
+  naming the missing slug. Fix it by adding a sub-goal that binds the prelude
+  flow first — usually just "log in as a member" — not by working around it.
+  Running the prelude automatically during execution is not built.
+
+`npm run prelude:check` gates all of this and is **safe** — like `auth:check`
+and unlike `explore:check`, it scopes to a reserved slug and deletes nothing
+else.
+
+---
+
+## When a run gets stuck and asks YOU to record
+
+**Shipped 2026-08-25.** A run that cannot do something no longer dies. It parks,
+hands you a command, and continues from wherever you get to.
+
+You will see a `needs_decision` with `kind: "needs_capture"`:
+
+```jsonc
+{ "kind": "needs_capture", "trigger": "unimplemented_action",
+  "why": "replay does not implement action 'dispatch_click'",
+  "atStep": 34,
+  "from": { "url": "https://…/checkout/summary", "sig": "/checkout/summary#3f2a…",
+            "sessionFile": ".understudy/sessions/handoff-<runId>.json" },
+  "howTo": { "run": "understudy record myapp --seed-session … --seed-url …" } }
+```
+
+Do exactly this:
+
+1. **Run the `howTo.run` command.** It opens a browser already signed in and
+   already on the page the run is stuck on, with capture disarmed.
+2. **Drive the piece the run could not do**, then press Enter to arm and record
+   only what matters. Close the window when done.
+3. **Send back the hash it printed**: `understudy_resume_run(requestId,
+   { recordingHash: "…" })`.
+
+The run reseeds its own browser from where you finished and carries on.
+
+Five things worth knowing:
+
+- **Your steps are NOT re-executed.** You and the run share the app's
+  server-side session, so by the time you close the window the work is already
+  done. Re-driving your steps would advance an already-advanced flow and apply
+  every side effect twice. The run adopts the state you reached and continues at
+  the next step.
+- **A seam handoff is the exception, and it is handled for you.** There, what
+  you recorded is the BRIDGE between two segments, so the destination's own
+  first step still runs afterwards.
+- **You can decline.** `{ action: 'skip' }` lets the run fail at that step;
+  `{ action: 'abort', reason }` stops it. Both are honest answers — a real
+  purchase is a good reason to skip.
+- **The capture is saved but NOT distilled.** That is deliberate: the run
+  continues without paying for a model call. Distil and ingest it afterwards, or
+  the next run asks again. The finished run tells you so in `manualHandoffs`.
+- **A run that needed you is not reported as a clean pass.** `passed: true`
+  arrives alongside `manualHandoffs`, because a human did part of it.
+
+### What makes a run ask
+
+Four triggers, all tunable in `.env` (defaults in `.env.example`):
+
+| Trigger | Env var | Default |
+|---|---|---|
+| a step failed too many times | `UNDERSTUDY_MAX_STEP_ATTEMPTS` | 1 (no retries) |
+| too many questions | `UNDERSTUDY_MAX_DECISIONS` | 25 |
+| the run has taken too long | `UNDERSTUDY_MAX_RUN_MINUTES` | 30 |
+| too many tokens exchanged | `UNDERSTUDY_MAX_DECISION_TOKENS` | 120000 |
+
+Plus two that always fire regardless of budget: an **unimplemented IR action**
+(`dispatch_click` — `wait_url` and `wait_text` are now implemented) and an
+**unresolved seam**.
+
+**On the token budget, know what it can see.** Understudy calls no model in this
+mode — you are the reasoner — so it cannot read your usage. It meters the
+payloads it hands you and the answers coming back, plus a surcharge per image it
+asks you to open. That under-counts your own thinking, so it trips early by
+design. If you know your real figure, pass it on any resume:
+`understudy_resume_run(requestId, answer, { totalTokens: 48000 })`. It is folded
+in with `max()`, so it can only make the budget trip **sooner**, never later.
+
+`npm run handoff:check` gates all of this and is the cheapest check in the repo
+— no database, no corpus, no model.
+
+`npm run auth:check` gates all of this and is **safe** — unlike `explore:check`,
+it deletes nothing.
 
 ---
 
@@ -388,8 +556,8 @@ ever reporting it missing.
 Which kind it is:
 
 > A **fact** is declarative and retrieved BY MEANING at planning time.
-> "Visit History is at `/uploaded-documents`." "Reaching checkout texts a real
-> phone." There is nothing to *do* at a step; it changes what you plan, and
+> "Order history is at `/past-invoices`, not `/orders`." "Reaching checkout
+> texts a real phone." There is nothing to *do* at a step; it changes what you plan, and
 > sometimes whether you run at all.
 >
 > A **lesson** is a conditional fix matched by EXACT TRIGGER during execution.
@@ -425,11 +593,14 @@ outlived its cause.
 
 ## Things that will cost you an hour if you don't know them
 
-**Logins are often rate limited.** MyApp locks the account for 15 minutes
-after a handful of attempts. Every replay does a cold login and `distill`
+**Logins are often rate limited.** One app in testing locks the account for 15
+minutes after a handful of attempts. Every replay does a cold login and `distill`
 replays *again*, so verify-then-ingest is 2–3 logins per recording. Plan for it:
 use `dryRun` while iterating, batch your ingests, and do not debug by re-running
-the same replay.
+the same replay. **Since 2026-08-21 a recording captured with `--arm-manually`
+carries a saved session and skips the login entirely** — see *Recording a flow
+without recording how you got there*. That does not help a recording whose own
+steps are the login, which must still run them.
 
 **Stop before the irreversible step.** Ingest replays the recording every time,
 so a captured "Confirm & Submit" or Stripe checkout files a real order on every
@@ -439,10 +610,12 @@ ingest. Trim with `import --until <n>` and say why in `corrections`.
 `valueRef` like `MEMBER.password`, never the value. Supply them per run through
 `values`.
 
-**Some IR actions are legal in the schema but unimplemented** — `wait_url`,
-`wait_text`, `dispatch_click`. A flow gated behind an explicit wait or a
-`dispatchEvent` submit cannot be captured past that point yet. That is usually
-where a capture has to stop.
+**One IR action is legal in the schema but unimplemented** — `dispatch_click`.
+A flow gated behind a `dispatchEvent` submit cannot be captured past that point
+yet, and that is usually where a capture has to stop. It no longer kills a run,
+though: since 2026-08-25 it escalates to a handoff and asks you to record the
+piece by hand. `wait_url` and `wait_text` were implemented 2026-08-25;
+`scroll_container` shipped 2026-08-19.
 
 `scroll_container` **is** implemented (2026-08-19). Capture it by writing
 `locator.scrollIntoViewIfNeeded()`, which the importer maps directly; a
@@ -478,8 +651,8 @@ real `upload`. Costing a person ten minutes of recording for an unusable
 artefact is the expensive version of this mistake.
 
 **A step that fails "locator matched no elements" is not always a bad
-selector.** On MyApp, `/select-condition` renders nothing but the sidebar
-on the first visit after login; a second `goto` renders the list. Two replays
+selector.** On one app, `/choose-plan` rendered nothing but the sidebar on the
+first visit after login; a second `goto` rendered the list. Two replays
 were spent blaming the locator. Before rewriting a selector, check whether the
 page rendered at all — `body.innerText` answers it in one call.
 

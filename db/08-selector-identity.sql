@@ -5,7 +5,7 @@
 -- the opposite defect: every element WITHOUT an accessible name now shares the
 -- key ('', '', ''), so they all merge into a single row.
 --
--- Measured on myapp before this migration: 92 steps pointing at 2 rows,
+-- Measured on a real corpus before this migration: 92 steps pointing at 2 rows,
 -- one holding 52 distinct elements. That breaks the health model (52 elements,
 -- one score — quarantine would remove all of them or none) and actively
 -- corrupts execution, because execute.ts reads `css` from this table and was

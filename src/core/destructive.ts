@@ -1,7 +1,7 @@
 /**
  * Destructive inference — five signals, and it FAILS OPEN.
  *
- * CLAUDE.md: "commit-shaped control clicked, payment origin crossed, clicked
+ * BUILDING.md: "commit-shaped control clicked, payment origin crossed, clicked
  * through a `boundary` fact, step fingerprint matches an already-destructive
  * flow, or a fact says so. No signal → not destructive. No question is ever
  * asked."

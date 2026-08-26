@@ -79,7 +79,7 @@ export interface SeamEndpoint {
  * that is not a real gap: `sig()` is state-granular, so a segment boundary
  * lands on two different fingerprints of the same page (a request appears on
  * /overview, a menu opens, a validation message renders). Observed on
- * myapp: decomposing one hair loss intake into its seven own segments
+ * a real corpus: decomposing one multi-step intake into its seven own segments
  * produced two "unresolved" seams between slices that are literally
  * consecutive in the recording they were cut from — each one a live-probe
  * request for a bridge across nothing.
@@ -269,7 +269,7 @@ export async function resolveSeam(
   // starts on /overview, but with a different fingerprint — six distinct
   // /overview sigs have been recorded, because the page renders request status
   // and notifications that change over time. No bridge exists because none is
-  // needed: the segment's first step is `goto /select-condition`.
+  // needed: the segment's first step is `goto /choose-plan`.
   //
   // Without this the honest probe answer ("no steps") is indistinguishable
   // from "I could not work it out", and both block. That is the wrong shape:

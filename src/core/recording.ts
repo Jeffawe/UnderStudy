@@ -27,6 +27,13 @@ export type RecordedAction =
   | 'uncheck'
   | 'upload'
   | 'wait_url'
+  // Both were in the schema's action CHECK from the start but missing from this
+  // union, so `flow-ir.ts`'s `r.action as RawEvent['action']` was quietly
+  // asserting something false — a step read back from the database could hold an
+  // action this type said was impossible. `wait_text` is implemented;
+  // `dispatch_click` still escalates, but it now does so visibly.
+  | 'wait_text'
+  | 'dispatch_click'
   // Scroll a nested scroll pane, not the window. Gating controls ("Confirm &
   // Submit" stays disabled until you have read the summary) watch a scroll
   // event on their own container, so `window.scrollTo` never satisfies them
@@ -114,6 +121,47 @@ export interface RawEvent {
   hints?: Record<string, unknown>;
 }
 
+/**
+ * How a recording gets to its first step — the part deliberately NOT recorded.
+ *
+ * A recording of "send a message" should not have to contain the login and the
+ * intake that precede it. Re-recording them would mint duplicate segments
+ * competing for the same bind slot, which is the exact problem slug reuse
+ * exists to prevent. So the entry state is DECLARED rather than captured, and
+ * replay reproduces it by other means.
+ */
+export interface RecordingEntry {
+  /**
+   * The page fingerprint observed at the moment capture began.
+   *
+   * An assertion, not a hint: replay checks it before step 0, because a
+   * recording whose steps were captured somewhere other than where replay
+   * starts is a recording that describes a page nobody is looking at.
+   */
+  startState?: string;
+  /**
+   * Step 0 is not a login — replay must restore a saved session first.
+   *
+   * Set when capture began from an already-authenticated browser, which is the
+   * whole point of arming late. Without it, replaying such a recording lands on
+   * a login page and fails on a locator that was never going to be there, with
+   * nothing explaining why.
+   */
+  requiresSession?: boolean;
+  /**
+   * Flow slugs replayed, in order, in the capture context before capture armed.
+   *
+   * BY REFERENCE, NEVER INLINED STEPS. A saved session can carry a login past
+   * replay because login state lives in cookies; wizard progress does not, so
+   * the only way to start a recording past an intake is to actually walk it.
+   * Copying those steps into the recording would re-record the intake and mint
+   * a duplicate segment competing for the same bind slot — the exact problem
+   * slug reuse exists to prevent. A reference also means fixing the referenced
+   * segment once fixes every recording built on top of it.
+   */
+  prelude?: string[];
+}
+
 export interface RawRecording {
   /** Bump when the shape changes incompatibly. */
   version: 1;
@@ -125,11 +173,13 @@ export interface RawRecording {
   createdAt: string;
   /** Distillation cache key. See recordingHash. */
   hash: string;
+  /** Absent for a recording that starts from a blank browser at `startUrl`. */
+  entry?: RecordingEntry;
   events: RawEvent[];
 }
 
 /**
- * Cache key for distillation — CLAUDE.md's day-one guard, so the expensive
+ * Cache key for distillation — BUILDING.md's day-one guard, so the expensive
  * model call happens once per distinct recording and never again.
  *
  * Deliberately excludes:
@@ -139,8 +189,26 @@ export interface RawRecording {
  *         localhost and the same flow captured against staging share a key
  *
  * Values ARE included: filling a different username is a different recording.
+ *
+ * THE ENTRY CONDITION IS PART OF THE KEY. The same tail steps captured from a
+ * restored session and from a cold browser replay differently and are not the
+ * same recording — without this they would collide, and `saveRecording` would
+ * report `existed: true` and silently keep the first. `startState` is
+ * deliberately NOT included: it is an observation that can shift with a banner,
+ * and a cache key that moves on cosmetic change is not a cache key.
+ *
+ * The line that decides is DECLARATION vs OBSERVATION. `requiresSession` and
+ * `prelude` are claims the operator made about how to reach step 0, and they
+ * change how the recording must be executed. `startState` is something the
+ * browser reported. The first kind belongs in the key; the second does not.
+ *
+ * The prelude is hashed as the ORDERED LIST OF SLUGS, never the referenced
+ * flows' steps. So identical tail steps captured after `[log-in]` and after
+ * `[log-in, complete-intake]` are correctly different recordings, while later
+ * fixing the login segment does not move the hash and does not orphan a
+ * distillation that was paid for.
  */
-export function recordingHash(events: RawEvent[]): string {
+export function recordingHash(events: RawEvent[], entry?: RecordingEntry): string {
   const normalized = events.map((e) => [
     e.action,
     e.role ?? '',
@@ -151,7 +219,22 @@ export function recordingHash(events: RawEvent[]): string {
     e.frameHint ?? '',
     urlPattern(e.url),
   ]);
-  return createHash('sha256').update(JSON.stringify(normalized)).digest('hex').slice(0, 32);
+
+  // Byte-identical to the old form when there is no entry condition, so every
+  // recording captured before this existed keeps the hash it already has.
+  // ORDER OF INSERTION IS LOAD-BEARING: `requiresSession` first, `prelude` only
+  // when non-empty, so a recording that predates preludes still serializes to
+  // exactly the bytes it always did. `auth:check` gate 1 rehashes every
+  // recording on disk and is what catches a regression here.
+  const extras: Record<string, unknown> = {};
+  if (entry?.requiresSession) extras.requiresSession = true;
+  if (entry?.prelude?.length) extras.prelude = entry.prelude;
+
+  const payload = Object.keys(extras).length
+    ? JSON.stringify([normalized, extras])
+    : JSON.stringify(normalized);
+
+  return createHash('sha256').update(payload).digest('hex').slice(0, 32);
 }
 
 /** Assemble a recording and stamp its hash. */
@@ -163,7 +246,7 @@ export function buildRecording(
     version: 1,
     ...meta,
     createdAt: new Date().toISOString(),
-    hash: recordingHash(events),
+    hash: recordingHash(events, meta.entry),
     events,
   };
 }

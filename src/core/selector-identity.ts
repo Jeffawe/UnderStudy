@@ -9,10 +9,10 @@
  *
  * Making them NOT NULL DEFAULT '' then made the key too STRONG in the opposite
  * direction: every element with no accessible name now had the SAME key.
- * Measured on myapp before this fix: 92 steps collapsed onto 2 selector
+ * Measured on a real corpus before this fix: 92 steps collapsed onto 2 selector
  * rows, one of which held 52 genuinely different elements — the OTP digit
- * boxes, "I accept", "Raised bumps", the Services nav div and the review pane,
- * all as a single "element" with a single health score.
+ * boxes, an "I accept" checkbox, several unlabelled option tiles, a nav div and
+ * a review pane, all as a single "element" with a single health score.
  *
  * That is not only a metrics problem. `execute.ts` reads `css` and `test_id`
  * FROM THIS TABLE when it rebuilds a locator, so all 52 were being handed

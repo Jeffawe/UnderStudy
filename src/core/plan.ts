@@ -39,6 +39,8 @@ export interface BoundStep {
   destructive: boolean;
   steps: number;
   outcome: string | null;
+  /** Flow slugs this one declares it must be reached through. */
+  prelude: string[];
 }
 
 export interface SubGoalPlan {
@@ -161,6 +163,7 @@ interface FlowMeta {
   slug: string;
   title: string;
   steps: number;
+  prelude: string[] | null;
 }
 
 /**
@@ -271,6 +274,7 @@ export async function buildPlan(
     for (const candidate of result.bindable) {
       const { rows } = await pool.query<FlowMeta>(
         `SELECT slug, title, outcome, start_state, end_state, preconditions, destructive,
+                prelude,
                 (SELECT count(*) FROM flow_steps fs WHERE fs.flow_id = f.flow_id) AS steps
          FROM flows f WHERE f.flow_id = $1`,
         [candidate.flowId ?? candidate.refId],
@@ -353,6 +357,7 @@ export async function buildPlan(
         intent: candidate.text,
         distance: candidate.distance,
         startState: meta.start_state,
+        prelude: Array.isArray(meta.prelude) ? meta.prelude : [],
         endState: meta.end_state,
         preconditions,
         destructive: meta.destructive,
@@ -442,6 +447,37 @@ export async function buildPlan(
         `${forbidden.length} sub-goal(s) can only be achieved destructively, and ` +
         `${env.name ?? 'this environment'} does not allow purchases: ` +
         forbidden.map((p) => `"${p.subGoal}"`).join(', ');
+    }
+  }
+
+  // A FLOW THAT DECLARES A PRELUDE CANNOT BE STARTED FROM NOWHERE.
+  //
+  // Captured with `record --after`, such a flow holds only the tail: the login
+  // or intake it depends on is REFERENCED, not contained. Binding it without
+  // that prelude having run puts the executor on a page the first step never
+  // expected, and the failure surfaces as a locator matching nothing — several
+  // steps from the actual cause.
+  //
+  // Satisfied by an earlier bound flow in the same plan, which is the ordinary
+  // case: "log in" then "finish the intake" already runs the login. Blocking is
+  // the same call the unresolved-seam rule makes — "I don't know how to get
+  // there" is worth stopping for, and working around it would be worse.
+  //
+  // Running the prelude automatically is the next rung and is deliberately not
+  // done here; blocking with the reason is honest, and guessing is not.
+  if (!blocked) {
+    const willRun = new Set<string>();
+    const missing: string[] = [];
+    for (const p of plans) {
+      if (!p.bound) continue;
+      const gaps = p.bound.prelude.filter((slug) => !willRun.has(slug));
+      if (gaps.length) missing.push(`${p.bound.slug} needs ${gaps.join(' -> ')}`);
+      willRun.add(p.bound.slug);
+    }
+    if (missing.length) {
+      blocked =
+        `bound flow(s) declare a prelude that this plan does not run: ${missing.join('; ')}. ` +
+        `Add a sub-goal that binds the prelude flow first, or re-record without --after`;
     }
   }
 

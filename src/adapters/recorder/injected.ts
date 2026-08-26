@@ -169,7 +169,13 @@ export const INJECTED_LISTENER = `
     var node = el;
     while (node && node.nodeType === 1 && parts.length < 4) {
       var part = node.tagName.toLowerCase();
-      if (node.classList && node.classList.length) part += '.' + [].slice.call(node.classList).join('.');
+      if (node.classList && node.classList.length) {
+        // Tailwind's variant/arbitrary-value classes (hover:bg-gray-200,
+        // text-[16px]) contain characters CSS reserves (: and [ ]). Joined
+        // raw, the resulting selector is not valid CSS and querySelectorAll
+        // throws — CSS.escape() is exactly what line 165 already uses for ids.
+        part += '.' + [].slice.call(node.classList).map(function (c) { return CSS.escape(c); }).join('.');
+      }
       parts.unshift(part);
       node = node.parentElement;
     }

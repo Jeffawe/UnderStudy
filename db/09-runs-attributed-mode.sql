@@ -7,9 +7,8 @@
 --
 -- The cost of that escape hatch went unnoticed until now: a hand-driven run
 -- wrote no `runs` row at all, so it laid down no drift baseline and left no
--- trace that the goal had ever been achieved. Measured on myapp — a
--- successful paid intake on 2026-08-20, and the newest run row was still
--- 2026-08-13.
+-- trace that the goal had ever been achieved. Measured on a real corpus — a
+-- successful paid checkout, and the newest run row a week older.
 --
 -- 'attributed' means: this goal really was run, and the result is true, but
 -- Understudy did not drive it. Kept as a distinct mode rather than reusing

@@ -39,7 +39,7 @@ export interface VocabularySegment {
  *   'plan'     authored facts only. `decompose` needs SEGMENT and FLOW names to
  *              phrase sub-goals against; it does not need the site's link graph,
  *              and on a real corpus that graph is the bulk of the payload.
- *              Measured on myapp: 22 mechanical claims = 6,477 chars of a
+ *              Measured on a real corpus: 22 mechanical claims = 6,477 chars of a
  *              9,007-char fact payload, i.e. 72% of it, none of which helps
  *              phrase a sub-goal — and it grows with every page explored.
  */
@@ -98,7 +98,7 @@ export async function fetchVocabulary(
   // and its absence is exactly "a person or the distiller wrote this".
   //
   // Note this is NOT the same as filtering on kind or source: the authored fact
-  // "Visit History is served at /uploaded-documents" is also kind='structure'
+  // "Order history is served at /past-invoices" is also kind='structure'
   // AND source='explored', and filtering on either would have discarded it.
   const onlyAuthored = purpose === 'plan' ? "AND (scope->'key') IS NULL" : '';
   const { rows: facts } = await pool.query<{ statement: string }>(

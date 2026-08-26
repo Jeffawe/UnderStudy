@@ -19,14 +19,17 @@
  * by computing them in-page at event time; this does the same.
  */
 
-import { chromium, type BrowserContext, type Page } from 'playwright';
-import { parseAria } from '../../core/sig.js';
+import { type BrowserContext, type Page } from 'playwright';
+import { openLease, type BrowserLease } from '../../core/browser.js';
+import { computeSig, parseAria } from '../../core/sig.js';
+import type { StorageState } from '../../core/auth-cache.js';
 import {
   buildRecording,
   redactValue,
   type RawEvent,
   type RawRecording,
   type RecordedAction,
+  type RecordingEntry,
   type Resolution,
 } from '../../core/recording.js';
 import { INJECTED_LISTENER, STAMP_ATTR } from './injected.js';
@@ -59,6 +62,25 @@ export interface LiveRecordOptions {
   /** Stop after this long even if the window is still open. */
   maxMinutes?: number;
   /**
+   * Start the browser from a saved session instead of a cold one.
+   *
+   * Opaque here on purpose: the recorder does not read the session cache, it is
+   * handed a payload. Same reasoning as `lessonsFor` and `visualCheck` on
+   * ReplayOptions — capture stays ignorant of where things are stored.
+   */
+  storageState?: StorageState;
+  /**
+   * Hold capture until this resolves, so the operator can reach the starting
+   * point without recording how they got there.
+   *
+   * THE LISTENER IS GATED, NOT INJECTED LATE. `addInitScript` only runs on new
+   * documents, so a listener installed after the page has loaded never runs at
+   * all. Instead it is installed as usual and its events are discarded until
+   * this resolves — which also means there is no "did arming work?" failure
+   * mode, because nothing about the page setup changes.
+   */
+  armWhen?: (page: Page) => Promise<void>;
+  /**
    * Drive the page programmatically instead of waiting for a human.
    *
    * Not a test hook — this is how an EXISTING Playwright script becomes a
@@ -67,6 +89,46 @@ export interface LiveRecordOptions {
    * recorder stops when the callback returns rather than when a window closes.
    */
   drive?: (page: Page) => Promise<void>;
+  /**
+   * Called once, at the moment capture arms, with the browser that got there.
+   *
+   * This is the only point at which the session is worth saving: the operator
+   * has finished logging in, and nothing recorded has run yet — so it is
+   * exactly the state the recording claims to start from. Saving at the END
+   * would bank whatever the recorded steps did to the session, up to and
+   * including logging out of it.
+   */
+  onArmed?: (info: {
+    context: BrowserContext;
+    page: Page;
+    sig: string;
+  }) => Promise<{ sessionSaved?: boolean } | void>;
+  /**
+   * Record in a browser someone else owns, instead of launching one.
+   *
+   * The lease is never closed here — the owner closes it.
+   */
+  lease?: BrowserLease;
+  /**
+   * Walk a prelude AFTER the capture machinery is installed and BEFORE arming.
+   *
+   * THIS IS WHY IT LIVES HERE AND NOT IN THE CALLER. `addInitScript` only runs
+   * on new documents, so a listener installed after the prelude has navigated
+   * never runs on the page the operator is looking at — silently. Ordering the
+   * install before the prelude is the whole correctness argument, and a caller
+   * that had to remember it would eventually forget.
+   *
+   * The gate does the rest: capture is disarmed throughout, exactly as it is
+   * while a human drives to a starting point by hand. A prelude is just that
+   * journey, driven programmatically.
+   */
+  beforeArm?: (lease: BrowserLease) => Promise<void>;
+  /**
+   * The flow slugs `beforeArm` walked, recorded on the recording as its entry
+   * condition. Kept separate from the callback so what gets WRITTEN DOWN is a
+   * plain list, not something inferred from a function that already ran.
+   */
+  preludeSlugs?: string[];
   origin?: string;
   source?: RawRecording['source'];
 }
@@ -100,22 +162,39 @@ export async function recordLive(opts: LiveRecordOptions): Promise<RawRecording>
     startUrl,
     maxMinutes = 30,
     drive,
+    storageState,
+    armWhen,
+    beforeArm,
+    preludeSlugs,
+    onArmed,
     // A driven capture needs no window; a human one is the whole point of a window.
     headless = Boolean(drive),
     source = drive ? 'script' : 'live',
     origin = drive ? 'driven' : 'headed-browser',
   } = opts;
 
-  const browser = await chromium.launch({ headless });
-  const context: BrowserContext = await browser.newContext();
+  const ownsLease = !opts.lease;
+  const lease =
+    opts.lease ?? (await openLease({ headless, ...(storageState ? { storageState } : {}) }));
+  const { browser, context } = lease;
 
   const events: RawEvent[] = [];
   const startedAt = Date.now();
   let closed = false;
 
+  // The capture gate. Armed immediately unless the caller wants to reach a
+  // starting point first — see `armWhen`. Events that arrive while this is
+  // false are dropped, which is what makes "record the tail, not the whole
+  // journey" possible without touching the injected listener at all.
+  let armed = !(armWhen || beforeArm);
+
   // The binding must exist before the init script runs, or the page calls a
   // function that isn't there.
   await context.exposeBinding('__understudyEmit', async ({ page }, wire: WireEvent) => {
+    // Dropped, not merely unrecorded: the listener keeps computing names and
+    // stamping elements throughout, so arming costs nothing and cannot half-work.
+    if (!armed) return;
+
     // The page now computes role and name with a spec-compliant accname
     // implementation, synchronously, while the element still exists. That is
     // authoritative — Playwright's own answer is only consulted when the page
@@ -135,9 +214,15 @@ export async function recordLive(opts: LiveRecordOptions): Promise<RawRecording>
     // from a field named "Password" with id "#password".
     const fieldHint = name || wire.testId || wire.css || 'field';
     const secretSignal = [name, wire.css, wire.testId].filter(Boolean).join(' ');
+    // A press event's value is a KEY NAME ('Enter'), not something the user
+    // typed — redacting it turns pressing Enter in a password field into
+    // `valueRef: SECRET.password`, and replay then tries to press a key called
+    // by the password itself. Only typed input can be a credential.
     const valued =
       wire.value !== undefined
-        ? redactValue(fieldHint, wire.value, wire.inputType, secretSignal)
+        ? wire.action === 'press'
+          ? { value: wire.value }
+          : redactValue(fieldHint, wire.value, wire.inputType, secretSignal)
         : {};
 
     events.push({
@@ -161,20 +246,103 @@ export async function recordLive(opts: LiveRecordOptions): Promise<RawRecording>
   await context.addInitScript(ACCNAME_BUNDLE);
   await context.addInitScript(INJECTED_LISTENER);
 
-  const page = await context.newPage();
+  const page = lease.page;
 
   // The opening navigation is a step in its own right — a replay has to start
-  // somewhere, and it is not implied by any click.
-  events.push({
-    seq: 0,
-    ts: 0,
-    action: 'goto',
-    value: startUrl,
-    url: startUrl,
-    resolution: 'script-literal',
-  });
+  // somewhere, and it is not implied by any click. When capture is armed later,
+  // the opening step is wherever the operator armed it, so it is pushed there
+  // instead of here.
+  if (armed) {
+    events.push({
+      seq: 0,
+      ts: 0,
+      action: 'goto',
+      value: startUrl,
+      url: startUrl,
+      resolution: 'script-literal',
+    });
+  }
 
-  await page.goto(startUrl, { waitUntil: 'domcontentloaded' });
+  // A prelude's own first step is a goto, so navigating here as well would be a
+  // second navigation racing the first for no purpose.
+  if (!beforeArm) await page.goto(startUrl, { waitUntil: 'domcontentloaded' });
+
+  let entry: RecordingEntry | undefined;
+
+  // THE PRELUDE RUNS HERE: after the listener and the accname bundle are
+  // installed, before the gate opens. Its events are dropped exactly as a
+  // human's are while driving to a starting point by hand.
+  if (beforeArm) await beforeArm(lease);
+
+  if (armWhen || beforeArm) {
+    // Closing the window is the stop signal everywhere else, so it has to be
+    // one here too. Without this race, shutting the browser while we are still
+    // waiting to be armed leaves the arm promise pending forever and the
+    // process hanging with nothing on screen to explain why.
+    const abandoned = new Promise<'abandoned'>((resolve) => {
+      const give = () => resolve('abandoned');
+      page.once('close', give);
+      context.once('close', give);
+      browser.once('disconnected', give);
+    });
+
+    const outcome = await Promise.race([
+      (armWhen ? armWhen(page) : Promise.resolve()).then(() => 'armed' as const),
+      abandoned,
+    ]);
+
+    if (outcome === 'abandoned') {
+      if (ownsLease) await lease.close();
+      // No events at all — the caller's "nothing was recorded" guard reports
+      // it and refuses to save, which is exactly right.
+      return buildRecording({ source, origin, appSlug, startUrl }, []);
+    }
+
+    // Drain before arming, not after. Events dispatched in the page just before
+    // the operator armed are still in flight over the binding, and a gate read
+    // at handler time would let them through — capturing the last click of the
+    // journey we were trying not to record.
+    await page
+      .evaluate('window.__understudyFlush && window.__understudyFlush()')
+      .catch(() => {});
+    await page.waitForTimeout(300).catch(() => {});
+
+    const here = page.url();
+    const { sig } = await computeSig(page);
+    armed = true;
+
+    events.push({
+      seq: 0,
+      ts: 0,
+      action: 'goto',
+      value: here,
+      url: here,
+      // The arming fingerprint rides on step 0 as an ordinary expectation, so
+      // replay's existing "am I where I expected to be?" check catches a stale
+      // or missing session for free — and escalates it like any other
+      // unexpected page, instead of failing later on a locator with no
+      // explanation. An expired session serves the login page at the URL that
+      // used to be the account page, which is precisely the case a URL
+      // comparison cannot see and sig() can.
+      expectedSig: sig,
+      resolution: 'script-literal',
+    });
+
+    const armedInfo = onArmed ? await onArmed({ context, page, sig }) : undefined;
+
+    // `requiresSession` is a claim about REPLAY: can a cold browser reach step
+    // 0 by itself? Restoring a session says no. So does SAVING one — the caller
+    // only banks a session when credentials were supplied and a login happened,
+    // which is the manual-login case and replays no better than the restored
+    // one. Arming on a page reachable without either needs nothing, and saying
+    // it does would block replay for no reason.
+    const needsSession = Boolean(storageState) || Boolean(armedInfo?.sessionSaved);
+    entry = {
+      startState: sig,
+      ...(needsSession ? { requiresSession: true } : {}),
+      ...(preludeSlugs?.length ? { prelude: preludeSlugs } : {}),
+    };
+  }
 
   if (drive) {
     await drive(page);
@@ -208,7 +376,7 @@ export async function recordLive(opts: LiveRecordOptions): Promise<RawRecording>
   }
   await page.waitForTimeout(250).catch(() => {});
 
-  await browser.close().catch(() => {});
+  if (ownsLease) await lease.close();
 
   // seq is reassigned densely: events arrive over a binding and a slow
   // resolution can land out of order relative to a fast one.
@@ -217,5 +385,8 @@ export async function recordLive(opts: LiveRecordOptions): Promise<RawRecording>
     .sort((a, b) => a.ts - b.ts)
     .map((e, i) => ({ ...e, seq: i }));
 
-  return buildRecording({ source, origin, appSlug, startUrl }, ordered);
+  return buildRecording(
+    { source, origin, appSlug, startUrl, ...(entry ? { entry } : {}) },
+    ordered,
+  );
 }

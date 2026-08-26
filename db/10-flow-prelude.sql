@@ -1,0 +1,23 @@
+-- Flows that declare a prelude instead of containing one.
+--
+-- `record --after <flow>` replays known flows in the capture context and arms
+-- from where they finish, so the recording holds only the tail. The prelude is
+-- stored BY REFERENCE — a list of flow slugs — never as inlined steps.
+--
+-- Inlining was the obvious alternative and it is wrong: copying the login steps
+-- into every recording built on top of them mints a duplicate segment competing
+-- for the same bind slot, which is the exact problem slug reuse exists to
+-- prevent. A reference also means fixing the login segment once fixes every
+-- recording built on it, the same idiom flow_steps already uses to share a step
+-- row between a recording and the segments sliced out of it.
+--
+-- WHY THIS COLUMN AND NOT JUST THE RECORDING'S entry.prelude: transitivity.
+-- A recording captured with `--after log-in` ingests as a flow that does not
+-- CONTAIN the login, it declares it. Without this column, someone building on
+-- that flow gets its steps and not its login, and the failure surfaces as a
+-- locator matching nothing several steps later with no hint of the cause.
+--
+-- Slugs, not flow ids: recordings are portable JSON and flow_id is a UUID that
+-- a re-ingest mints afresh, so an id would not survive the trip.
+
+ALTER TABLE flows ADD COLUMN IF NOT EXISTS prelude JSONB NOT NULL DEFAULT '[]';

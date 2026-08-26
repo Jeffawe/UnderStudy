@@ -456,6 +456,22 @@ const renderStep = (step: RunStep) => {
     ...(o.result
       ? {
           passed: o.result.ok,
+          // A RUN THAT NEEDED A HUMAN IS NOT A CLEAN PASS. Reporting `passed`
+          // alone would be the unearned proof this codebase refuses to
+          // manufacture anywhere else.
+          ...(o.result.handoffs?.length
+            ? {
+                manualHandoffs: o.result.handoffs.map((h) => ({
+                  step: h.seq,
+                  trigger: h.trigger,
+                  reason: h.reason,
+                  ...(h.recordingHash ? { recordingHash: h.recordingHash } : {}),
+                })),
+                note:
+                  `${o.result.handoffs.length} step(s) were performed by a human, not the executor — ` +
+                  `distill and ingest the captured recording(s) so the next run does not need to ask`,
+              }
+            : {}),
           flowsRun: o.flowsRun,
           path: o.result.sigSequence,
           failures: o.result.steps.filter((st) => !st.ok).map((st) => ({ seq: st.seq, action: st.action, error: st.error })),
@@ -518,15 +534,25 @@ server.registerTool(
     description:
       'Supply the decision a suspended run is waiting on, and it continues. Returns at the NEXT ' +
       'point it needs you, or when the run finishes. For a decompose request answer ' +
-      '{ subGoals: ["...", "..."] } using the vocabulary you were given.',
+      '{ subGoals: ["...", "..."] } using the vocabulary you were given. For a needs_capture ' +
+      'request, run the `howTo.run` command it gave you, then answer { recordingHash: "<hash>" } ' +
+      "— or { action: 'skip' } to let the run fail there.",
     inputSchema: {
       requestId: z.string(),
       answer: z.record(z.string(), z.unknown()).describe('e.g. { "subGoals": ["log in", "add to cart"] }'),
+      usage: z
+        .object({ totalTokens: z.number().optional() })
+        .optional()
+        .describe(
+          'Optional: tokens YOU have spent on this run so far. Understudy meters the payloads ' +
+          'it hands you, but cannot see your side; a figure here is folded in with max(), so it ' +
+          'can only make the budget trip sooner, never later.',
+        ),
     },
   },
-  async ({ requestId, answer }) => {
+  async ({ requestId, answer, usage }) => {
     try {
-      return renderStep(await resumeRun(requestId, answer));
+      return renderStep(await resumeRun(requestId, answer, usage));
     } catch (err) {
       return fail(err instanceof Error ? err.message : String(err));
     }

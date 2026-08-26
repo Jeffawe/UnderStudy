@@ -2,7 +2,7 @@
  * Where raw recordings live on disk.
  *
  * Recordings are keyed by their content hash, which makes this the
- * distillation cache CLAUDE.md asks for on day one: distilling is the expensive
+ * distillation cache BUILDING.md asks for on day one: distilling is the expensive
  * step, and re-recording the same flow produces the same hash, so the model is
  * paid for once. Two captures of genuinely different flows differ in hash and
  * are stored side by side.

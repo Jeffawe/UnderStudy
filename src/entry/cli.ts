@@ -21,7 +21,15 @@ import { explore } from '../core/explore.js';
 import { recall, isGap, GAP_DISTANCE, type ChunkKind } from '../core/recall.js';
 import { recordLive } from '../adapters/recorder/live.js';
 import { listRecordings, saveRecording } from '../core/recording-store.js';
-import { buildRecording } from '../core/recording.js';
+import {
+  loadSession,
+  saveSession,
+  forgetSession,
+  loadHandoffSession,
+  type StorageState,
+} from '../core/auth-cache.js';
+import { buildRecording, type RawEvent, type RawRecording } from '../core/recording.js';
+import { eventsForFlowSlugs } from '../core/flow-ir.js';
 import { parseScript } from '../adapters/recorder/script.js';
 import { loadRecording } from '../core/recording-store.js';
 import { replay } from '../core/replay.js';
@@ -77,6 +85,22 @@ EXPLORE
 RECORD
   --url <baseUrl>       required on first run; remembered afterwards
   --max-minutes <n>     stop recording after n minutes (default 30)
+  --arm-manually        drive to the starting point yourself, unrecorded, then
+                        press Enter to begin capturing. Use this to record a
+                        flow without recording the login that precedes it.
+  --after <flow-slug>   replay a known flow first, unrecorded, and capture from
+                        where it ends (repeatable, ordered). Skips an INTAKE,
+                        which a saved session cannot — wizard progress lives on
+                        the server. Combine with --arm-manually to adjust by
+                        hand before capture arms. A prelude flow that fills
+                        credentials needs the matching --value here too.
+  --value REF=value     credentials the saved session is keyed on (repeatable)
+  --fresh               ignore any saved session and sign in again
+  --seed-session <file> start from an explicit saved-state file rather than the
+                        credential cache. Handed to you by a stuck run that
+                        asked for a capture — see --seed-url.
+  --seed-url <url>      open here instead of the app's base URL. Used with
+                        --seed-session to resume exactly where a run got stuck.
 
 IMPORT
   --url <baseUrl>       resolves goto('/') when the script relies on a baseURL
@@ -231,17 +255,171 @@ async function resolveBaseUrl(slug: string, flag: string | undefined): Promise<s
   return baseUrl;
 }
 
+/**
+ * Wait for the operator to say "start recording now".
+ *
+ * Deliberately stdin and not anything on the page. The recorder's stop signal
+ * is closing the window for the same reason: any in-page control would itself
+ * be captured, and the first recorded step would be a click on Understudy's
+ * own UI rather than on the app.
+ */
+function waitForEnter(prompt: string): Promise<void> {
+  // Without a terminal there is nothing to press Enter on, and the wait would
+  // hang forever holding a browser window open. Say so instead.
+  if (!process.stdin.isTTY) {
+    fail(
+      '--arm-manually needs a terminal to read the arming keypress from',
+      'run it directly rather than through a pipe or a non-interactive shell',
+    );
+  }
+
+  return new Promise((resolve) => {
+    console.log(prompt);
+    const finish = () => {
+      process.stdin.off('data', finish);
+      process.stdin.off('end', finish);
+      process.stdin.pause();
+      resolve();
+    };
+    process.stdin.resume();
+    process.stdin.once('data', finish);
+    // EOF is a legitimate "go" signal too, and without this the promise would
+    // never settle on a closed stdin.
+    process.stdin.once('end', finish);
+  });
+}
+
 async function cmdRecord(positional: string[], flags: Flags) {
   const slug = positional[0] ?? fail('record needs an app slug', 'understudy record saucedemo --url https://…');
   const baseUrl = await resolveBaseUrl(slug, str(flags.get('url')));
 
+  const values = valuesFromFlags(flags);
+  const seedSessionFile = str(flags.get('seed-session'));
+  const seedUrl = str(flags.get('seed-url'));
+  // A seeded capture is always late-armed: the whole point is to look at where
+  // the run got stuck before deciding what to record.
+  const armManually = flags.has('arm-manually') || Boolean(seedSessionFile);
+  const fresh = flags.has('fresh');
+  const after = all(flags, 'after');
+
   console.log(`target: ${describeTarget()}`);
-  console.log(`recording ${slug} at ${baseUrl}\n`);
+  console.log(`recording ${slug} at ${baseUrl}`);
+
+  // Resolved BEFORE the browser opens, so an unknown slug or a cycle costs a
+  // query rather than a launched Chromium and a confused operator.
+  let prelude: { events: RawEvent[]; slugs: string[] } | undefined;
+  if (after.length) {
+    const appId = await appIdOrFail(slug);
+    const { events, chain } = await eventsForFlowSlugs(appId, after).catch((err: Error) =>
+      fail(err.message, 'see `understudy flows ' + slug + '` for the slugs that exist'),
+    );
+
+    // A destructive prelude would run on record, replay, ingest AND distill —
+    // four real orders per recording. Refuse rather than discover that later.
+    const commits = chain.filter((f) => f.destructive).map((f) => f.slug);
+    if (commits.length && !flags.has('allow-purchases')) {
+      fail(
+        `prelude flow(s) marked destructive: ${commits.join(', ')}`,
+        'a prelude replays on record, replay, ingest and distill — pass --allow-purchases only if that is genuinely safe',
+      );
+    }
+
+    prelude = { events, slugs: chain.map((f) => f.slug) };
+    console.log(`prelude: ${prelude.slugs.join(' -> ')}  (${events.length} steps, not recorded)`);
+  }
+
+  // A saved session only makes sense when capture starts late — if the login is
+  // part of what we are recording, restoring one would skip the very steps the
+  // recording exists to capture.
+  // An explicit seed file wins over the credential cache: it is a specific
+  // paused browser being handed over, not a cache of "whoever logged in last".
+  const seeded = seedSessionFile ? await loadHandoffSession(seedSessionFile) : undefined;
+  if (seedSessionFile && !seeded) {
+    fail(
+      `could not read the seed session at ${seedSessionFile}`,
+      'the run that wrote it may have finished — handoff state is deleted when a run ends',
+    );
+  }
+
+  const cached = seeded
+    ? { storageState: seeded.storageState, savedAt: seeded.savedAt }
+    : (armManually || Boolean(prelude)) && !fresh
+      ? await loadSession(slug, values, prelude?.slugs)
+      : undefined;
+  if (seeded) {
+    console.log(`session: seeded from ${seedSessionFile} (run ${seeded.runId})`);
+    console.log(`         the run is paused at ${seeded.url}`);
+  } else if (cached) {
+    console.log(`session: restored (saved ${cached.savedAt})`);
+  } else if (armManually || prelude) {
+    console.log(`session: none — the prelude or your own login establishes one`);
+  }
+  console.log();
 
   const recording = await recordLive({
     appSlug: slug,
-    startUrl: baseUrl,
+    startUrl: seedUrl ?? baseUrl,
+    ...(cached ? { storageState: cached.storageState } : {}),
     ...(flags.has('max-minutes') ? { maxMinutes: Number(str(flags.get('max-minutes'))) } : {}),
+    ...(prelude
+      ? {
+          preludeSlugs: prelude.slugs,
+          beforeArm: async (lease) => {
+            console.log(`replaying prelude (${prelude.events.length} steps)…`);
+            const pre = await replay(
+              buildRecording(
+                { source: 'import', origin: `prelude:${prelude.slugs.join('+')}`, appSlug: slug, startUrl: baseUrl },
+                prelude.events,
+              ),
+              { lease, values, headless: false },
+            );
+
+            // Arming from a state the prelude did not actually reach would
+            // capture steps against a page nobody can get back to.
+            if (!pre.ok) {
+              const failedStep = pre.steps.find((st) => !st.ok);
+              fail(
+                `prelude did not replay clean — step ${failedStep?.seq} (${failedStep?.action}) ${failedStep?.error ?? ''}`,
+                'fix or re-ingest the prelude flow before recording on top of it',
+              );
+            }
+            console.log(`prelude finished — ${pre.steps.length} steps replayed`);
+          },
+        }
+      : {}),
+    ...(armManually
+      ? {
+          armWhen: () =>
+            waitForEnter(
+              prelude
+                ? 'the prelude has finished — adjust if you need to, nothing is being recorded yet.\n' +
+                    'press Enter here to begin capturing.'
+                : 'drive to the point you want to start from — nothing is being recorded yet.\n' +
+                  'press Enter here to begin capturing.',
+            ),
+        }
+      : {}),
+    ...(armManually || prelude
+      ? {
+          onArmed: async ({ context, sig }) => {
+            console.log(`\narmed at ${sig}\n`);
+
+            // A SEEDED CAPTURE MUST NOT BANK ITS STATE AS THE LOGIN SESSION.
+            // It was handed a specific paused browser sitting mid-flow; writing
+            // that under the credential key would mean the next ordinary
+            // `--arm-manually` restores a half-finished wizard. It still
+            // counts as requiring a session, because it plainly does.
+            if (seeded) return { sessionSaved: true };
+
+            // Saved at arm time, not at the end: this is the state the recording
+            // claims to start from, and the steps that follow may well log out
+            // of it.
+            const path = await saveSession(context, slug, values, sig, prelude?.slugs);
+            if (path) console.log(`session saved  ${path}`);
+            return { sessionSaved: Boolean(path) };
+          },
+        }
+      : {}),
   });
 
   if (!recording.events.some((e) => e.action !== 'goto')) {
@@ -267,8 +445,124 @@ async function cmdRecord(positional: string[], flags: Flags) {
     console.log(`\n${approximate} step(s) have approximate role/name — replay will resolve them.`);
   }
 
+  if (recording.entry?.requiresSession) {
+    console.log(
+      `\nthis recording starts from a signed-in browser (${recording.entry.startState}).`,
+    );
+    console.log('  replay and ingest restore the saved session for these --value credentials.');
+  }
+
   console.log(`\nhash  ${recording.hash}${existed ? '  (identical recording already existed)' : ''}`);
   console.log(`saved ${path}`);
+}
+
+/**
+ * Resolve the session a recording needs before it can replay.
+ *
+ * A late-armed recording declares that its first step is not reachable from a
+ * cold browser. Failing here with the reason is the whole point: without it,
+ * replay lands on a login page and dies on a locator that was never going to be
+ * there, which reads as a broken recording rather than a missing session.
+ */
+/**
+ * Resolve the prelude a recording declares into steps that can be walked.
+ *
+ * The same shape as `sessionForRecording`, and for the same reason: a recording
+ * captured with `--after` holds only the tail, so replaying it cold starts on a
+ * page its first step never expected. Failing HERE, naming the missing flow, is
+ * the difference between an explicable error and a locator timeout twenty steps
+ * from the actual cause.
+ */
+async function preludeForRecording(
+  recording: RawRecording,
+): Promise<RawEvent[] | undefined> {
+  const slugs = recording.entry?.prelude;
+  if (!slugs?.length) return undefined;
+
+  const appId = await appIdFor(recording.appSlug);
+  if (!appId) {
+    fail(
+      `this recording declares a prelude (${slugs.join(' -> ')}) but app '${recording.appSlug}' is not in this store`,
+      'ingest the app first, or switch --target',
+    );
+  }
+
+  const { events, chain } = await eventsForFlowSlugs(appId, slugs).catch((err: Error) =>
+    fail(
+      `this recording declares a prelude that cannot be resolved — ${err.message}`,
+      'the referenced flow must exist in this corpus; re-ingest it or re-record without --after',
+    ),
+  );
+
+  console.log(`prelude: ${chain.map((f) => f.slug).join(' -> ')}  (${events.length} steps)`);
+  return events;
+}
+
+async function sessionForRecording(
+  recording: RawRecording,
+  values: Record<string, string>,
+): Promise<StorageState | undefined> {
+  if (!recording.entry?.requiresSession) return undefined;
+
+  const cached = await loadSession(recording.appSlug, values, recording.entry.prelude);
+  if (!cached) {
+    fail(
+      'this recording starts from a signed-in browser, and no saved session matches these credentials',
+      'pass the same --value credentials you recorded with, or re-record with --arm-manually',
+    );
+  }
+
+  console.log(`session: restored (saved ${cached.savedAt})`);
+  return cached.storageState;
+}
+
+/**
+ * A restored session that did not land where it was saved is dead — drop it.
+ *
+ * Detected, not probed: step 0 of a late-armed recording carries the arming
+ * fingerprint as its `expectedSig`, so replay has already made the comparison.
+ * Deleting the entry here is what stops the same stale session being restored
+ * on the next run and producing the identical confusing failure.
+ */
+/**
+ * Report a prelude that did not replay, and stop.
+ *
+ * Distinct from a failed recording on purpose: the recording's own steps never
+ * ran, so nothing was learned about it. Saying "replay FAILED" here would send
+ * someone to debug a recording that is very likely fine, when what actually
+ * broke is upstream — the referenced flow has rotted, or the app changed before
+ * the part under test.
+ */
+function reportPreludeFailure(
+  recording: RawRecording,
+  result: { preludeOk?: boolean; preludeSteps?: Array<{ seq: number; action: string; error?: string }> },
+): boolean {
+  if (result.preludeOk !== false) return false;
+
+  const bad = result.preludeSteps?.find((s) => s.error);
+  console.error('\nthe PRELUDE failed — this recording\'s own steps never ran.');
+  console.error(`  prelude   ${recording.entry?.prelude?.join(' -> ') ?? '(unknown)'}`);
+  if (bad) console.error(`  step ${bad.seq} (${bad.action}): ${bad.error}`);
+  console.error('  the recording is not implicated; fix or re-ingest the prelude flow.');
+  process.exitCode = 4;
+  return true;
+}
+
+async function dropStaleSession(
+  recording: RawRecording,
+  values: Record<string, string>,
+  result: { steps: Array<{ seq: number; unexpectedPage?: { expected: string; observed: string } }> },
+): Promise<void> {
+  if (!recording.entry?.requiresSession) return;
+
+  const entryStep = result.steps.find((s) => s.seq === 0);
+  if (!entryStep?.unexpectedPage) return;
+
+  await forgetSession(recording.appSlug, values, recording.entry.prelude);
+  console.log('\nthe restored session did not land where it was recorded:');
+  console.log(`  expected  ${entryStep.unexpectedPage.expected}`);
+  console.log(`  observed  ${entryStep.unexpectedPage.observed}`);
+  console.log('  the saved session has been discarded — re-record with --arm-manually to refresh it.');
 }
 
 async function cmdImport(positional: string[], flags: Flags) {
@@ -348,8 +642,12 @@ async function cmdReplay(positional: string[], flags: Flags) {
   // this a verification replay is the one place that ignores the memory — and
   // it is also where lesson counters would otherwise never move.
   const replayAppId = await appIdFor(recording.appSlug);
+  const storageState = await sessionForRecording(recording, values);
+  const replayPrelude = await preludeForRecording(recording);
   const result = await replay(recording, {
     values,
+    ...(storageState ? { storageState } : {}),
+    ...(replayPrelude ? { prelude: replayPrelude } : {}),
     ...(flags.has('headed') ? { headless: false } : {}),
     ...(replayAppId ? { lessonsFor: (context) => lessonsFor(replayAppId, context) } : {}),
   });
@@ -357,12 +655,15 @@ async function cmdReplay(positional: string[], flags: Flags) {
     const folded = await foldLessonOutcomes(replayAppId, result.steps, recording.events);
     if (folded.fired) console.log(`lessons  ${folded.fired} fired, ${folded.helped} on steps with a history of failing`);
   }
+  await dropStaleSession(recording, values, result);
+  if (reportPreludeFailure(recording, result)) return;
 
   console.log(`replay ${result.ok ? 'PASSED' : 'FAILED'} in ${(result.durationMs / 1000).toFixed(1)}s\n`);
   for (const s of result.steps) {
     const status = s.ok ? 'ok  ' : 'FAIL';
     const notes = [
       s.ambiguousByName && `ambiguous: ${s.ambiguousByName.matched} by name, resolved via ${s.ambiguousByName.disambiguatedBy}`,
+      s.roleHadNoMatch && `role matched nothing, fell back to ${s.roleHadNoMatch.fellBackTo}`,
       s.roundTripMismatch && `value did not survive: wrote "${s.roundTripMismatch.expected}", read "${s.roundTripMismatch.actual}"`,
       s.error,
     ].filter(Boolean).join('; ');
@@ -426,12 +727,19 @@ async function cmdIngest(positional: string[], flags: Flags) {
   // fingerprints come from.
   console.log(`target: ${describeTarget()}`);
   console.log('replaying to verify…');
+  const ingestValues = valuesFromFlags(flags);
   const replayAppId = await appIdFor(recording.appSlug);
+  const ingestSession = await sessionForRecording(recording, ingestValues);
+  const ingestPrelude = await preludeForRecording(recording);
   const result = await replay(recording, {
-    values: valuesFromFlags(flags),
+    values: ingestValues,
+    ...(ingestSession ? { storageState: ingestSession } : {}),
+    ...(ingestPrelude ? { prelude: ingestPrelude } : {}),
     ...(replayAppId ? { lessonsFor: (context) => lessonsFor(replayAppId, context) } : {}),
   });
   if (replayAppId) await foldLessonOutcomes(replayAppId, result.steps, recording.events);
+  await dropStaleSession(recording, ingestValues, result);
+  if (reportPreludeFailure(recording, result)) return;
 
   const failed = result.steps.find((s) => !s.ok);
   if (failed) {
@@ -492,11 +800,18 @@ async function cmdDistill(positional: string[], flags: Flags) {
   // an unreplayable step could otherwise be named, segmented, and bound like
   // a real one.
   const replayAppId = await appIdFor(recording.appSlug);
+  const distillValues = valuesFromFlags(flags);
+  const distillSession = await sessionForRecording(recording, distillValues);
+  const distillPrelude = await preludeForRecording(recording);
   const result = await replay(recording, {
-    values: valuesFromFlags(flags),
+    values: distillValues,
+    ...(distillSession ? { storageState: distillSession } : {}),
+    ...(distillPrelude ? { prelude: distillPrelude } : {}),
     ...(replayAppId ? { lessonsFor: (context) => lessonsFor(replayAppId, context) } : {}),
   });
   if (replayAppId) await foldLessonOutcomes(replayAppId, result.steps, recording.events);
+  await dropStaleSession(recording, distillValues, result);
+  if (reportPreludeFailure(recording, result)) return;
   if (result.needsReview) {
     console.error('cannot distill — the recording did not replay cleanly.');
     const bad = result.steps.find((s) => !s.ok);

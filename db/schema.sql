@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS flows (
   -- Provenance for THIS flow's distillation — not a finding (the app is fine)
   -- and not a fact (it is not knowledge about the app). See db/05.
   corrections   JSONB NOT NULL DEFAULT '[]',
+  -- Flow slugs replayed, in order, before this flow's own steps. Set when a
+  -- recording was captured with `record --after <flow>`: the login or intake
+  -- that precedes the tail is REFERENCED, never inlined, so one fix to the
+  -- referenced segment fixes every flow built on it. Expanded transitively —
+  -- see db/10 and src/core/flow-ir.ts.
+  prelude       JSONB NOT NULL DEFAULT '[]',
   used_by       INT NOT NULL DEFAULT 0,           -- flows containing this macro
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),

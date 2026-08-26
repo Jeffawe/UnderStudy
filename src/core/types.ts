@@ -60,7 +60,27 @@ export interface Distiller {
 }
 
 export interface PendingDecision {
-  kind: 'gap' | 'seam' | 'unexpected_page' | 'visual_diff' | 'finding_judgment' | 'parameter';
+  kind:
+    | 'gap'
+    | 'seam'
+    | 'unexpected_page'
+    // A step that FAILED, as distinct from one that landed somewhere odd. Both
+    // used to be sent as 'unexpected_page', which made the stored payloads
+    // unreadable and the escalation counts meaningless.
+    | 'step_failed'
+    | 'visual_diff'
+    | 'finding_judgment'
+    | 'parameter'
+    /**
+     * The executor is stuck and wants a human to RECORD the missing piece.
+     *
+     * Deliberately not 'gap': that word already means a RETRIEVAL gap — top
+     * distance at or above GAP_DISTANCE, a statement about the corpus made at
+     * planning time (see REASONER.md). This is an execution-time statement
+     * about a live browser sitting on a known page, and overloading the word
+     * would make the one document that matters ambiguous.
+     */
+    | 'needs_capture';
   context: Record<string, unknown>;
 }
 

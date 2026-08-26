@@ -41,6 +41,8 @@ export interface RecordRunOptions {
   stepIds?: string[];
   /** Selector per step, parallel to stepIds. */
   selectorIds?: Array<string | null>;
+  /** The row opened by `openRun`, when the caller opened one. */
+  runId?: string;
 }
 
 export interface RecordRunResult {
@@ -216,9 +218,8 @@ export interface AttributedRunOptions {
  * browser directly, an API call — and for a third-party checkout or an
  * unimplemented IR action that is the only option. What nobody noticed is that
  * taking the escape hatch opted out of the whole feedback loop: no run row, no
- * drift baseline, no trace that the goal had ever succeeded. On myapp a
- * paid intake completed on 2026-08-20 while the newest run row still read
- * 2026-08-13.
+ * drift baseline, no trace that the goal had ever succeeded. On a real corpus a
+ * paid checkout completed while the newest run row was still a week older.
  *
  * This is deliberately NOT `recordRun`. There is no ReplayResult here, so there
  * are no step outcomes, no signals, and no selector health to fold — claiming
@@ -249,6 +250,68 @@ export async function recordAttributedRun(opts: AttributedRunOptions): Promise<{
   return { runId: rows[0]!.run_id, ...(drift ? { drift } : {}) };
 }
 
+
+/**
+ * Open the run row BEFORE the run starts, and return its UUID.
+ *
+ * Runs used to be INSERTed only at the end, by `recordRun`. That left
+ * `context_requests.run_id` unconditionally NULL — every pending question was
+ * recorded against no run at all, so "what is this run waiting on?" could not
+ * be answered in SQL, which is the entire reason the row is written. It also
+ * meant a run that died mid-flight left no trace whatsoever.
+ *
+ * `status` starts 'running' and is moved to 'needs_context' while a capture is
+ * outstanding; both values have been in the schema CHECK from the start and
+ * neither had ever been written.
+ */
+export async function openRun(opts: {
+  appId: string;
+  goal: string;
+  mode?: 'execute' | 'emit-only' | 'dry-run';
+  reasoner?: string;
+}): Promise<string> {
+  const { rows } = await getPool().query<{ run_id: string }>(
+    `INSERT INTO runs (app_id, goal, mode, status, reasoner)
+     VALUES ($1,$2,$3,'running',$4)
+     RETURNING run_id`,
+    [opts.appId, opts.goal, opts.mode ?? 'execute', opts.reasoner ?? null],
+  );
+  return rows[0]!.run_id;
+}
+
+/** Move a run between the in-flight states, e.g. while a handoff is outstanding. */
+export async function markRunStatus(
+  runId: string,
+  status: 'running' | 'needs_context',
+): Promise<void> {
+  await getPool()
+    .query(`UPDATE runs SET status = $2 WHERE run_id = $1`, [runId, status])
+    .catch(() => {});
+}
+
+/**
+ * What is worth remembering about HOW the run went, beyond pass/fail.
+ *
+ * A run that needed a human to take over is not a clean pass, and a `runs` row
+ * that says 'passed' with nothing else would be exactly the unearned proof this
+ * codebase refuses to manufacture elsewhere.
+ */
+function planNote(result: ReplayResult): Record<string, unknown> {
+  return {
+    ...(result.handoffs?.length
+      ? {
+          handoffs: result.handoffs.map((h) => ({
+            step: h.seq,
+            trigger: h.trigger,
+            reason: h.reason,
+            ...(h.recordingHash ? { recordingHash: h.recordingHash } : {}),
+          })),
+        }
+      : {}),
+    ...(result.preludeOk === false ? { preludeFailed: true } : {}),
+  };
+}
+
 export async function recordRun(
   result: ReplayResult,
   opts: RecordRunOptions,
@@ -258,6 +321,7 @@ export async function recordRun(
   const drift = await detectDrift(opts.appId, opts.goal, result.sigSequence);
 
   const { appId, goal, mode = 'execute', reasoner, stepIds = [], selectorIds = [] } = opts;
+  const existingRunId = opts.runId;
 
   const findings = extractFindings(result, goal);
   const signalsByStep = new Map<number, CapturedSignal[]>();
@@ -268,19 +332,37 @@ export async function recordRun(
   }
 
   const outcome = await tx(async (client: pg.PoolClient) => {
-    const { rows: runRows } = await client.query<{ run_id: string }>(
-      `INSERT INTO runs (app_id, goal, mode, status, sig_sequence, reasoner, finished_at)
-       VALUES ($1,$2,$3,$4,$5,$6, now())
-       RETURNING run_id`,
-      [
-        appId,
-        goal,
-        mode,
-        result.ok ? 'passed' : 'failed',
-        JSON.stringify(result.sigSequence),
-        reasoner ?? null,
-      ],
-    );
+    // UPDATE when the row was opened up front (so its id could be threaded into
+    // context_requests), INSERT when it was not — a bare verification replay
+    // has no session around it.
+    const { rows: runRows } = existingRunId
+      ? await client.query<{ run_id: string }>(
+          `UPDATE runs SET status = $2, sig_sequence = $3, reasoner = coalesce($4, reasoner),
+                           plan = $5, finished_at = now()
+           WHERE run_id = $1
+           RETURNING run_id`,
+          [
+            existingRunId,
+            result.ok ? 'passed' : 'failed',
+            JSON.stringify(result.sigSequence),
+            reasoner ?? null,
+            JSON.stringify(planNote(result)),
+          ],
+        )
+      : await client.query<{ run_id: string }>(
+          `INSERT INTO runs (app_id, goal, mode, status, sig_sequence, reasoner, plan, finished_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7, now())
+           RETURNING run_id`,
+          [
+            appId,
+            goal,
+            mode,
+            result.ok ? 'passed' : 'failed',
+            JSON.stringify(result.sigSequence),
+            reasoner ?? null,
+            JSON.stringify(planNote(result)),
+          ],
+        );
     const runId = runRows[0]!.run_id;
 
     for (const [ordinal, step] of result.steps.entries()) {

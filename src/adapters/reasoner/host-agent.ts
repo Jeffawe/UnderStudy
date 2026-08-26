@@ -29,7 +29,18 @@ import type { Vocabulary } from '../../core/vocabulary.js';
 
 export interface SuspendedRequest {
   requestId: string;
-  kind: 'decision';
+  /**
+   * Which QUEUE this belongs to, not which question it is.
+   *
+   * `record_flow` has been in the schema CHECK since the first migration and had
+   * never been written. It is what makes
+   * `WHERE kind='record_flow' AND status='pending'` a real, operator-visible
+   * queue of "runs waiting for a human to record something" — the stated reason
+   * for writing the row at all.
+   */
+  kind: 'decision' | 'record_flow';
+  /** The decision kind, so an answer can be validated against the question. */
+  decisionKind?: PendingDecision['kind'];
   /** What the agent is being asked, in one line. */
   ask: string;
   reason: string;
@@ -75,6 +86,36 @@ export class HostAgentReasoner implements Reasoner {
     return Promise.race([suspension, settled.then((done) => ({ done }))]);
   }
 
+  /**
+   * Why an answer does not fit the question it was given.
+   *
+   * `decompose` used to THROW on a shape mismatch, which killed the run — a
+   * typo in one tool call and twenty minutes of execution was gone. Since the
+   * request now carries its own kind, the mismatch can be described and asked
+   * again instead.
+   */
+  static misfit(kind: PendingDecision['kind'] | undefined, value: unknown): string | undefined {
+    const v = (value ?? {}) as Record<string, unknown>;
+    if (kind === 'gap') {
+      const ok = Array.isArray(v.subGoals) && v.subGoals.every((x) => typeof x === 'string' && x.trim());
+      return ok ? undefined : 'expected { subGoals: string[] }';
+    }
+    if (kind === 'needs_capture') {
+      if (typeof v.recordingHash === 'string' && v.recordingHash.trim()) return undefined;
+      if (v.action === 'skip' || v.action === 'abort') return undefined;
+      return "expected { recordingHash: \"…\" }, or { action: 'skip' | 'abort' }";
+    }
+    if (kind === 'visual_diff') {
+      return Array.isArray(v.verdicts) ? undefined : 'expected { verdicts: [...] }';
+    }
+    return undefined;
+  }
+
+  /** The kind of the outstanding question, for validating what comes back. */
+  get pendingKind(): PendingDecision['kind'] | undefined {
+    return this.#request?.decisionKind;
+  }
+
   /** Answer the outstanding request and let the pipeline continue. */
   answer(requestId: string, value: unknown): boolean {
     const deferred = this.#pending.get(requestId);
@@ -105,8 +146,12 @@ export class HostAgentReasoner implements Reasoner {
         vocabulary,
         expects: { subGoals: ['string, one per step, in the vocabulary above'] },
       },
+      decisionKind: 'gap',
     });
 
+    // Still guarded, but this is now the LAST line of defence rather than the
+    // only one: `resumeRun` validates the shape before it ever reaches here and
+    // re-asks, so a mistyped answer costs one more question, not the run.
     const subGoals = (answer as { subGoals?: unknown })?.subGoals;
     if (!Array.isArray(subGoals) || !subGoals.every((s) => typeof s === 'string' && s.trim())) {
       throw new Error('decompose expected { subGoals: string[] }');
@@ -115,33 +160,91 @@ export class HostAgentReasoner implements Reasoner {
   }
 
   async resolve(decision: PendingDecision): Promise<Record<string, unknown>> {
+    const wantsCapture = decision.kind === 'needs_capture';
     const answer = await this.#ask({
-      ask: `The executor needs a decision: ${decision.kind}`,
-      reason: 'Deterministic code cannot make this judgement call.',
+      ask: wantsCapture
+        ? 'The executor is stuck and needs a flow RECORDED before it can continue'
+        : `The executor needs a decision: ${decision.kind}`,
+      reason: wantsCapture
+        ? 'No amount of retrying reaches this state — a human has to drive it once.'
+        : 'Deterministic code cannot make this judgement call.',
       payload: { kind: decision.kind, ...decision.context },
+      ...(wantsCapture ? { kind: 'record_flow' as const } : {}),
+      decisionKind: decision.kind,
     });
     return (answer ?? {}) as Record<string, unknown>;
   }
 
+  /** Mark the request as handed to the agent — the 'delivered' the schema always had. */
+  async markDelivered(requestId: string): Promise<void> {
+    await getPool()
+      .query(
+        // Guarded on 'pending' so a fast answer is never clobbered by a slow
+        // delivery write landing after it.
+        `UPDATE context_requests SET status = 'delivered'
+         WHERE request_id = $1 AND status = 'pending'`,
+        [requestId],
+      )
+      .catch(() => {});
+  }
+
+  /**
+   * Record what the answer actually PRODUCED, once it has been applied.
+   *
+   * Addressed by RUN rather than by request id, because the id is consumed
+   * inside `resolve()` and threading it back out would mean leaking the
+   * suspension mechanics into the pipeline. The newest answered `record_flow`
+   * row for a run is unambiguously the one that just came back — a run only
+   * ever has one outstanding.
+   */
+  async markIngested(produced: Record<string, unknown>): Promise<void> {
+    if (!this.runId) return;
+    await getPool()
+      .query(
+        `UPDATE context_requests SET status = 'ingested', produced = $2
+         WHERE request_id = (
+           SELECT request_id FROM context_requests
+           WHERE run_id = $1 AND kind = 'record_flow' AND status = 'answered'
+           ORDER BY created_at DESC LIMIT 1
+         )`,
+        [this.runId, JSON.stringify(produced)],
+      )
+      .catch(() => {});
+  }
+
   // -------------------------------------------------------------------------
 
-  async #ask(spec: { ask: string; reason: string; payload: Record<string, unknown> }): Promise<unknown> {
+  async #ask(spec: {
+    ask: string;
+    reason: string;
+    payload: Record<string, unknown>;
+    kind?: 'decision' | 'record_flow';
+    decisionKind?: PendingDecision['kind'];
+  }): Promise<unknown> {
     const requestId = randomUUID();
+    const kind = spec.kind ?? 'decision';
 
     // The row is durability and visibility: you can see what a run is waiting
     // on from SQL, even though the promise itself lives in this process.
     await getPool()
       .query(
         `INSERT INTO context_requests (request_id, app_id, run_id, kind, status, reason, ask, payload)
-         VALUES ($1,$2,$3,'decision','pending',$4,$5,$6)`,
-        [requestId, this.appId, this.runId ?? null, spec.reason, spec.ask, JSON.stringify(spec.payload)],
+         VALUES ($1,$2,$3,$4,'pending',$5,$6,$7)`,
+        [requestId, this.appId, this.runId ?? null, kind, spec.reason, spec.ask, JSON.stringify(spec.payload)],
       )
       .catch(() => {
         // A missing row must not sink a run; the in-memory deferred is what
         // actually gates execution.
       });
 
-    const request: SuspendedRequest = { requestId, kind: 'decision', ...spec };
+    const request: SuspendedRequest = {
+      requestId,
+      kind,
+      ask: spec.ask,
+      reason: spec.reason,
+      payload: spec.payload,
+      ...(spec.decisionKind ? { decisionKind: spec.decisionKind } : {}),
+    };
     this.#request = request;
 
     const promise = new Promise<unknown>((resolve, reject) => {

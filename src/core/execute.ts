@@ -18,69 +18,9 @@
 import { getPool } from './db.js';
 import { replay, type ReplayOptions, type ReplayResult } from './replay.js';
 import { buildRecording, type RawEvent, type RawRecording } from './recording.js';
+import { eventsForFlow } from './flow-ir.js';
 import type { Plan } from './plan.js';
 import { lessonsFor, foldLessonOutcomes } from './lessons.js';
-
-interface StepRow {
-  action: string;
-  role: string | null;
-  name: string | null;
-  test_id: string | null;
-  css: string | null;
-  frame_hint: string | null;
-  value_ref: string | null;
-  args: Record<string, unknown>;
-  semantic: string;
-  state_after: string | null;
-}
-
-/**
- * Reconstruct the IR for a flow, in order.
- *
- * The inverse of ingest: `args.value` holds the literal that was typed,
- * `value_ref` holds the reference to something we deliberately never stored.
- */
-async function eventsForFlow(flowId: string, startingSeq: number): Promise<RawEvent[]> {
-  const { rows } = await getPool().query<StepRow>(
-    `SELECT s.action, sel.role, sel.name, sel.test_id, sel.css, sel.frame_hint,
-            s.value_ref, s.args, s.semantic, s.state_after
-     FROM flow_steps fs
-     JOIN steps s ON s.step_id = fs.step_id
-     LEFT JOIN selectors sel ON sel.selector_id = s.selector_id
-     WHERE fs.flow_id = $1
-     ORDER BY fs.ordinal`,
-    [flowId],
-  );
-
-  return rows.map((r, i) => {
-    const args = (r.args ?? {}) as Record<string, unknown>;
-    const literal = typeof args.value === 'string' ? args.value : undefined;
-
-    return {
-      seq: startingSeq + i,
-      ts: startingSeq + i,
-      action: r.action as RawEvent['action'],
-      // '' is how the schema encodes "no role/name" — turn it back into absence
-      // so the locator builder falls through to test id or css.
-      ...(r.role ? { role: r.role } : {}),
-      ...(r.name ? { name: r.name } : {}),
-      ...(literal !== undefined ? { value: literal } : {}),
-      ...(r.value_ref ? { valueRef: r.value_ref } : {}),
-      ...(r.test_id ? { testId: r.test_id } : {}),
-      ...(args.testIdAttr ? { testIdAttr: String(args.testIdAttr) } : {}),
-      ...(r.css ? { css: r.css } : {}),
-      ...(r.frame_hint ? { frameHint: r.frame_hint } : {}),
-      ...(args.exact ? { exact: true } : {}),
-      ...(typeof args.nth === 'number' ? { hints: { nth: args.nth } } : {}),
-      // state_after is the fingerprint this step PRODUCED when recorded — an
-      // expectation, not a URL. It was being loaded and then assigned to `url`,
-      // which threw the expectation away and put a sig where a URL belongs.
-      ...(r.state_after ? { expectedSig: r.state_after } : {}),
-      url: '',
-      resolution: 'accname' as const,
-    };
-  });
-}
 
 export interface ExecuteResult {
   result: ReplayResult;
@@ -125,11 +65,22 @@ export async function executePlan(
     // was never recorded in — which is how a plan quietly does the wrong thing
     // rather than failing.
     const seam = seamBefore.get(sub.bound.slug);
-    if (seam && seam.kind === 'unresolved') {
-      throw new Error(
-        `refusing to execute: unresolved seam ${seam.from} -> ${seam.to} (${seam.detail})`,
-      );
-    }
+
+    // AN UNRESOLVED SEAM USED TO THROW HERE, while events were still being
+    // ASSEMBLED — before any browser existed. That is why it could only ever
+    // fail the run: there was no live state to hand anyone.
+    //
+    // Marking the destination's first step instead defers the same refusal to
+    // run time, where the executor is sitting on a real page and can ask a
+    // human to record the bridge. Nothing is loosened: with no handoff wired
+    // the step still fails, which is the old behaviour with a better message.
+    // `hints` is free-form and survives splicing, so this needs no new action
+    // and no schema CHECK change.
+    const gapBefore =
+      seam && seam.kind === 'unresolved'
+        ? { from: seam.from, to: seam.to, detail: seam.detail }
+        : undefined;
+
     if (seam?.steps.length) {
       for (const e of seam.steps) {
         events.push({ ...e, seq: events.length, ts: events.length });
@@ -142,9 +93,18 @@ export async function executePlan(
     // a second one mid-plan would throw away the state the previous flow just
     // established — the seam already told us whether that is needed.
     const isFirst = events.length === 0;
+    let firstOfFlow = true;
     for (const e of flowEvents) {
       if (!isFirst && e.action === 'goto') continue;
-      events.push({ ...e, seq: events.length, ts: events.length });
+      events.push({
+        ...e,
+        seq: events.length,
+        ts: events.length,
+        ...(firstOfFlow && gapBefore
+          ? { hints: { ...(e.hints ?? {}), seamGapBefore: gapBefore } }
+          : {}),
+      });
+      firstOfFlow = false;
     }
     flowsRun.push(sub.bound.slug);
 

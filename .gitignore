@@ -22,6 +22,12 @@ dist/
 # and the fixtures beside them can be patient photos.
 .understudy/explorations/
 
+# Saved browser sessions, keyed by a hash of the credentials that made them.
+# storageState holds live cookies and tokens — a credential in every meaningful
+# sense, and a shorter-lived one than a password but no less usable. Written
+# 0600 and never mirrored to the database for the same reason.
+.understudy/sessions/
+
 # Distiller cache, keyed by recording hash — regenerable, but expensive to lose
 .understudy/cache/
 .understudy/distilled/
@@ -45,3 +51,14 @@ playwright-report/
 
 # Playwright MCP scratch output: page snapshots, console logs, screenshots
 .playwright-mcp/
+
+# Internal docs. The repo shows README.md and REASONER.md — what Understudy is
+# and how to drive it. Everything below is a working document written for
+# whoever is building it, and carries things a visitor should not have: Oracle
+# public IPs and SSH details, the CockroachDB org id, cluster host and SQL user,
+# and absolute paths into a laptop nobody else has. Keep them local.
+PLAN.md
+STATUS.md
+STATUS-HISTORY.md
+BUILDING.md
+CLAUDE.md

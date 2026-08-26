@@ -224,8 +224,9 @@ export async function ingestRecording(
     if (created) {
       const { rows } = await client.query<{ flow_id: string }>(
         `INSERT INTO flows (app_id, slug, title, intent, outcome, start_state, end_state,
-                            source, destructive, needs_review, recording_hash, corrections)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'recorded',$8,$9,$10,$11)
+                            source, destructive, needs_review, recording_hash, corrections,
+                            prelude)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'recorded',$8,$9,$10,$11,$12)
          RETURNING flow_id`,
         [
           appId,
@@ -239,6 +240,10 @@ export async function ingestRecording(
           needsReview,
           recording.hash,
           JSON.stringify(distilled?.corrections ?? []),
+          // The prelude this recording DECLARED. Stored on the flow so a later
+          // `--after` on this flow expands transitively — without it, building
+          // on a flow captured with `--after log-in` silently omits the login.
+          JSON.stringify(recording.entry?.prelude ?? []),
         ],
       );
       flowId = rows[0]!.flow_id;
@@ -248,7 +253,7 @@ export async function ingestRecording(
         `UPDATE flows SET intent = $2, start_state = $3, end_state = $4,
                           destructive = $5, needs_review = $6, updated_at = now(),
                           title = coalesce($7, title), preconditions = $8,
-                          corrections = $9
+                          corrections = $9, prelude = $10
          WHERE flow_id = $1`,
         [
           flowId,
@@ -260,6 +265,7 @@ export async function ingestRecording(
           distilled?.intent ?? null,
           JSON.stringify(distilled?.preconditions ?? []),
           JSON.stringify(distilled?.corrections ?? []),
+          JSON.stringify(recording.entry?.prelude ?? []),
         ],
       );
       // Membership is rebuilt from scratch. The step ROWS are then garbage

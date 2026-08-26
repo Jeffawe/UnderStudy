@@ -26,10 +26,13 @@
     "recall:check": "tsx src/core/recall-check.ts",
     "sig:check": "tsx src/core/sig-check.ts",
     "explore:check": "tsx src/core/explore-check.ts",
+    "auth:check": "tsx src/core/auth-check.ts",
     "understudy": "tsx src/entry/cli.ts",
     "vendor:accname": "node scripts/vendor-accname.mjs",
     "mcp": "tsx src/entry/mcp.ts",
-    "bedrock:check": "tsx src/adapters/bedrock/check.ts"
+    "bedrock:check": "tsx src/adapters/bedrock/check.ts",
+    "prelude:check": "tsx src/core/prelude-check.ts",
+    "handoff:check": "tsx src/core/handoff-check.ts"
   },
   "dependencies": {
     "@anthropic-ai/bedrock-sdk": "^0.32.1",
