@@ -1,6 +1,6 @@
 # Understudy
 
-An agent that learns a web app from browser recordings and stores what it learned
+An system that learns a web app from browser recordings and stores what it learned
 as **queryable memory**, so you can say *"test login"* and it works — including
 for goals no single recording covers.
 
@@ -79,4 +79,4 @@ an hour. If you are an agent working in this repo, read that.
 
 ## License
 
-MIT
+Apache
