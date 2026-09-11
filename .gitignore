@@ -62,3 +62,7 @@ STATUS.md
 STATUS-HISTORY.md
 BUILDING.md
 CLAUDE.md
+
+# Uploaded files copied in by the recorder. Ignored for the same reason
+# recordings are: a captured upload can be a photo of someone's ID.
+.understudy/fixtures/

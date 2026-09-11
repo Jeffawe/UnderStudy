@@ -32,7 +32,8 @@
     "mcp": "tsx src/entry/mcp.ts",
     "bedrock:check": "tsx src/adapters/bedrock/check.ts",
     "prelude:check": "tsx src/core/prelude-check.ts",
-    "handoff:check": "tsx src/core/handoff-check.ts"
+    "handoff:check": "tsx src/core/handoff-check.ts",
+    "upload:check": "tsx src/adapters/recorder/upload-check.ts"
   },
   "dependencies": {
     "@anthropic-ai/bedrock-sdk": "^0.32.1",

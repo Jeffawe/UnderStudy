@@ -275,6 +275,12 @@ export const INJECTED_LISTENER = `
     if (tag !== 'input' && tag !== 'textarea') return;
     var type = (el.getAttribute('type') || 'text').toLowerCase();
     if (type === 'checkbox' || type === 'radio') return;
+    // A FILE INPUT'S VALUE IS A LIE. The browser masks it to 'C:\\fakepath\\name'
+    // so a page cannot learn where someone keeps their files. Deferring it here
+    // flushed it as an ordinary fill carrying that string: a step that cannot
+    // replay, with the file absent from the recording entirely, and nothing
+    // anywhere reporting either. The 'change' handler records it properly.
+    if (type === 'file') return;
 
     for (var i = 0; i < pending.length; i++) {
       if (pending[i].el === el) {
@@ -318,6 +324,16 @@ export const INJECTED_LISTENER = `
     }
     if (type === 'checkbox' || type === 'radio') {
       emit(el.checked ? 'check' : 'uncheck', el);
+      return;
+    }
+    if (type === 'file') {
+      // The page reports THAT an upload happened and how many files it carried.
+      // It cannot report WHICH files: el.value is masked and File exposes only
+      // .name. Node resolves the real paths from the stamp over CDP, which is
+      // the only place they can be read at all.
+      var count = el.files ? el.files.length : 0;
+      if (!count) return; // clearing a file input is not an upload
+      emit('upload', el, { fileCount: count });
       return;
     }
     // Text inputs are handled by the input+flush path above. Emitting here too

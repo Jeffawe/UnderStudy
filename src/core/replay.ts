@@ -795,7 +795,11 @@ export async function replay(
             case 'upload': {
               const value = valueFor(event, values);
               if (value === undefined) throw new Error('upload step has no file path');
-              await target.setInputFiles(value, { timeout: timeoutMs });
+              // A multi-file input is stored newline-joined, because the IR's
+              // value is a single string and a newline cannot occur in the
+              // hash-prefixed names the recorder writes.
+              const files = value.includes('\n') ? value.split('\n') : value;
+              await target.setInputFiles(files, { timeout: timeoutMs });
               break;
             }
             case 'scroll_container': {

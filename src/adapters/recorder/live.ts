@@ -19,7 +19,11 @@
  * by computing them in-page at event time; this does the same.
  */
 
-import { type BrowserContext, type Page } from 'playwright';
+import { type BrowserContext, type CDPSession, type Page } from 'playwright';
+import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { basename, join, relative, resolve } from 'node:path';
 import { openLease, type BrowserLease } from '../../core/browser.js';
 import { computeSig, parseAria } from '../../core/sig.js';
 import type { StorageState } from '../../core/auth-cache.js';
@@ -52,6 +56,8 @@ interface WireEvent {
   frameHint?: string;
   value?: string;
   label?: string;
+  /** Files on a file input. The page can count them; it cannot name them. */
+  fileCount?: number;
 }
 
 export interface LiveRecordOptions {
@@ -156,6 +162,95 @@ async function resolveStamped(
   }
 }
 
+// Read per call, not once at import. A module-level constant would freeze the
+// override before any caller could set it, which is a footgun for anything that
+// wants its own directory — a check, or a run recording into a scratch corpus.
+const fixturesDir = () => process.env.UNDERSTUDY_FIXTURES_DIR ?? resolve('.understudy/fixtures');
+
+/**
+ * One CDP session per page, reused.
+ *
+ * `DOM.getFileInfo` lives in the DOM domain and answers nothing until it is
+ * enabled, and opening a session per uploaded file would be wasteful on a form
+ * that takes several.
+ */
+const cdpSessions = new WeakMap<Page, Promise<CDPSession>>();
+
+async function cdpFor(page: Page): Promise<CDPSession> {
+  let session = cdpSessions.get(page);
+  if (!session) {
+    session = page
+      .context()
+      .newCDPSession(page)
+      .then(async (opened) => {
+        await opened.send('DOM.enable').catch(() => {});
+        return opened;
+      });
+    cdpSessions.set(page, session);
+  }
+  return session;
+}
+
+/**
+ * The real paths behind a file input.
+ *
+ * THIS IS THE ONE THING THE PAGE CANNOT TELL US. The DOM masks a file input's
+ * value to `C:\fakepath\<name>` and `File` exposes only `.name`, both
+ * deliberately, so that a page cannot learn where a person keeps their files.
+ * The recorder is not a page, though — it owns the browser, and Chrome will
+ * answer the question over the DevTools protocol.
+ *
+ * Chromium-only, which costs nothing here: every browser Understudy opens is
+ * Chromium. Returns [] rather than throwing, because an upload we cannot
+ * resolve should drop one step, not kill a recording someone is halfway
+ * through.
+ */
+async function uploadedPaths(page: Page, stamp: number): Promise<string[]> {
+  try {
+    const cdp = await cdpFor(page);
+    const handle = await cdp.send('Runtime.evaluate', {
+      expression: `document.querySelector('[${STAMP_ATTR}="${stamp}"]').files`,
+    });
+    const objectId = handle?.result?.objectId;
+    if (!objectId) return [];
+
+    const props = await cdp.send('Runtime.getProperties', { objectId, ownProperties: true });
+    const paths: string[] = [];
+    for (const prop of props?.result ?? []) {
+      // A FileList's own properties are its numeric indices plus 'length'.
+      if (!/^\d+$/.test(prop.name)) continue;
+      const fileId = prop.value?.objectId;
+      if (!fileId) continue;
+      const info = (await cdp.send('DOM.getFileInfo', { objectId: fileId })) as { path?: string };
+      if (info?.path) paths.push(info.path);
+    }
+    return paths;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Copy an uploaded file into the corpus and return the path to store.
+ *
+ * A recording that points at `/Users/someone/Desktop/photo.png` replays
+ * exactly once, on one machine — which contradicts the rule that a recording
+ * must replay. Copying the file in makes the recording self-contained. Naming
+ * it by content hash means the same photo recorded ten times is stored once,
+ * and two different files that share a basename cannot collide.
+ */
+async function stashFixture(absolute: string): Promise<string> {
+  const bytes = await readFile(absolute);
+  const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
+  const dir = fixturesDir();
+  const target = join(dir, `${digest}-${basename(absolute)}`);
+  await mkdir(dir, { recursive: true });
+  if (!existsSync(target)) await writeFile(target, bytes);
+  // Relative, so the value means the same thing from the repo root whoever
+  // replays it.
+  return relative(process.cwd(), target);
+}
+
 export async function recordLive(opts: LiveRecordOptions): Promise<RawRecording> {
   const {
     appSlug,
@@ -218,12 +313,27 @@ export async function recordLive(opts: LiveRecordOptions): Promise<RawRecording>
     // typed — redacting it turns pressing Enter in a password field into
     // `valueRef: SECRET.password`, and replay then tries to press a key called
     // by the password itself. Only typed input can be a credential.
+    // AN UPLOAD'S VALUE IS A PATH, NOT A CREDENTIAL, so it must never reach
+    // redactValue — a file input labelled "Upload your ID photo" trips
+    // SECRET_HINTS on the word 'id' and would be stored as a valueRef, leaving
+    // replay hunting for a password that was never a password.
+    let uploaded: string | undefined;
+    if (wire.action === 'upload') {
+      const paths = await uploadedPaths(page, wire.stamp);
+      // Nothing resolvable: drop the step. Recording an upload we cannot point
+      // at is exactly the silent-corruption failure this branch exists to end.
+      if (!paths.length) return;
+      uploaded = (await Promise.all(paths.map(stashFixture))).join('\n');
+    }
+
     const valued =
-      wire.value !== undefined
-        ? wire.action === 'press'
-          ? { value: wire.value }
-          : redactValue(fieldHint, wire.value, wire.inputType, secretSignal)
-        : {};
+      uploaded !== undefined
+        ? { value: uploaded }
+        : wire.value !== undefined
+          ? wire.action === 'press'
+            ? { value: wire.value }
+            : redactValue(fieldHint, wire.value, wire.inputType, secretSignal)
+          : {};
 
     events.push({
       seq: events.length,
