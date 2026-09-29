@@ -20,6 +20,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "db:start": "./scripts/db-start.sh",
+    "db:stop": "./scripts/db-stop.sh",
     "db:sql": "./scripts/db.sh",
     "db:schema": "./scripts/apply-schema.sh",
     "embedder:check": "tsx src/adapters/embedder/check.ts",
@@ -33,7 +34,8 @@
     "bedrock:check": "tsx src/adapters/bedrock/check.ts",
     "prelude:check": "tsx src/core/prelude-check.ts",
     "handoff:check": "tsx src/core/handoff-check.ts",
-    "upload:check": "tsx src/adapters/recorder/upload-check.ts"
+    "upload:check": "tsx src/adapters/recorder/upload-check.ts",
+    "hair-loss:book": "tsx .understudy/explorations/hair-loss-book.ts"
   },
   "dependencies": {
     "@anthropic-ai/bedrock-sdk": "^0.32.1",
