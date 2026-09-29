@@ -25,6 +25,9 @@ specific task.
 
 - Read `REASONER.md` before using Understudy to run, plan, distill, ingest, or
   remember app behavior. That file is the operating contract.
+- CockroachDB is on-demand: run `./scripts/db-start.sh` before touching the DB
+  and `./scripts/db-stop.sh` when the task is finished (details in
+  `REASONER.md` Setup).
 - You are the reasoner/distiller, not the browser driver by default.
   Deterministic code owns replay, recall, binding, seam resolution, and
   execution; it asks you questions when judgement is needed.

@@ -100,6 +100,19 @@ The `understudy` MCP server is in `.mcp.json`. Eleven tools, prefixed
 PATH="/opt/homebrew/bin:$PATH" ./scripts/db-start.sh
 ```
 
+**The database is on-demand: start it when you need it, stop it when done.**
+It is not left running between sessions.
+
+- **Before** the first tool or command that touches the DB (any `understudy_*`
+  tool, `understudy` CLI, `npm run db:sql`), run `./scripts/db-start.sh`. It is
+  a no-op if already running.
+- **When the work is finished**, run `./scripts/db-stop.sh` (`npm run db:stop`).
+  "Finished" means the task is done and nothing further is queued — not between
+  tool calls or mid-task, since a restart costs seconds and an in-flight run
+  needs the DB. Do not stop it if the user says they are continuing, or if you
+  did not start it and it was already running for something else.
+- Say in one line when you start or stop it.
+
 > **The MCP server is long-lived.** It loads `src/` once when the session
 > connects. If anyone edits the source, the CLI picks it up immediately but the
 > MCP tools keep running the old build — and the symptom is baffling: the same
