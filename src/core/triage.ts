@@ -26,6 +26,7 @@
  */
 
 import { getPool, tx } from './db.js';
+import { triggerProblems } from './trigger.js';
 
 export type Disposition = 'triaged_lesson' | 'triaged_issue' | 'wontfix' | 'fixed';
 
@@ -173,6 +174,10 @@ export async function applyTriage(
 ): Promise<{ status: Disposition; lessonId?: string }> {
   if (decision.disposition === 'triaged_lesson' && !decision.lesson) {
     throw new Error('triaged_lesson requires a lesson — what should the agent do instead?');
+  }
+  if (decision.lesson) {
+    const problems = triggerProblems(decision.lesson.trigger);
+    if (problems.length) throw new Error(`lesson ${problems.join('; ')}`);
   }
 
   return tx(async (client) => {

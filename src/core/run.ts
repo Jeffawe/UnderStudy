@@ -73,6 +73,10 @@ interface FindingDraft {
  */
 function stable(text: string): string {
   return text
+    // Query strings inside a message: a signed upload URL carries a fresh
+    // expiry and signature every time, so one CORS defect filed a new finding
+    // per upload. routeOf() already drops them for network findings.
+    .replace(/(https?:\/\/[^\s'"?#]+)\?[^\s'"]*/g, '$1')
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid')
     .replace(/\b\d{3,}\b/g, ':n')
     .replace(/\s+/g, ' ')
@@ -270,6 +274,10 @@ export async function openRun(opts: {
   mode?: 'execute' | 'emit-only' | 'dry-run';
   reasoner?: string;
 }): Promise<string> {
+  // Housekeeping rides on the one moment we know someone is starting fresh.
+  // Never allowed to stop the run it piggybacks on.
+  await reapAbandoned(opts.appId).catch(() => {});
+
   const { rows } = await getPool().query<{ run_id: string }>(
     `INSERT INTO runs (app_id, goal, mode, status, reasoner)
      VALUES ($1,$2,$3,'running',$4)
@@ -277,6 +285,44 @@ export async function openRun(opts: {
     [opts.appId, opts.goal, opts.mode ?? 'execute', opts.reasoner ?? null],
   );
   return rows[0]!.run_id;
+}
+
+/**
+ * Close runs that parked on a question nobody came back to answer.
+ *
+ * The answer to a suspended run is an in-process promise (host-agent.ts), so a
+ * run whose MCP server has since restarted can never be resumed — yet nothing
+ * ever closed its row. It sat in 'running' forever, with its question in
+ * 'delivered', and every "what is in flight?" query counted it.
+ *
+ * Idle is measured from the LATEST activity — the run opening or its newest
+ * question — so a long run that keeps asking is never reaped mid-flight. If a
+ * reaped run does somehow finish, recordRun's UPDATE overwrites the status, so
+ * being wrong here costs nothing. Tunable: UNDERSTUDY_ABANDON_AFTER_HOURS.
+ */
+export async function reapAbandoned(appId: string): Promise<{ runs: number; requests: number }> {
+  const hours = Number(process.env.UNDERSTUDY_ABANDON_AFTER_HOURS) || 24;
+  return tx(async (client) => {
+    const { rowCount: runs } = await client.query(
+      `UPDATE runs r SET status = 'abandoned', finished_at = now()
+       WHERE r.app_id = $1 AND r.status IN ('running','needs_context')
+         AND greatest(r.started_at, coalesce(
+               (SELECT max(c.created_at) FROM context_requests c WHERE c.run_id = r.run_id),
+               r.started_at)) < now() - $2::FLOAT * INTERVAL '1 hour'`,
+      [appId, hours],
+    );
+    // The questions those runs were waiting on, plus any that belong to no run.
+    const { rowCount: requests } = await client.query(
+      `UPDATE context_requests c SET status = 'expired'
+       WHERE c.app_id = $1 AND c.status IN ('pending','delivered')
+         AND c.created_at < now() - $2::FLOAT * INTERVAL '1 hour'
+         AND NOT EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.run_id = c.run_id AND r.status IN ('running','needs_context'))`,
+      [appId, hours],
+    );
+    return { runs: runs ?? 0, requests: requests ?? 0 };
+  });
 }
 
 /** Move a run between the in-flight states, e.g. while a handoff is outstanding. */
@@ -368,9 +414,12 @@ export async function recordRun(
     for (const [ordinal, step] of result.steps.entries()) {
       const signals = signalsByStep.get(step.seq) ?? [];
       await client.query(
+        // fingerprint is copied off the step NOW, while the row exists: step_id
+        // goes NULL on the next re-ingest and the history must not. See db/11.
         `INSERT INTO run_events (run_id, ordinal, step_id, selector_id, outcome, error,
-                                 sig_observed, duration_ms, console, network)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+                                 sig_observed, duration_ms, console, network, fingerprint)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+                 (SELECT fingerprint FROM steps WHERE step_id = $3))`,
         [
           runId,
           ordinal,

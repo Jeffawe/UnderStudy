@@ -26,6 +26,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { triggerProblems } from './trigger.js';
 import type { RawRecording } from './recording.js';
 import type { ReplayResult } from './replay.js';
 import type { Vocabulary } from './vocabulary.js';
@@ -248,6 +249,20 @@ export function validateDistilled(input: unknown, stepCount: number): Validation
     if (start < 0 || end > stepCount) push(`${at}.stepRange [${start},${end}) is outside 0..${stepCount}`);
     if (start >= end) push(`${at}.stepRange [${start},${end}) is empty or inverted`);
   });
+
+  // Ingest writes these straight into `lessons`, so a bad trigger here is a
+  // lesson that fires everywhere or nowhere. Validated like every other writer.
+  if (d.candidateLessons !== undefined && !Array.isArray(d.candidateLessons)) {
+    push('candidateLessons must be an array');
+  } else {
+    (d.candidateLessons as unknown[] | undefined)?.forEach((raw, i) => {
+      const l = (raw ?? {}) as Record<string, unknown>;
+      for (const field of ['kind', 'title', 'body'] as const) {
+        if (typeof l[field] !== 'string' || !(l[field] as string).trim()) push(`candidateLessons[${i}].${field} is required`);
+      }
+      for (const p of triggerProblems(l.trigger)) push(`candidateLessons[${i}].${p}`);
+    });
+  }
 
   return errors.length ? { ok: false, errors } : { ok: true, errors: [], value: d as unknown as Distilled };
 }

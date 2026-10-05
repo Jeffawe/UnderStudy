@@ -78,16 +78,17 @@ export async function lessonsFor(appId: string, context: StepContext): Promise<L
  * history of going wrong. If it never has, a lesson firing on it has no
  * demonstrated problem to solve.
  *
- * `run_events.step_id` is ON DELETE SET NULL (db/03), so the join silently
- * drops events whose step rows were replaced by a re-ingest. That is the right
- * behaviour here: it makes the check conservative, and a lesson is better
- * under-credited than falsely credited.
+ * Reads the fingerprint stored ON the event (db/11), not through `step_id`:
+ * that pointer goes NULL on every re-ingest (db/03), and joining through it
+ * silently erased the history this question depends on. Events written before
+ * db/11 that had already lost their step have no fingerprint and do not count —
+ * conservative, since a lesson is better under-credited than falsely credited.
  */
 async function fingerprintHasFailed(appId: string, fingerprint: string): Promise<boolean> {
   const { rows } = await getPool().query(
     `SELECT 1 FROM run_events re
-     JOIN steps s ON s.step_id = re.step_id
-     WHERE s.app_id = $1 AND s.fingerprint = $2
+     JOIN runs r ON r.run_id = re.run_id
+     WHERE r.app_id = $1 AND re.fingerprint = $2
        AND re.outcome IN ('not_found','assert_fail','timeout','error')
      LIMIT 1`,
     [appId, fingerprint],

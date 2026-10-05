@@ -563,24 +563,41 @@ export async function ingestRecording(
     if (distilled?.candidateLessons?.length) {
       // Rebuilt per distillation: a re-cut distillation may drop a lesson, and
       // a lesson nobody stands behind should not linger.
+      //
+      // Unlink, then collect: a lesson may be shared with another flow (see the
+      // dedupe below), so it only goes when NO live flow still stands behind
+      // it. `lesson_links.target_id` has no FK — it is polymorphic — so a flow
+      // deleted any other way left its lessons behind, linked to nothing, and
+      // firing as exact duplicates of the re-ingested copies. The sweep
+      // collects those too.
       await client.query(
-        `DELETE FROM lessons WHERE lesson_id IN (
-           SELECT lesson_id FROM lesson_links
-           WHERE target_kind = 'flow' AND target_id = $1)`,
+        `DELETE FROM lesson_links WHERE target_kind = 'flow' AND target_id = $1`,
         [flowId],
       );
+      await collectUnlinkedLessons(client, appId);
 
       for (const lesson of distilled.candidateLessons) {
-        const { rows: lr } = await client.query<{ lesson_id: string }>(
-          `INSERT INTO lessons (app_id, kind, title, body, trigger, source)
-           VALUES ($1,$2,$3,$4,$5,'distilled')
-           RETURNING lesson_id`,
-          [appId, lesson.kind, lesson.title, lesson.body, JSON.stringify(lesson.trigger ?? {})],
+        // Same title and trigger is the same lesson: link it rather than mint a
+        // twin that fires alongside it and double-counts every application.
+        const trigger = JSON.stringify(lesson.trigger ?? {});
+        const { rows: same } = await client.query<{ lesson_id: string }>(
+          `SELECT lesson_id FROM lessons
+           WHERE app_id = $1 AND title = $2 AND trigger = $3::JSONB
+           LIMIT 1`,
+          [appId, lesson.title, trigger],
         );
+        const lessonId = same[0]?.lesson_id ?? (
+          await client.query<{ lesson_id: string }>(
+            `INSERT INTO lessons (app_id, kind, title, body, trigger, source)
+             VALUES ($1,$2,$3,$4,$5,'distilled')
+             RETURNING lesson_id`,
+            [appId, lesson.kind, lesson.title, lesson.body, trigger],
+          )
+        ).rows[0]!.lesson_id;
         await client.query(
           `INSERT INTO lesson_links (lesson_id, target_kind, target_id)
            VALUES ($1,'flow',$2) ON CONFLICT DO NOTHING`,
-          [lr[0]!.lesson_id, flowId],
+          [lessonId, flowId],
         );
         lessonCount++;
       }
@@ -655,4 +672,23 @@ export async function ingestRecording(
     selectorIds: result.stepSelectorIds,
     appId,
   };
+}
+
+/**
+ * Drop distilled lessons that no live flow stands behind any more.
+ *
+ * Only `distilled` lessons: they exist BECAUSE of a recording, so a lesson
+ * whose recordings are all gone has lost its provenance. A user_said or
+ * promoted lesson is unlinked by design and is never collected here.
+ */
+export async function collectUnlinkedLessons(client: pg.PoolClient, appId: string): Promise<number> {
+  const { rowCount } = await client.query(
+    `DELETE FROM lessons l
+     WHERE l.app_id = $1 AND l.source = 'distilled'
+       AND NOT EXISTS (
+         SELECT 1 FROM lesson_links ll JOIN flows f ON f.flow_id = ll.target_id
+         WHERE ll.lesson_id = l.lesson_id AND ll.target_kind = 'flow')`,
+    [appId],
+  );
+  return rowCount ?? 0;
 }

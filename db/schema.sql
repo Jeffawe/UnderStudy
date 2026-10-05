@@ -267,7 +267,9 @@ CREATE TABLE IF NOT EXISTS runs (
                 -- works. See db/09.
                 CHECK (mode IN ('execute','emit-only','dry-run','attributed')),
   status        STRING NOT NULL DEFAULT 'running'
-                CHECK (status IN ('running','passed','failed','blocked','needs_context')),
+                -- 'abandoned' = opened, then parked on a question nobody came
+                -- back to answer. Not 'failed': nothing was tried. See db/12.
+                CHECK (status IN ('running','passed','failed','blocked','needs_context','abandoned')),
   sig_sequence  JSONB NOT NULL DEFAULT '[]',   -- observed fingerprint path — flow-drift diff
   reasoner      STRING,                        -- 'bedrock' | 'host-agent'
   started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -294,9 +296,14 @@ CREATE TABLE IF NOT EXISTS run_events (
   console       JSONB NOT NULL DEFAULT '[]',   -- captured unconditionally
   network       JSONB NOT NULL DEFAULT '[]',   -- method,url,status,req body,res body
   artifact_ref  STRING,                        -- s3 key or local path
+  -- The step's fingerprint, frozen at write time. step_id above goes NULL on
+  -- every re-ingest; this is what keeps "has this KIND of step ever failed?"
+  -- answerable afterwards. See db/11.
+  fingerprint   STRING,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (run_id, ordinal),
-  INDEX run_events_selector_idx (selector_id, outcome)
+  INDEX run_events_selector_idx (selector_id, outcome),
+  INDEX run_events_fingerprint_idx (fingerprint, outcome)
 );
 
 -- findings — "X is wrong". Distinct from a lesson: a lesson means the agent

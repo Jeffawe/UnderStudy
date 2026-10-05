@@ -206,9 +206,9 @@ export async function recallByVector(
   // Filtering inside that scan would cut rows the index already ranked and
   // leave fewer than requested; filtering after it is what over-fetch is for.
   //
-  // Quarantined selectors are dropped here rather than in JS because the join
-  // is cheap on 60 rows and a quarantined element should never reach the
-  // re-rank at all — it isn't a low-confidence answer, it's a known-broken one.
+  // Quarantined selectors and superseded facts are dropped here rather than in
+  // JS because the join is cheap on 60 rows and neither should reach the
+  // re-rank at all — they aren't low-confidence answers, they're known-wrong ones.
   const { rows } = await runner.query<ScanRow>(
     `WITH ann AS (
        SELECT chunk_id, kind, ref_id, flow_id, text, meta,
@@ -226,6 +226,15 @@ export async function recallByVector(
          WHERE s.selector_id = ann.ref_id
            AND ann.kind = 'selector'
            AND s.quarantined
+       )
+       -- A superseded fact is kept for its trail, never as an answer: without
+       -- this, recall returned both sides of a correction ("a Pending request
+       -- blocks a new one" next to the fact overruling it).
+       AND NOT EXISTS (
+         SELECT 1 FROM facts f
+         WHERE f.fact_id = ann.ref_id
+           AND ann.kind = 'fact'
+           AND f.superseded_by IS NOT NULL
        )
      ORDER BY dist`,
     [literal, appId, overFetch, kinds ?? null],

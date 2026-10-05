@@ -20,6 +20,7 @@
  */
 
 import { getPool, tx, ensureMeta } from './db.js';
+import { triggerProblems } from './trigger.js';
 import type { Embedder } from './types.js';
 
 /** Must match the CHECK constraints in db/schema.sql. */
@@ -98,13 +99,7 @@ export function validateRemember(input: RememberInput): string[] {
     if (!nonEmpty(l?.kind)) problems.push(`lessons[${i}].kind is required`);
     if (!nonEmpty(l?.title)) problems.push(`lessons[${i}].title is required`);
     if (!nonEmpty(l?.body)) problems.push(`lessons[${i}].body is required`);
-    if (typeof l?.trigger !== 'object' || l.trigger === null || Array.isArray(l.trigger)) {
-      problems.push(`lessons[${i}].trigger must be an object`);
-    } else if (!Object.keys(l.trigger).length) {
-      // An empty trigger is JSONB-contained by EVERY step context, so the
-      // lesson would fire on all of them. That is never what anyone means.
-      problems.push(`lessons[${i}].trigger is empty — it would match every step`);
-    }
+    for (const p of triggerProblems(l?.trigger)) problems.push(`lessons[${i}].${p}`);
   });
 
   findings.forEach((f, i) => {
