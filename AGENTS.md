@@ -13,7 +13,7 @@ Claude's `@REASONER.md` import, so it says what `CLAUDE.md` does by import.
 When starting Codex specifically for this repository, use the scoped profile:
 
 ```bash
-codex --profile understudy-only --cd /Users/somua/Documents/Projects/Tester/understudy
+codex --profile understudy-only --cd /path/to/understudy
 ```
 
 That profile is intentionally Understudy-only. Do not use broader profiles or

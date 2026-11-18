@@ -1,6 +1,3 @@
-[mcp_servers.cockroachdb]
-url = "https://cockroachlabs.cloud/mcp"
-
 [mcp_servers.playwright]
 command = "npx"
 args = [

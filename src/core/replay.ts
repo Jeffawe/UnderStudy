@@ -324,7 +324,7 @@ function locatorFor(root: Page | Frame, event: RawEvent): Locator | undefined {
   }
 
   // A name written as a regex in the source stays a regex here. `event.name`
-  // holds the SOURCE, which for something like `Minoxidil 2\.5mg` is not the
+  // holds the SOURCE, which for something like `Version 2\.5` is not the
   // accessible name and would match nothing as a literal.
   const name: string | RegExp = event.hints?.nameRegex
     ? new RegExp(event.name!, String(event.hints.nameFlags ?? ''))

@@ -85,8 +85,8 @@ const SNAPSHOT_CALLS = new Set(['toHaveScreenshot', 'checkpoint', 'visualCheckpo
  * These exist to be warned about, not to be mapped. An unmapped call used to
  * fall through the walk in silence, which is the worst possible outcome: the
  * import "succeeds", the step count looks plausible, and the recording is
- * quietly missing a step the flow depends on. That is exactly how the hair loss
- * spec's `page.evaluate` scroll — the thing that unlocks Confirm & Submit —
+ * quietly missing a step the flow depends on. That is exactly how one spec's
+ * `page.evaluate` scroll — the thing that unlocked its submit button —
  * disappeared between a spec that passes and a recording that cannot.
  *
  * A missing step must cost a warning, every time.
@@ -542,7 +542,7 @@ export async function parseScript(
               // the embeddings all key on it. When the source was a regex, the
               // string is its SOURCE and hints carry the regex-ness so replay
               // can rebuild the real matcher — `exact` would be wrong here, a
-              // source like `Minoxidil 2\.5mg` never equals an accessible name.
+              // source like `Version 2\.5` never equals an accessible name.
               ...(merged.name !== undefined ? { name: merged.name.source } : {}),
               ...(merged.exact ? { exact: merged.exact } : {}),
               ...valued,

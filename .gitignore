@@ -57,11 +57,7 @@ playwright-report/
 # Playwright MCP scratch output: page snapshots, console logs, screenshots
 .playwright-mcp/
 
-# Internal docs. The repo shows README.md and REASONER.md — what Understudy is
-# and how to drive it. Everything below is a working document written for
-# whoever is building it, and carries things a visitor should not have: Oracle
-# public IPs and SSH details, the CockroachDB org id, cluster host and SQL user,
-# and absolute paths into a laptop nobody else has. Keep them local.
+# Local working docs — kept on the developer's machine, not in the repo.
 CLAUDE.md
 ARCHITECTURE.md
 ROADMAP.md
