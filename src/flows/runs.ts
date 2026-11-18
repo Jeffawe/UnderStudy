@@ -34,15 +34,20 @@ export async function recordRun(opts: {
   result: ReplayResult;
   /** The flow's steps, for naming the links between pages. */
   steps: Step[];
+  /** 'replay' when a flow was named; 'run' when it was found from a goal. */
+  mode?: 'replay' | 'run';
+  /** What was asked for. Defaults to the flow's slug. */
+  goal?: string;
   startedAt?: Date;
 }): Promise<RecordedRun> {
   const { app, flow, result, steps } = opts;
   const c = await collections();
   const now = new Date();
 
-  // 1. Drift, against the most recent passed runs of this flow.
+  // 1. Drift, against the most recent passed runs of this flow — however it
+  // was started, it walked the same steps.
   const history = await c.runs
-    .find({ app, plan: [flow], mode: 'replay', status: 'passed' }, { projection: { sigSequence: 1 } })
+    .find({ app, plan: [flow], mode: { $in: ['replay', 'run'] }, status: 'passed' }, { projection: { sigSequence: 1 } })
     .sort({ startedAt: -1 })
     .limit(LOOKBACK)
     .toArray();
@@ -80,8 +85,8 @@ export async function recordRun(opts: {
   // 4. The run.
   const run: Run = {
     app,
-    goal: flow,
-    mode: 'replay',
+    goal: opts.goal ?? flow,
+    mode: opts.mode ?? 'replay',
     status: result.ok ? 'passed' : 'failed',
     plan: [flow],
     steps: result.steps.map((s) => ({

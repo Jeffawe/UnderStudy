@@ -108,6 +108,34 @@ test('save → replay → drift and findings', { timeout: 180_000 }, async () =>
   assert.ok(shopPage?.links.some((l) => l.via.name === 'Cart'), 'the page map knows Cart leads on from /shop');
 });
 
+test('recall finds the saved flow by name and by words, and refuses to guess', async () => {
+  const { recall } = await import('../src/memory/recall.js');
+  const exact = await recall('shop', 'open-the-cart');
+  assert.equal(exact.method, 'exact');
+  assert.equal(exact.best?.slug, 'open-the-cart');
+
+  const byWords = await recall('shop', 'open my cart');
+  assert.equal(byWords.method, 'words', 'no model configured in this test');
+  assert.equal(byWords.verdict, 'known');
+  assert.equal(byWords.best?.slug, 'open-the-cart');
+
+  const nope = await recall('shop', 'change my password');
+  assert.equal(nope.verdict, 'unknown');
+  assert.equal(nope.best, undefined, 'nothing to run');
+
+  assert.equal((await recall('another-app', 'open the cart')).verdict, 'unknown', 'never crosses apps');
+});
+
+test('a run found from a goal shares drift history with replays of the same flow', { timeout: 60_000 }, async () => {
+  shop.set({ promo: false, broken: false });
+  const { flows } = await collections();
+  const flow = (await flows.findOne({ app: 'shop', slug: 'open-the-cart' }))!;
+  const result = await replay(recordingFrom(flow), { values });
+  const run = await recordRun({ app: 'shop', flow: flow.slug, result, steps: flow.steps, mode: 'run', goal: 'open my cart' });
+  assert.equal(run.drift.firstRun, false, 'earlier replays count as history');
+  assert.equal(run.drift.changed, false);
+});
+
 test('a destructive flow is marked on save', { timeout: 60_000 }, async () => {
   const u = shop.url;
   const recording = buildRecording({ source: 'live', origin: 'test', appSlug: 'shop', startUrl: u }, [

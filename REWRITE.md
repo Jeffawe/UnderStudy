@@ -253,8 +253,8 @@ what it replaces.
 | **0. Spike** | Connect to local Community + your Atlas free cluster. Create both vector indexes, embed via Voyage, query with `app` filter. | Same test passes on both URIs. **Done 2026-11-18.** Local: `npm test` + `doctor`. Atlas: `doctor` + a real Voyage search, same rankings and scores as local. See *What phase 0 taught us*. |
 | **1. Store** | `src/store/`: types for the six collections, connect from `MONGODB_URI`, create indexes on first run. Delete Cockroach + Bedrock + ONNX code. | `understudy doctor` reports a healthy connection on both URIs. **Done 2026-11-18** — see *Phase 1 notes*. |
 | **2. Record & replay, no AI** | Player, `save`, `replay`, `flows`. Live recorder + script import ported. | Record login on a test app, replay it, see drift and findings. No key, no agent. **Done 2026-11-18** — see *Phase 2 notes*. |
-| **3. Run by goal, no AI** | Recall on Voyage (name match without a key), `run` picks one flow, safety gate, run documents. | `understudy run myapp "log in"` binds and runs the login flow. |
-| **4. Agent layer** | The seven MCP tools: distill/segments, decompose, three-rung seams, remember, findings. Rewrite `REASONER.md` to match. | A goal spanning two recordings binds two segments and runs. |
+| **3. Run by goal, no AI** | Recall on Voyage (name match without a key), `run` picks one flow, safety gate, run documents. | `understudy run myapp "log in"` binds and runs the login flow. **Done 2026-11-18** — see *Phase 3 notes*. |
+| **4. Agent layer** | The seven MCP tools: distill/segments, decompose, three-rung seams, remember, findings. Lessons applied during replay (moved here from phase 3, so lessons are written and read in the same phase), and the 3 remaining destructive signals that need notes. Rewrite `REASONER.md` to match. | A goal spanning two recordings binds two segments and runs. |
 | **5. Extension** | Chrome extension + localhost WebSocket. | Record a flow in your normal Chrome, replay it headless. |
 | **6. Clean up** | Copy the corpus across (one-off script). Rewrite README, write ARCHITECTURE.md, delete BUILDING/PLAN/STATUS/STATUS-HISTORY. | Fresh clone → working in under five minutes. |
 | **7. Hosted (later)** | Memory-only server: anyone points it at their own Mongo URI. No browsers. | Not scheduled. |
@@ -284,7 +284,7 @@ what it replaces.
   `recordings`, `replay`. The CLI remembers an app's base URL in MongoDB's
   `apps` collection (`urls.default`). Everything else returns in phases 2–4.
 - **Not yet back:** `record --after` and replaying a recording that has a
-  prelude (refused with a clear message), and lessons during replay (phase 3).
+  prelude (refused with a clear message), and lessons during replay (phase 4).
 - **Removed:** Bedrock, ONNX embedder, reasoner/distiller adapters, the MCP
   server, `pg`, the schema and migrations, the `db*.sh` scripts, all
   `*-check.ts` scripts, and the core modules that only talked to CockroachDB.
@@ -330,6 +330,31 @@ what it replaces.
   - A replay that lands on an unexpected page still counts as passed (by
     design — a banner shouldn't fail a test), so that path joins the history
     and stops drifting next time. Triage is where someone says "that's a bug".
+
+## Phase 3 notes (2026-11-18)
+
+- **New commands:** `recall <app> "<goal>"` (what memory knows; nothing runs)
+  and `run <app> "<goal>"` (find the flow, safety-check it, run it, record
+  the run). `run --flow <slug>` skips matching; `--dry-run` runs nothing.
+- **Three verdicts, and only one runs:** *known* runs; *unsure* shows the
+  candidates and stops; *unknown* says to record it. Matching is exact name
+  first, then by meaning (Voyage), or by words when no model is configured.
+- **The cutoff, calibrated on real flows** (28 providernow flows, voyage-4-lite,
+  15 differently-worded known goals, 14 plausible goals the app doesn't have):
+  no single score separates them — "download my medical records" (unknown)
+  scored 0.735, above "sign in" (known) at 0.730. What separates them is the
+  lead over the runner-up: right answers lead by 0.09+, unknown goals scatter
+  (≤0.056). Rule: **known if score ≥ 0.78, or ≥ 0.70 and ≥ 0.08 ahead of the
+  next.** All 29 land correctly. Constants are in `src/memory/recall.ts`
+  (`MEANING`) and pinned by `test/recall.test.ts`. A different embedding model
+  needs recalibrating.
+- **Watch this:** on a 2-flow demo corpus, "change my password" came out
+  *unsure*, 0.003 inside the margin. Safe — unsure never runs — but it shows
+  the margin is tuned on a bigger corpus. Re-check once the real corpus is
+  copied in (phase 6).
+- **`replay.ts` not split:** `run` just calls it, so there was no shared piece
+  to extract. Still a candidate for simplifying, not a blocker.
+- **Drift history is per flow**, whether it was started by `replay` or `run`.
 
 ## Decisions (2026-11-18)
 

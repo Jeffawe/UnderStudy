@@ -16,6 +16,8 @@
  * then falls back to matching names.
  */
 
+import 'dotenv/config';
+
 export interface EmbedderConfig {
   url: string;
   model: string;

@@ -18,6 +18,7 @@ import { buildRecording, type RawRecording } from '../core/recording.js';
 import { replay, type ReplayResult } from '../core/replay.js';
 import { saveFlow, recordingFrom } from '../flows/save.js';
 import { recordRun, type RecordedRun } from '../flows/runs.js';
+import { recall, type Recall } from '../memory/recall.js';
 import * as store from '../store/db.js';
 
 const USAGE = `understudy — learn a web app, then test it by intent
@@ -36,8 +37,10 @@ COMMANDS
   replay <hash>         re-run a recording file headless
   replay <app> <flow>   re-run a saved flow; records the run, drift and findings
   findings <app>        what looked broken, most frequent first
+  recall <app> "<goal>" what memory knows about a goal — nothing runs
+  run <app> "<goal>"    find the flow that does the goal, and run it
 
-  Coming back in the rewrite: run by goal, emit, MCP tools (see REWRITE.md).
+  Coming back in the rewrite: emit, MCP tools (see REWRITE.md).
 
 RECORD
   --url <baseUrl>       required the first time you use an app; remembered after
@@ -64,6 +67,14 @@ SAVE
 
 FINDINGS
   --all                 include findings already triaged
+
+RUN
+  --flow <slug>         skip matching and run this flow (for an UNSURE match)
+  --dry-run             say which flow would run, and run nothing
+  plus --value, --headed, --allow-purchases as for replay
+
+RECALL
+  --limit <n>           how many flows and notes to show (default 5)
 
 SETTINGS (.env)
   MONGODB_URI           local Community or your Atlas mongodb+srv:// string
@@ -381,23 +392,92 @@ async function cmdReplay(positional: string[], flags: Flags) {
 }
 
 async function cmdReplayFlow(app: string, slug: string, flags: Flags) {
+  await runSavedFlow(app, slug, flags, { mode: 'replay' });
+}
+
+/**
+ * Run one saved flow: the safety gate, the replay, and recording the run.
+ * Shared by `replay <app> <flow>` and `run <app> "<goal>"`.
+ */
+async function runSavedFlow(app: string, slug: string, flags: Flags, how: { mode: 'replay' | 'run'; goal?: string }) {
   const { flows } = await store.collections();
   const flow = await flows.findOne({ app, slug });
   if (!flow) fail(`no flow '${slug}' for app '${app}'`, `understudy flows ${app}`);
 
+  // The safety gate: a destructive flow does something real every time it runs.
   if (flow.destructive && !flags.has('allow-purchases')) {
     fail(
-      `'${slug}' is marked destructive (${flow.destructiveBecause}) — replaying it may place a real order`,
+      `'${slug}' is marked destructive (${flow.destructiveBecause}) — running it may place a real order`,
       'pass --allow-purchases if that is genuinely fine',
     );
   }
 
-  console.log(`replaying ${app}/${slug} — ${flow.title}\n`);
+  console.log(`running ${app}/${slug} — ${flow.title}\n`);
   const result = await replayWithSession(recordingFrom(flow), flags);
   printReplay(result);
-  const run = await recordRun({ app, flow: slug, result, steps: flow.steps });
+  const run = await recordRun({ app, flow: slug, result, steps: flow.steps, mode: how.mode, ...(how.goal ? { goal: how.goal } : {}) });
   printRunReport(run);
   if (!result.ok) process.exitCode = 3;
+}
+
+// --- recall / run ------------------------------------------------------------
+
+function printRecall(r: Recall) {
+  const verdict = { known: 'KNOWN', unsure: 'UNSURE', unknown: "DON'T KNOW" }[r.verdict];
+  console.log(`${verdict} — ${r.why}  (matched by ${r.method})\n`);
+  if (r.flows.length) {
+    console.log('flows');
+    for (const f of r.flows) {
+      const marks = [f.destructive && 'DESTRUCTIVE', f.requiresSession && 'needs session', f.kind === 'segment' && 'segment'].filter(Boolean).join(', ');
+      console.log(`  ${f.score.toFixed(3)}  ${f.slug.padEnd(32)} ${f.title}${marks ? `  [${marks}]` : ''}`);
+    }
+  }
+  if (r.notes.length) {
+    console.log('\nnotes');
+    for (const n of r.notes) console.log(`  ${n.score.toFixed(3)}  ${n.kind.padEnd(6)} ${n.text.slice(0, 100)}`);
+  }
+}
+
+/** What memory knows about a goal. A database query: no browser, nothing runs. */
+async function cmdRecall(positional: string[], flags: Flags) {
+  const [app, ...goalWords] = positional;
+  if (!app || !goalWords.length) fail('recall needs an app and a goal', 'understudy recall myapp "log in"');
+  printRecall(await recall(app, goalWords.join(' '), { limit: Number(str(flags.get('limit')) ?? 5) }));
+}
+
+/**
+ * Run a goal: find the flow that does it, check it's safe, run it. Only a
+ * KNOWN match runs on its own — an unsure one is shown so you can pick, and an
+ * unknown one is a cue to record it, never a guess.
+ */
+async function cmdRun(positional: string[], flags: Flags) {
+  const [app, ...goalWords] = positional;
+  if (!app || !goalWords.length) fail('run needs an app and a goal', 'understudy run myapp "log in"');
+  const goal = goalWords.join(' ');
+
+  const picked = str(flags.get('flow'));
+  if (picked) return runSavedFlow(app, picked, flags, { mode: 'run', goal });
+
+  const r = await recall(app, goal);
+  printRecall(r);
+
+  if (r.verdict !== 'known' || !r.best) {
+    console.log(
+      r.verdict === 'unsure'
+        ? `\nnot running — no flow is clearly this goal, and it may not be in memory at all.\n` +
+            `  if one of the flows above IS it:  understudy run ${app} "${goal}" --flow <slug>\n` +
+            `  if none is:                       understudy record ${app}`
+        : `\nnot running — nothing in memory does this. Record it: understudy record ${app}`,
+    );
+    process.exitCode = 4;
+    return;
+  }
+  if (flags.has('dry-run')) {
+    console.log(`\ndry run — would run ${r.best.slug}${r.best.destructive ? ' (DESTRUCTIVE: needs --allow-purchases)' : ''}`);
+    return;
+  }
+  console.log();
+  await runSavedFlow(app, r.best.slug, flags, { mode: 'run', goal });
 }
 
 function printReplay(result: ReplayResult) {
@@ -531,6 +611,8 @@ async function main() {
     case 'save': return cmdSave(rest, flags);
     case 'flows': return cmdFlows(rest);
     case 'findings': return cmdFindings(rest, flags);
+    case 'recall': return cmdRecall(rest, flags);
+    case 'run': return cmdRun(rest, flags);
     default: fail(`unknown command '${command}'`, 'understudy --help');
   }
 }
