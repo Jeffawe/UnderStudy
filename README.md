@@ -42,13 +42,14 @@ Community Edition with `mongot` running locally.
 npm install -g @jeffawe/understudy               # 
 npx playwright install --only-shell chromium     # the headless browser replay uses, ~200 MB
 
-understudy config set \
-  MONGODB_URI="mongodb+srv://…" \
-  EMBED_URL=https://api.voyageai.com/v1/embeddings EMBED_MODEL=voyage-4-lite EMBED_KEY="…"
+understudy config set MONGODB_URI="mongodb+srv://…" EMBED_KEY="…"
 ```
 
-That writes `~/.understudy/understudy.env`, readable only by you. Already keep
-your settings in an env file? Point at it instead:
+That writes `~/.understudy/understudy.env`, readable only by you. `EMBED_KEY` is
+a [Voyage](https://www.voyageai.com) API key (200M free tokens); it's optional —
+without one, goals match flow names instead of meaning.
+
+Already keep your settings in an env file? Point at it instead:
 
 ```bash
 understudy config --env-file ~/secrets/understudy.env
@@ -66,12 +67,26 @@ Settings come from, highest first: real environment variables, `--env-file
 | Setting | What it's for |
 |---|---|
 | `MONGODB_URI` | your Atlas `mongodb+srv://…` string, or local Community |
-| `EMBED_URL`, `EMBED_MODEL`, `EMBED_KEY` | optional: match goals by meaning. Any OpenAI-style endpoint: Voyage `voyage-4-lite` is the default (200M free tokens); for free and offline, run [Ollama](https://ollama.com) (`ollama pull mxbai-embed-large`) and set `EMBED_URL=http://localhost:11434/v1/embeddings`, `EMBED_MODEL=mxbai-embed-large`, `EMBED_DIMS=1024`, no key. Without a model, goals match flow names. |
+| `EMBED_KEY` | optional: a Voyage key, to match goals by meaning (`voyage-4-lite`). Using another model? See below. |
 | `UNDERSTUDY_<REF>` | login values. A recording never stores a password: the field is kept as a name like `SECRET.password`, and at replay Understudy reads the value from `UNDERSTUDY_SECRET_PASSWORD`. Or pass it per run (`--value SECRET.password=…`, or `values` from an agent). Exported tests read the same variable. |
 
-> **Another embedding model?** The line between "a flow I know" and "close, but
-> not it" was calibrated on Voyage. Other models score differently, so check a
-> few goals with `understudy recall` (see ROADMAP.md).
+### Using a different embedding model
+
+Voyage is the default, so a key is all it needs. For any other model, also set
+`EMBED_URL` and `EMBED_MODEL` — any endpoint that speaks the OpenAI
+`/v1/embeddings` format works (OpenAI, Mistral, Together, Ollama…) — and
+`EMBED_DIMS` if its vectors aren't 1024 numbers long. Free and offline, with
+[Ollama](https://ollama.com):
+
+```bash
+ollama pull mxbai-embed-large
+understudy config set EMBED_URL=http://localhost:11434/v1/embeddings EMBED_MODEL=mxbai-embed-large EMBED_DIMS=1024
+```
+
+Two things to know: one database holds one model's vectors, so switching later
+means `understudy reembed`; and the line between "a flow I know" and "close,
+but not it" was calibrated on Voyage — other models score differently, so check
+a few goals with `understudy recall` first (see ROADMAP.md).
 
 ## Use it
 

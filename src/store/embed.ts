@@ -12,7 +12,8 @@
  *   EMBED_KEY    API key, if the endpoint needs one
  *   EMBED_DIMS   vector length the model returns (default 1024)
  *
- * Leave EMBED_URL and EMBED_MODEL unset to run with no model at all: search
+ * Just EMBED_KEY, and nothing else, means Voyage's voyage-4-lite — the default.
+ * Set none of them to run with no model at all: search
  * then falls back to matching names.
  */
 
@@ -25,12 +26,21 @@ export interface EmbedderConfig {
   dims: number;
 }
 
-/** The configured embedder, or null if none is set. */
+/** What you get with only EMBED_KEY set: Voyage's cheapest model. */
+export const VOYAGE_DEFAULT = { url: 'https://api.voyageai.com/v1/embeddings', model: 'voyage-4-lite' };
+
+/**
+ * The configured embedder, or null if none is set. Only EMBED_KEY set means
+ * Voyage (the default); a different model needs EMBED_URL and EMBED_MODEL.
+ */
 export function embedderConfig(): EmbedderConfig | null {
-  const url = process.env.EMBED_URL?.trim();
-  const model = process.env.EMBED_MODEL?.trim();
-  if (!url && !model) return null;
-  if (!url || !model) throw new Error('set both EMBED_URL and EMBED_MODEL in .env, or neither');
+  let url = process.env.EMBED_URL?.trim();
+  let model = process.env.EMBED_MODEL?.trim();
+  if (!url && !model) {
+    if (!process.env.EMBED_KEY?.trim()) return null;
+    ({ url, model } = VOYAGE_DEFAULT);
+  }
+  if (!url || !model) throw new Error('set both EMBED_URL and EMBED_MODEL for a non-Voyage model, or neither (just EMBED_KEY means Voyage)');
 
   const dims = Number(process.env.EMBED_DIMS ?? 1024);
   if (!Number.isInteger(dims) || dims <= 0) throw new Error(`EMBED_DIMS must be a positive whole number, got '${process.env.EMBED_DIMS}'`);
@@ -62,7 +72,7 @@ export async function embed(
   purpose: 'query' | 'document',
   cfg: EmbedderConfig | null = embedderConfig(),
 ): Promise<number[][]> {
-  if (!cfg) throw new Error('no embedding model configured — set EMBED_URL and EMBED_MODEL in .env');
+  if (!cfg) throw new Error('no embedding model configured — set EMBED_KEY (Voyage), or EMBED_URL and EMBED_MODEL for another model');
   const out: number[][] = [];
   for (let i = 0; i < texts.length; i += BATCH) {
     out.push(...(await embedBatch(texts.slice(i, i + BATCH), purpose, cfg)));

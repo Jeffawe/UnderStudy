@@ -19,6 +19,7 @@ process.env.MONGODB_DB = 'understudy_test';
 // Start with no embedding model, whatever .env says: these tests supply vectors by hand.
 process.env.EMBED_URL = '';
 process.env.EMBED_MODEL = '';
+process.env.EMBED_KEY = ''; // otherwise a key alone would mean Voyage
 delete process.env.EMBED_DIMS;
 const EMBED_DIMS = 1024;
 

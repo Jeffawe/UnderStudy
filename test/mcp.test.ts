@@ -22,7 +22,7 @@ before(async () => {
     command: process.execPath,
     args: ['--import', 'tsx', 'src/entry/mcp.ts'],
     env: {
-      ...process.env, MONGODB_DB: DB, EMBED_URL: '', EMBED_MODEL: '',
+      ...process.env, MONGODB_DB: DB, EMBED_URL: '', EMBED_MODEL: '', EMBED_KEY: '',
       UNDERSTUDY_RECORDINGS_DIR: recordings,
       // A login value from settings, the way a user would set it — never through the chat.
       UNDERSTUDY_SECRET_PASSWORD: 'not-a-real-password',

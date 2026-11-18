@@ -13,7 +13,7 @@ import { embed, embedderConfig } from './embed.js';
 
 export async function reembed(): Promise<{ flows: number; notes: number; model: string }> {
   const cfg = embedderConfig();
-  if (!cfg) throw new Error('no embedding model configured — set EMBED_URL and EMBED_MODEL in .env first');
+  if (!cfg) throw new Error('no embedding model configured — set EMBED_KEY (Voyage), or EMBED_URL and EMBED_MODEL for another model');
 
   const c = await collections();
   // Record the new model first, so ensureSchema accepts it and resizes the indexes.

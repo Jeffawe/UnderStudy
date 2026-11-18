@@ -209,7 +209,7 @@ async function cmdDoctor() {
   const { embedderConfig, embed } = await import('../store/embed.js');
   const cfg = embedderConfig();
   if (!cfg) {
-    console.log('embedder   none configured — search will match names only (set EMBED_URL + EMBED_MODEL)');
+    console.log('embedder   none configured — search will match names only (set EMBED_KEY for Voyage)');
   } else {
     const [v] = await embed(['understudy doctor'], 'query', cfg);
     console.log(`embedder   ${cfg.model} at ${new URL(cfg.url).host} — ok, ${v!.length} numbers per vector`);
@@ -314,8 +314,9 @@ async function cmdConfig(positional: string[], flags: Flags) {
   console.log(`env file      ${cfg.envFile ?? 'none saved — use --env-file <path> or `config set`'}`);
   console.log(`read now      ${loadedFrom.length ? loadedFrom.join(', ') : 'no env files (only the environment)'}`);
   console.log(`MONGODB_URI   ${process.env.MONGODB_URI ? store.describeUri() : 'not set'}`);
-  console.log(`EMBED_URL     ${process.env.EMBED_URL || 'not set (goals match flow names, not meaning)'}`);
-  console.log(`EMBED_MODEL   ${process.env.EMBED_MODEL || 'not set'}`);
+  const defaulted = !process.env.EMBED_URL && !process.env.EMBED_MODEL && process.env.EMBED_KEY;
+  console.log(`EMBED_URL     ${process.env.EMBED_URL || (defaulted ? 'not set — Voyage, the default' : 'not set (goals match flow names, not meaning)')}`);
+  console.log(`EMBED_MODEL   ${process.env.EMBED_MODEL || (defaulted ? 'not set — voyage-4-lite, the default' : 'not set')}`);
   console.log(`EMBED_KEY     ${shown('EMBED_KEY')}`);
   const logins = Object.keys(process.env).filter((k) => k.startsWith('UNDERSTUDY_') && !['UNDERSTUDY_HOME'].includes(k) && !k.endsWith('_DIR'));
   console.log(`login values  ${logins.length ? logins.join(', ') : 'none (a recording\'s SECRET.password reads UNDERSTUDY_SECRET_PASSWORD)'}`);

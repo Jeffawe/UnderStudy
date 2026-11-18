@@ -51,8 +51,12 @@ test('only Voyage gets input_type', async () => {
 test('reads its settings from the environment', () => {
   const saved = { ...process.env };
   try {
-    process.env.EMBED_URL = ''; process.env.EMBED_MODEL = '';
+    process.env.EMBED_URL = ''; process.env.EMBED_MODEL = ''; process.env.EMBED_KEY = '';
     assert.equal(embedderConfig(), null, 'nothing set → no model, names only');
+
+    process.env.EMBED_KEY = 'k';
+    assert.deepEqual(embedderConfig(), { url: 'https://api.voyageai.com/v1/embeddings', model: 'voyage-4-lite', dims: 1024, key: 'k' }, 'just a key → Voyage');
+    process.env.EMBED_KEY = '';
 
     process.env.EMBED_URL = 'https://api.voyageai.com/v1/embeddings';
     assert.throws(() => embedderConfig(), /both EMBED_URL and EMBED_MODEL/);

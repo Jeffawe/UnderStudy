@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 process.env.MONGODB_DB = 'understudy_test_e2e';
 process.env.EMBED_URL = '';
 process.env.EMBED_MODEL = '';
+process.env.EMBED_KEY = ''; // otherwise a key alone would mean Voyage
 
 const { connect, close, collections } = await import('../src/store/db.js');
 const { saveFlow, recordingFrom } = await import('../src/flows/save.js');
