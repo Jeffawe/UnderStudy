@@ -252,7 +252,7 @@ what it replaces.
 |---|---|---|
 | **0. Spike** | Connect to local Community + your Atlas free cluster. Create both vector indexes, embed via Voyage, query with `app` filter. | Same test passes on both URIs. **Done 2026-11-18.** Local: `npm test` + `doctor`. Atlas: `doctor` + a real Voyage search, same rankings and scores as local. See *What phase 0 taught us*. |
 | **1. Store** | `src/store/`: types for the six collections, connect from `MONGODB_URI`, create indexes on first run. Delete Cockroach + Bedrock + ONNX code. | `understudy doctor` reports a healthy connection on both URIs. **Done 2026-11-18** — see *Phase 1 notes*. |
-| **2. Record & replay, no AI** | Player, `save`, `replay`, `flows`. Live recorder + script import ported. | Record login on a test app, replay it, see drift and findings. No key, no agent. |
+| **2. Record & replay, no AI** | Player, `save`, `replay`, `flows`. Live recorder + script import ported. | Record login on a test app, replay it, see drift and findings. No key, no agent. **Done 2026-11-18** — see *Phase 2 notes*. |
 | **3. Run by goal, no AI** | Recall on Voyage (name match without a key), `run` picks one flow, safety gate, run documents. | `understudy run myapp "log in"` binds and runs the login flow. |
 | **4. Agent layer** | The seven MCP tools: distill/segments, decompose, three-rung seams, remember, findings. Rewrite `REASONER.md` to match. | A goal spanning two recordings binds two segments and runs. |
 | **5. Extension** | Chrome extension + localhost WebSocket. | Record a flow in your normal Chrome, replay it headless. |
@@ -300,6 +300,36 @@ what it replaces.
 - **Known replay failure, not a regression:** old saucedemo recordings predate
   `testIdAttr`, so a bare `data-test` id like `shopping-cart-link` matches
   nothing. Re-record or re-import them.
+
+## Phase 2 notes (2026-11-18)
+
+- **New commands:** `save <hash> "<name>"` (replays to prove it, refuses if it
+  fails unless `--force`), `flows <app>`, `replay <app> <flow>`,
+  `findings <app>`. `replay <hash>` still runs an unsaved recording file.
+- **New code, `src/flows/`:** `save.ts` (recording → flow document, flow →
+  recording), `runs.ts` (every saved-flow replay records a run, findings,
+  drift and pages), `drift.ts` + `findings.ts` (ported, pure), and
+  `destructive.ts` (2 of the old 5 signals — the 3 that need stored knowledge
+  come with the phase 3 safety gate).
+- **Fixed on the way:** the destructive check now only looks at clicks and key
+  presses. The old one judged every step, so a "Confirm password" field marked
+  a whole signup flow destructive.
+- **A destructive flow is refused by `replay`** unless `--allow-purchases`.
+- **Tests:** `test/fixture-app.ts` is a tiny local shop (log in → shop → cart)
+  with switches to add a promo page or break the cart, so the end-to-end test
+  never depends on a public site. 17 tests, ~30s.
+- **Not done here, on purpose:** `replay.ts` is still the old 1,100-line
+  player. It works, so splitting it is deferred to when the runner (phase 3)
+  needs to reuse its pieces — not done for its own sake.
+- **Small things noticed:**
+  - One unexpected page currently raises two findings (the step's
+    unexpected page + the path drift). Consider folding them into one.
+  - `import` turns `process.env.X!` into a value reference named literally
+    `process.env.X!`. It works (`--value 'process.env.X!=…'`) but should
+    become a clean name like `ENV.X`.
+  - A replay that lands on an unexpected page still counts as passed (by
+    design — a banner shouldn't fail a test), so that path joins the history
+    and stops drifting next time. Triage is where someone says "that's a bug".
 
 ## Decisions (2026-11-18)
 

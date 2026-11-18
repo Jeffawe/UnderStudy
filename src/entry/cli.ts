@@ -15,7 +15,9 @@ import { parseScript } from '../adapters/recorder/script.js';
 import { listRecordings, loadRecording, saveRecording } from '../core/recording-store.js';
 import { loadSession, saveSession, forgetSession, type StorageState } from '../core/auth-cache.js';
 import { buildRecording, type RawRecording } from '../core/recording.js';
-import { replay } from '../core/replay.js';
+import { replay, type ReplayResult } from '../core/replay.js';
+import { saveFlow, recordingFrom } from '../flows/save.js';
+import { recordRun, type RecordedRun } from '../flows/runs.js';
 import * as store from '../store/db.js';
 
 const USAGE = `understudy — learn a web app, then test it by intent
@@ -29,9 +31,13 @@ COMMANDS
   record <app>          capture a flow in a headed browser
   import <app> <file>   read an existing Playwright script into a recording
   recordings [app]      list captured recordings
-  replay <hash>         re-run a recording headless, verify it, capture signals
+  save <hash> "<name>"  prove a recording by replaying it, then save it as a flow
+  flows <app>           list an app's saved flows and how each last ran
+  replay <hash>         re-run a recording file headless
+  replay <app> <flow>   re-run a saved flow; records the run, drift and findings
+  findings <app>        what looked broken, most frequent first
 
-  Coming back in the rewrite: save, run, flows, findings, emit (see REWRITE.md).
+  Coming back in the rewrite: run by goal, emit, MCP tools (see REWRITE.md).
 
 RECORD
   --url <baseUrl>       required the first time you use an app; remembered after
@@ -45,10 +51,19 @@ IMPORT
   --url <baseUrl>       resolves goto('/') when the script relies on a baseURL
   --until <n>           keep only the first n steps (stop before a real purchase)
 
-REPLAY
+REPLAY and SAVE
   --value REF=value     supply a value the recording deliberately doesn't store,
                         e.g. --value SECRET.password=hunter2 (repeatable)
   --headed              watch it replay
+  --allow-purchases     replay a flow marked destructive (refused by default)
+
+SAVE
+  --slug <name>         the flow's short name (default: made from the name)
+  --intent <text>       what the flow is for, if different from its name
+  --force               save even though the proving replay failed
+
+FINDINGS
+  --all                 include findings already triaged
 
 SETTINGS (.env)
   MONGODB_URI           local Community or your Atlas mongodb+srv:// string
@@ -314,10 +329,12 @@ async function sessionForRecording(recording: RawRecording, values: Record<strin
   return cached.storageState;
 }
 
-async function cmdReplay(positional: string[], flags: Flags) {
-  const hash = positional[0] ?? fail('replay needs a recording hash', 'understudy recordings');
-  const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`, 'understudy recordings'));
-
+/**
+ * Replay a recording, with everything around it: say which values are missing,
+ * restore a saved session if it needs one, and drop that session if it turned
+ * out to be stale. Shared by `replay` and `save`.
+ */
+async function replayWithSession(recording: RawRecording, flags: Flags): Promise<ReplayResult> {
   if (recording.entry?.prelude?.length) {
     fail(
       `this recording starts after other flows (${recording.entry.prelude.join(' -> ')}), and preludes are parked in the rewrite`,
@@ -328,7 +345,7 @@ async function cmdReplay(positional: string[], flags: Flags) {
   const values = valuesFromFlags(flags);
   const needed = recording.events.filter((e) => e.valueRef && !(e.valueRef in values));
   if (needed.length) {
-    console.log(`this recording needs ${needed.length} value(s) it deliberately does not store:`);
+    console.log(`this needs ${needed.length} value(s) that are deliberately not stored:`);
     for (const e of needed) console.log(`  --value ${e.valueRef}=…`);
     console.log('');
   }
@@ -349,7 +366,41 @@ async function cmdReplay(positional: string[], flags: Flags) {
     console.log(`  expected ${entry.unexpectedPage.expected}, saw ${entry.unexpectedPage.observed}`);
     console.log('  re-record with --arm-manually to refresh it.\n');
   }
+  return result;
+}
 
+/** `replay <hash>` runs a recording file; `replay <app> <flow>` runs a saved flow and records the run. */
+async function cmdReplay(positional: string[], flags: Flags) {
+  if (positional.length >= 2) return cmdReplayFlow(positional[0]!, positional[1]!, flags);
+
+  const hash = positional[0] ?? fail('replay needs a recording hash, or an app and a flow', 'understudy recordings · understudy flows <app>');
+  const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`, 'understudy recordings'));
+  const result = await replayWithSession(recording, flags);
+  printReplay(result);
+  if (!result.ok) process.exitCode = 3;
+}
+
+async function cmdReplayFlow(app: string, slug: string, flags: Flags) {
+  const { flows } = await store.collections();
+  const flow = await flows.findOne({ app, slug });
+  if (!flow) fail(`no flow '${slug}' for app '${app}'`, `understudy flows ${app}`);
+
+  if (flow.destructive && !flags.has('allow-purchases')) {
+    fail(
+      `'${slug}' is marked destructive (${flow.destructiveBecause}) — replaying it may place a real order`,
+      'pass --allow-purchases if that is genuinely fine',
+    );
+  }
+
+  console.log(`replaying ${app}/${slug} — ${flow.title}\n`);
+  const result = await replayWithSession(recordingFrom(flow), flags);
+  printReplay(result);
+  const run = await recordRun({ app, flow: slug, result, steps: flow.steps });
+  printRunReport(run);
+  if (!result.ok) process.exitCode = 3;
+}
+
+function printReplay(result: ReplayResult) {
   console.log(`replay ${result.ok ? 'PASSED' : 'FAILED'} in ${(result.durationMs / 1000).toFixed(1)}s\n`);
   for (const s of result.steps) {
     const notes = [
@@ -368,7 +419,86 @@ async function cmdReplay(positional: string[], flags: Flags) {
       console.log(`  [step ${g.duringStep}] ${g.kind}${g.status ? ' ' + g.status : ''}  ${g.text.slice(0, 90)}`);
     }
   }
-  if (!result.ok) process.exitCode = 3;
+}
+
+/** What recording the run added: drift against earlier runs, and findings. */
+function printRunReport(run: RecordedRun) {
+  const { drift } = run;
+  if (drift.firstRun) console.log('\ndrift    first passed run — this path is now the baseline');
+  else if (!drift.changed) console.log('\ndrift    same path as recent runs');
+  else {
+    console.log('\ndrift    PATH CHANGED');
+    for (const s of drift.added) console.log(`  new      ${s}`);
+    for (const s of drift.removed) console.log(`  gone     ${s}`);
+    for (const s of drift.stateChanged) console.log(`  state    ${s}`);
+  }
+  console.log(`findings ${run.findings.length ? `${run.findings.length} raised or seen again (understudy findings <app>)` : 'none'}`);
+  console.log(`run      ${run.runId.toHexString()}`);
+}
+
+// --- save / flows / findings -------------------------------------------------
+
+/**
+ * Prove a recording by replaying it, then save it as a flow. A recording that
+ * doesn't replay cleanly is refused — memory only holds flows known to work.
+ */
+async function cmdSave(positional: string[], flags: Flags) {
+  const [hash, ...titleWords] = positional;
+  if (!hash || !titleWords.length) {
+    fail('save needs a recording hash and a name', 'understudy save <hash> "log in as a member"');
+  }
+  const title = titleWords.join(' ');
+  const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`, 'understudy recordings'));
+
+  console.log(`proving ${hash} by replaying it…\n`);
+  const result = await replayWithSession(recording, flags);
+  printReplay(result);
+  if (!result.ok && !flags.has('force')) {
+    console.error('\nnot saved — the recording did not replay cleanly. Fix it, or re-record.');
+    process.exitCode = 3;
+    return;
+  }
+
+  const slug = str(flags.get('slug'));
+  const intent = str(flags.get('intent'));
+  const flow = await saveFlow(recording, result, { title, ...(slug ? { slug } : {}), ...(intent ? { intent } : {}) });
+  const run = await recordRun({ app: flow.app, flow: flow.slug, result, steps: flow.steps });
+
+  console.log(`\nsaved    ${flow.app}/${flow.slug}  (${flow.steps.length} steps${flow.embedding ? ', searchable by meaning' : ''})`);
+  if (flow.destructive) console.log(`         DESTRUCTIVE — ${flow.destructiveBecause}. Replays need --allow-purchases.`);
+  printRunReport(run);
+  console.log(`\nreplay it any time:  understudy replay ${flow.app} ${flow.slug}`);
+}
+
+async function cmdFlows(positional: string[]) {
+  const app = positional[0] ?? fail('flows needs an app name', 'understudy flows myapp');
+  const { flows, runs } = await store.collections();
+  const rows = await flows.find({ app }, { projection: { embedding: 0, steps: 0 } }).sort({ slug: 1 }).toArray();
+  if (!rows.length) {
+    console.log(`no flows for '${app}' yet — record one, then \`understudy save <hash> "<name>"\``);
+    return;
+  }
+  for (const f of rows) {
+    const last = await runs.find({ app, plan: [f.slug] }).sort({ startedAt: -1 }).limit(1).next();
+    const status = last ? `${last.status} ${last.startedAt.toISOString().slice(0, 16).replace('T', ' ')}` : 'never run';
+    const marks = [f.destructive && 'DESTRUCTIVE', f.requiresSession && 'needs session', f.kind === 'segment' && 'segment']
+      .filter(Boolean).join(', ');
+    console.log(`  ${f.slug.padEnd(32)} ${status.padEnd(24)} ${f.title}${marks ? `  [${marks}]` : ''}`);
+  }
+}
+
+async function cmdFindings(positional: string[], flags: Flags) {
+  const app = positional[0] ?? fail('findings needs an app name', 'understudy findings myapp');
+  const { findings } = await store.collections();
+  const filter = flags.has('all') ? { app } : { app, status: 'open' as const };
+  const rows = await findings.find(filter).sort({ occurrences: -1, lastSeen: -1 }).limit(50).toArray();
+  if (!rows.length) {
+    console.log(flags.has('all') ? `no findings for '${app}'` : `no open findings for '${app}' (--all to include triaged ones)`);
+    return;
+  }
+  for (const f of rows) {
+    console.log(`  ${f.severity.padEnd(6)} ×${String(f.occurrences).padEnd(4)} ${f.kind.padEnd(14)} ${f.statement.slice(0, 110)}`);
+  }
 }
 
 // --- recordings --------------------------------------------------------------
@@ -398,6 +528,9 @@ async function main() {
     case 'import': return cmdImport(rest, flags);
     case 'recordings': return cmdRecordings(rest);
     case 'replay': return cmdReplay(rest, flags);
+    case 'save': return cmdSave(rest, flags);
+    case 'flows': return cmdFlows(rest);
+    case 'findings': return cmdFindings(rest, flags);
     default: fail(`unknown command '${command}'`, 'understudy --help');
   }
 }

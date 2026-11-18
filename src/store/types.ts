@@ -49,6 +49,18 @@ export interface Flow {
   destructive: boolean;
   /** Where a capture deliberately stops, and why. Read by whoever picks it up next. */
   corrections: string[];
+  /** Why it was marked destructive, e.g. 'commit-shaped control "Place order"'. */
+  destructiveBecause?: string;
+  /** The recording this flow was saved from (its hash), so it can be traced back. */
+  recording: string;
+  /** Where replay starts. */
+  startUrl: string;
+  /** True if the first step needs a signed-in browser (recorded with --arm-manually). */
+  requiresSession: boolean;
+  /** Page fingerprint before the first step / after the last — how flows join up. */
+  startState?: string;
+  endState?: string;
+  /** Each step's `expectedSig` is the page seen after it when the flow was proven. */
   steps: Step[];
   /** The text that gets embedded and searched: title + intent + outcome. */
   searchText: string;
@@ -63,7 +75,6 @@ export interface Page {
   /** sig(): `<url pattern>#<8 hex>`. */
   sig: string;
   urlPattern: string;
-  title: string;
   /** Known ways out of this page. */
   links: { to: string; via: { role: string; name: string } }[];
   firstSeen: Date;
@@ -134,10 +145,15 @@ export interface Run {
   status: 'running' | 'waiting' | 'passed' | 'failed' | 'blocked';
   /** The flow slugs bound, in order. */
   plan: string[];
+  /** One line per step: what it did and where it ended up. */
+  steps: { seq: number; action: string; ok: boolean; sig?: string; error?: string }[];
   /** The page fingerprints actually passed through — compared across runs for drift. */
   sigSequence: string[];
-  /** Console errors, failed requests, non-2xx responses. */
+  /** Console errors, failed requests, non-2xx responses (first 200). */
   events: Record<string, unknown>[];
+  /** Fingerprints of the findings this run raised. */
+  findings: string[];
+  durationMs: number;
   /** Set while status is 'waiting': the question the agent must answer. */
   question?: Record<string, unknown>;
   startedAt: Date;

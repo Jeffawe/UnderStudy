@@ -1,0 +1,123 @@
+/**
+ * Phase 2, end to end, with no AI: a recording of logging in and opening the
+ * cart is proven by replay, saved as a flow, and replayed from MongoDB. Then
+ * the app changes, and drift and findings notice.
+ *
+ * Needs local MongoDB (MONGODB_URI) and Playwright's Chromium. Uses its own
+ * database, emptied afterwards.
+ */
+
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+
+process.env.MONGODB_DB = 'understudy_test_e2e';
+process.env.EMBED_URL = '';
+process.env.EMBED_MODEL = '';
+
+const { connect, close, collections } = await import('../src/store/db.js');
+const { saveFlow, recordingFrom } = await import('../src/flows/save.js');
+const { recordRun } = await import('../src/flows/runs.js');
+const { replay } = await import('../src/core/replay.js');
+const { buildRecording } = await import('../src/core/recording.js');
+import { startFixtureApp, type FixtureApp } from './fixture-app.js';
+
+let shop: FixtureApp;
+const values = { 'SECRET.password': 'not-a-real-password' };
+
+async function wipe() {
+  const d = await connect();
+  for (const c of await d.listCollections({}, { nameOnly: true }).toArray()) await d.collection(c.name).drop();
+}
+
+before(async () => {
+  shop = await startFixtureApp();
+  await wipe();
+});
+after(async () => {
+  try { await wipe(); } finally { await close(); await shop.close(); }
+});
+
+/** What `understudy record` would capture: sign in, then open the cart. */
+function recordingOfLoginAndCart() {
+  const u = shop.url;
+  return buildRecording({ source: 'live', origin: 'test', appSlug: 'shop', startUrl: u }, [
+    { seq: 0, ts: 0, action: 'goto', url: u, resolution: 'synthesized' },
+    { seq: 1, ts: 1, action: 'fill', role: 'textbox', name: 'Username', value: 'demo', url: u, resolution: 'accname' },
+    { seq: 2, ts: 2, action: 'fill', role: 'textbox', name: 'Password', valueRef: 'SECRET.password', url: u, resolution: 'accname' },
+    { seq: 3, ts: 3, action: 'click', role: 'button', name: 'Log in', url: u, resolution: 'accname' },
+    { seq: 4, ts: 4, action: 'click', role: 'link', name: 'Cart', url: `${u}shop`, resolution: 'accname' },
+  ]);
+}
+
+/** What `understudy replay shop <flow>` does. */
+async function replayFlow(slug: string) {
+  const { flows } = await collections();
+  const flow = (await flows.findOne({ app: 'shop', slug }))!;
+  const result = await replay(recordingFrom(flow), { values });
+  const run = await recordRun({ app: 'shop', flow: slug, result, steps: flow.steps });
+  return { result, run };
+}
+
+test('save → replay → drift and findings', { timeout: 180_000 }, async () => {
+  // 1. Prove the recording, save it, record that first run (what `understudy save` does).
+  const recording = recordingOfLoginAndCart();
+  const proof = await replay(recording, { values });
+  assert.equal(proof.ok, true, `proving replay failed: ${JSON.stringify(proof.steps.filter((s) => !s.ok))}`);
+
+  const flow = await saveFlow(recording, proof, { title: 'Open the cart' });
+  assert.equal(flow.slug, 'open-the-cart');
+  assert.equal(flow.destructive, false);
+  assert.equal(flow.steps.length, 5);
+  assert.ok(flow.steps.every((s) => s.action === 'goto' || s.expectedSig), 'each step remembers the page it reached');
+  assert.equal(JSON.stringify(flow).includes(values['SECRET.password']), false, 'the password is not stored');
+  const first = await recordRun({ app: 'shop', flow: flow.slug, result: proof, steps: flow.steps });
+  assert.equal(first.drift.firstRun, true);
+
+  // 2. Replay from memory, app unchanged: same path, nothing wrong.
+  const same = await replayFlow('open-the-cart');
+  assert.equal(same.result.ok, true);
+  assert.equal(same.run.drift.changed, false);
+  assert.equal(same.run.findings.length, 0);
+
+  // 3. The app ships a promo page in front of the cart, and breaks the cart.
+  shop.set({ promo: true, broken: true });
+  const changed = await replayFlow('open-the-cart');
+  assert.equal(changed.run.drift.changed, true, 'the new path is noticed');
+  assert.ok(changed.run.drift.added.some((s) => s.startsWith('/promo')), `promo page reported as new: ${JSON.stringify(changed.run.drift)}`);
+  const kinds = changed.run.findings.map((f) => f.kind);
+  assert.ok(kinds.includes('flow_drift'), `drift became a finding: ${kinds}`);
+
+  // 4. Cart directly broken (no promo): console error and the 500 become findings.
+  shop.set({ promo: false, broken: true });
+  const broken = await replayFlow('open-the-cart');
+  const brokenKinds = broken.run.findings.map((f) => f.kind);
+  assert.ok(brokenKinds.includes('console_error'), `console error found: ${brokenKinds}`);
+  assert.ok(brokenKinds.includes('network_error'), `500 found: ${brokenKinds}`);
+
+  // 5. Run it broken again: same findings, more occurrences — not duplicates.
+  await replayFlow('open-the-cart');
+  const { findings, runs, pages } = await collections();
+  const net = await findings.find({ app: 'shop', kind: 'network_error' }).toArray();
+  assert.equal(net.length, 1);
+  assert.equal(net[0]!.occurrences, 2);
+  assert.equal(net[0]!.severity, 'high');
+
+  // Everything was recorded.
+  assert.equal(await runs.countDocuments({ app: 'shop', plan: ['open-the-cart'] }), 5);
+  const shopPage = await pages.findOne({ app: 'shop', urlPattern: '/shop' });
+  assert.ok(shopPage?.links.some((l) => l.via.name === 'Cart'), 'the page map knows Cart leads on from /shop');
+});
+
+test('a destructive flow is marked on save', { timeout: 60_000 }, async () => {
+  const u = shop.url;
+  const recording = buildRecording({ source: 'live', origin: 'test', appSlug: 'shop', startUrl: u }, [
+    { seq: 0, ts: 0, action: 'goto', url: u, resolution: 'synthesized' },
+    { seq: 1, ts: 1, action: 'click', role: 'button', name: 'Place order', url: u, resolution: 'accname' },
+  ]);
+  // Not replayed: saveFlow trusts the caller to have proven it, and marking
+  // reads only the steps.
+  const fake = { ok: true, steps: [], sigSequence: [], signals: [], durationMs: 0 } as unknown as Parameters<typeof saveFlow>[1];
+  const flow = await saveFlow(recording, fake, { title: 'Buy it' });
+  assert.equal(flow.destructive, true);
+  assert.match(flow.destructiveBecause!, /Place order/);
+});
