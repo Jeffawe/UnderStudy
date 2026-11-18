@@ -82,3 +82,31 @@ test('flow ↔ recording round trip keeps the steps and records what each step s
 
   assert.equal(slugify('Log in as a Member!'), 'log-in-as-a-member');
 });
+
+test('emit: Playwright and Cypress, credentials from the environment, positions kept', async () => {
+  const { emitFlow } = await import('../src/flows/emit.js');
+  const now = new Date();
+  const flow = {
+    app: 'shop', slug: 'log-in', title: 'Log in', intent: 'sign in', kind: 'recording', preconditions: [], outcome: '',
+    destructive: false, corrections: [], recording: 'x', startUrl: url, requiresSession: false, searchText: '', createdAt: now, updatedAt: now,
+    steps: [
+      { action: 'goto', value: url, url, resolution: 'synthesized' },
+      { action: 'fill', role: 'textbox', name: 'Password', valueRef: 'SECRET.password', url, resolution: 'accname' },
+      { action: 'fill', css: 'div.code input', value: '5', hints: { nth: 1 }, url, resolution: 'accname' },
+      { action: 'click', testId: 'go', testIdAttr: 'data-test', url, resolution: 'accname' },
+    ],
+  } as unknown as Flow;
+
+  const pw = emitFlow(flow);
+  assert.match(pw.code, /await page\.goto\('https:\/\/shop\.test\/'\);/);
+  assert.match(pw.code, /getByRole\('textbox', \{ name: 'Password' \}\)\.fill\(SECRET_PASSWORD\)/);
+  assert.match(pw.code, /const SECRET_PASSWORD = process\.env\.SECRET_PASSWORD/);
+  assert.match(pw.code, /locator\('div\.code input'\)\.nth\(1\)\.fill\('5'\)/, 'which of several matching boxes is kept');
+  assert.match(pw.code, /locator\('\[data-test="go"\]'\)\.click\(\)/);
+  assert.deepEqual(pw.requiredValues, ['SECRET.password']);
+
+  const cy = emitFlow(flow, 'cypress-js');
+  assert.match(cy.code, /cy\.visit\('https:\/\/shop\.test\/'\);/);
+  assert.match(cy.code, /cy\.get\('div\.code input'\)\.eq\(1\)\.type\('5'\)/);
+  assert.ok(cy.warnings.some((w) => /Cypress can't express/.test(w)), 'role + name loss is said out loud');
+});

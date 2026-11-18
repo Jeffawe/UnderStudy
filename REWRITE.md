@@ -256,7 +256,7 @@ what it replaces.
 | **3. Run by goal, no AI** | Recall on Voyage (name match without a key), `run` picks one flow, safety gate, run documents. | `understudy run myapp "log in"` binds and runs the login flow. **Done 2026-11-18** — see *Phase 3 notes*. |
 | **4. Agent layer** | The seven MCP tools: distill/segments, decompose, three-rung seams, remember, findings. Lessons applied during replay (moved here from phase 3, so lessons are written and read in the same phase), and the 3 remaining destructive signals that need notes. Rewrite `REASONER.md` to match. | A goal spanning two recordings binds two segments and runs. **Done 2026-11-18** — see *Phase 4 notes*. |
 | **5. Extension** | Chrome extension + localhost WebSocket. | Record a flow in your normal Chrome, replay it headless. **Done 2026-11-18** — see *Phase 5 notes*. |
-| **6. Clean up** | Copy the corpus across (one-off script). Rewrite README, write ARCHITECTURE.md, delete BUILDING/PLAN/STATUS/STATUS-HISTORY. | Fresh clone → working in under five minutes. |
+| **6. Clean up** | Copy the corpus across (one-off script). Rewrite README, write ARCHITECTURE.md, delete BUILDING/PLAN/STATUS/STATUS-HISTORY. | Fresh clone → working in under five minutes. **Done 2026-11-18** — see *Phase 6 notes*. |
 | **7. Hosted (later)** | Memory-only server: anyone points it at their own Mongo URI. No browsers. | Not scheduled. |
 
 ## What phase 0 taught us (2026-11-18)
@@ -427,6 +427,45 @@ what it replaces.
 - **Not automated:** clicking the toolbar button itself — Playwright can't. The
   test drives the extension's background worker, which is what the popup
   messages. Worth one manual try in your Chrome.
+
+## Phase 6 notes (2026-11-18)
+
+- **The old corpus is in MongoDB** (local `understudy` database), copied by a
+  one-off script from `.understudy/export/` and then thrown away, as decided.
+  providernow: 28 flows (23 segments), 31 facts (4 mark a control
+  destructive), 15 lessons with their counters, 53 pages with 121 links, 55
+  findings; saucedemo: 1 flow, 2 facts, 9 pages, 4 findings. All 77 texts
+  embedded in one Voyage request.
+  - **Left behind on purpose:** the 5 mined macros (never bind targets), 30
+    crawler-generated "page X has these controls" facts (the old planner hid
+    them too), 3 visual-checkpoint steps (visual diffing is parked), and run
+    history (drift starts fresh: each flow's first replay is its baseline).
+  - **Reshaped:** old steps had no URL, so each step's page is rebuilt from
+    the page the step before it reached. "Exploration refused to click X"
+    facts became one destructive marker per control (`marksDestructive`).
+    Finding statuses mapped `wontfix→noise`, `triaged_issue→issue`,
+    `triaged_lesson→lesson`.
+  - Only the local database got the copy. The one-off script lived in the
+    session scratchpad, not the repo; putting the corpus on Atlas means
+    re-running it with Atlas's `MONGODB_URI` (it replaces what it copied, so
+    re-running is safe).
+- **The "known" cutoff holds on the real corpus**, through MongoDB's vector
+  search this time: **29/29** (all 15 known goals run; of the 14 unknown, 12
+  are *unknown* and 2 *unsure* — none run). Closest known: "sign in" 0.732,
+  +0.110 ahead. Closest unknown: "download my medical records" 0.740, +0.035.
+- **The old end-to-end proof passes on the new code:** `run providernow "start
+  a weight loss plan" --sub-goal "log in as a member" --sub-goal "choose the
+  weight loss service" --dry-run` binds two segments from different recordings
+  and bridges them by navigating to /overview.
+- **`emit` is back** (`src/flows/emit.ts`, Playwright and Cypress). Fixed on the
+  way: the old emitter dropped `hints.nth`, so the six boxes of a one-time code
+  — one shared selector, told apart only by position — all printed as the
+  first box. It now narrows exactly as replay does (text filter, then position).
+- **Extension:** "I'm signed in here" is remembered per site, and a signed-in
+  recording made without it now fails `save` with a hint saying so.
+- **Docs:** README and `ARCHITECTURE.md` rewritten for the new version.
+  `BUILDING`, `PLAN`, `STATUS`, `STATUS-HISTORY` were local-only (gitignored),
+  so they're archived in `.understudy/legacy-docs/`, not deleted.
 
 ## After the rewrite
 

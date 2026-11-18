@@ -30,6 +30,12 @@ async function refresh() {
   } else {
     show(`Ready to record "${s.cli.app}".`);
     $('startPane').hidden = false;
+    // Remembered per site: on your own app you tick it once.
+    const tab = await activeTab();
+    if (tab?.url && /^https?:/.test(tab.url)) {
+      const key = `signedIn:${new URL(tab.url).origin}`;
+      $('signedIn').checked = Boolean((await chrome.storage.local.get(key))[key]);
+    }
   }
 }
 
@@ -41,6 +47,7 @@ $('start').addEventListener('click', async () => {
   const allowed = await chrome.permissions.request({ origins: [origin] }).catch(() => false);
   if (!allowed) return show('Understudy needs access to this site to record it.', 'err');
   $('start').disabled = true;
+  await chrome.storage.local.set({ [`signedIn:${new URL(tab.url).origin}`]: $('signedIn').checked });
   const r = await send({ type: 'understudy:start', tabId: tab.id, signedIn: $('signedIn').checked });
   $('start').disabled = false;
   if (!r.ok) return show(r.error, 'err');

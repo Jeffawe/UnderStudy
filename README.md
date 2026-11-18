@@ -1,89 +1,101 @@
 # Understudy
 
-> **Being rewritten on MongoDB (November 2026).** `main` records, saves and
-> replays flows, runs goals by meaning, and serves the MCP tools on MongoDB;
-> the docs below are rewritten last — see [REWRITE.md](REWRITE.md) and
-> [REASONER.md](REASONER.md), which are current. The previous CockroachDB version,
-> which the rest of this README describes, is on the
-> [`legacy-cockroach`](../../tree/legacy-cockroach) branch.
+End-to-end tests for your own web apps, without clicking through every flow by
+hand. Record a flow once; Understudy remembers it, replays it as a test, notices
+when the app changes, and can run goals you describe in words — including goals
+that need pieces of several recordings.
 
-A system that learns a web app from browser recordings and stores what it learned
-as **queryable memory**, so you can say *"test login"* and it works — including
-for goals no single recording covers.
+It works on its own from the command line, and it plugs into an AI agent
+(Claude Code, Codex, Cursor) over MCP. The agent is optional; with one,
+Understudy never calls a model itself — the agent is the model.
 
-In practice: end-to-end tests against your own sites, without clicking through
-every flow by hand.
-
-## Why
-
-Driving a browser blind is expensive. An agent that reads a page snapshot per
-interaction spends 3–7k tokens per page, so a fourteen-step login-and-checkout
-costs 40–100k tokens — and it re-reasons from scratch every run.
-
-Understudy answers the same goal from memory in **~1.5k tokens**, and what comes
-back is an executable plan rather than a description of one.
-
-## How it works
+## What it does
 
 ```
-record  →  replay  →  distil  →  recall  →  run
+record  →  save  →  replay / run  →  findings
 ```
 
-- **record** — capture a real browser session, or import a Playwright script.
-- **replay** — every step must re-run and pass. Nothing enters memory unproven.
-- **distil** — slice the recording into reusable **segments** that belong to the
-  app, not to the recording they came from.
-- **recall** — a vector query over segments, facts and lessons. The distance
-  doubles as a confidence signal: too far away means *"I don't know this"*, and
-  the agent asks instead of guessing.
-- **run** — deterministic code binds segments to sub-goals, bridges the seams
-  between them, and executes. It calls no model. When it hits a judgement it
-  cannot make, it suspends and asks the agent driving it.
+- **record** — click through a flow in your own Chrome (with the extension) or
+  in a fresh browser. Passwords are never stored: a password field is kept as
+  a reference like `SECRET.password`, and you supply the value when replaying.
+- **save** — the recording is replayed headless first. It is kept only if every
+  step passes, so memory only holds flows known to work.
+- **replay / run** — `replay` runs a flow by name; `run` finds the flow that
+  does a goal you describe ("go to my basket") and runs it. Matching is by
+  meaning if you configure an embedding model, by name if you don't.
+- **findings** — every run checks for console errors, failed requests, error
+  responses, values that didn't stick, and whether the flow took a different
+  path through the app than last time. Each problem is reported once, with a
+  count, not once per run.
 
-Recordings are stored as data (`{action, role, name, value}`), not code — so
-values can be swapped per run, and the same flow can be re-emitted as Playwright
-or Cypress.
+With an agent attached it also splits recordings into reusable segments (a
+login cut out of a checkout, say), plans a goal across segments of different
+recordings, and writes down what it learns as facts and lessons that apply to
+every future run.
 
-## Setup
+## Set up (about five minutes)
 
-Needs Node 22+ and a CockroachDB instance (local or Cloud).
+You need **Node 22+** and a **MongoDB** with vector search — either a free
+[Atlas](https://www.mongodb.com/atlas) cluster, or MongoDB Community Edition
+with `mongot` running locally.
 
 ```bash
+git clone https://github.com/Jeffawe/UnderStudy.git && cd UnderStudy
 npm install
-npm run db:start          # local single-node cockroach
-npm run db:schema         # apply db/schema.sql
-npm run build
+npx playwright install chromium
+cp .env.example .env          # then set MONGODB_URI
+npx tsx src/entry/cli.ts doctor
 ```
 
-Copy `.env.example` to `.env` and set your connection string. Credentials are
-never stored in recordings — a password field records a reference like
-`MEMBER.password`, and you supply the value per run.
+`doctor` connects, creates what it needs, and reports whether vector search is
+ready. To match goals by meaning, add an embedding model to `.env` — any
+OpenAI-style endpoint works; Voyage (`voyage-4-lite`, 200M free tokens) is the
+default, and Ollama works offline for free. Without one, goals match flow names.
+
+> **Atlas free clusters** allow 3 search indexes; Understudy uses 2, so one free
+> cluster holds one Understudy database.
 
 ## Use it
 
 ```bash
-npx understudy record myapp            # capture a flow
-npx understudy ingest <hash>           # replay it, then store it
-npx understudy recall myapp "log in"   # ask what the memory knows — free, no browser
-npx understudy test myapp "check out"  # plan and run a goal
+understudy record myapp --extension         # record in your own Chrome (see extension/README.md)
+understudy record myapp --url https://…     # or in a fresh browser
+understudy save <hash> "log in as a member" # prove it by replaying, then keep it
+understudy flows myapp                      # what it knows how to do
+understudy replay myapp log-in-as-a-member  # run one flow
+understudy run myapp "sign in"              # find the flow for a goal, and run it
+understudy findings myapp                   # what looked broken
+understudy emit myapp log-in-as-a-member    # print it as a Playwright (or Cypress) test
 ```
 
-Or attach it to any MCP-speaking agent (Claude Code, Codex, Cursor). The server
-exposes eleven tools; register it in `.mcp.json`:
+(`understudy` is `npx tsx src/entry/cli.ts` until you `npm run build && npm link`.)
+`understudy --help` lists everything. A flow that commits something real — a
+purchase, a deletion — is marked destructive and refused unless you pass
+`--allow-purchases`.
+
+## With an agent
+
+Register the MCP server (this repo's `.mcp.json` already does):
 
 ```json
-{ "mcpServers": { "understudy": { "command": "npx", "args": ["understudy-mcp"] } } }
+{ "mcpServers": { "understudy": { "command": "npx", "args": ["tsx", "src/entry/mcp.ts"] } } }
 ```
 
-The agent is consulted, not in the loop — a run asks it perhaps three or four
-questions rather than driving eighty round trips through it.
+Seven tools: `recall`, `run`, `answer`, `distill`, `save_distilled`,
+`remember`, `findings`. [REASONER.md](REASONER.md) is the contract for using
+them — how to split a goal, when to answer a question and when to say "I don't
+know", and what to write down.
 
-## For agents
+## Learn more
 
-**[`REASONER.md`](REASONER.md)** is the contract for driving Understudy: the
-handshakes, the four questions a run will ask, and the gotchas that cost someone
-an hour. If you are an agent working in this repo, read that.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — how it fits together, for changing the code
+- [REASONER.md](REASONER.md) — how an agent should use it
+- [extension/README.md](extension/README.md) — the Chrome recorder
+- [REWRITE.md](REWRITE.md) — the November 2026 move to MongoDB, and why
+
+The previous CockroachDB version is on the
+[`legacy-cockroach`](../../tree/legacy-cockroach) branch.
 
 ## License
 
-Apache
+MIT

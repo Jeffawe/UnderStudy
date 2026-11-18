@@ -21,7 +21,8 @@ import { execute } from '../flows/execute.js';
 import { destructiveControls, remember } from '../memory/notes.js';
 import { start, answer, runPlan, type PlanState } from '../plan/planner.js';
 import { distillRequest, saveDistilled } from '../flows/distill.js';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
+import { emitFlow, type Framework } from '../flows/emit.js';
 import { saveFlow, recordingFrom } from '../flows/save.js';
 import { recordRun, type RecordedRun } from '../flows/runs.js';
 import { recall, type Recall } from '../memory/recall.js';
@@ -48,8 +49,9 @@ COMMANDS
   answer <runId> <json> answer a question a planned run stopped on
   distill <app> <flow>  print a saved flow's steps for an agent to name and split
   remember <app> <file> store facts, lessons and findings from a JSON batch
+  emit <app> <flow>     print a saved flow as a Playwright or Cypress test
 
-  MCP server for agents: understudy-mcp (see REASONER.md). Coming back: emit.
+  MCP server for agents: understudy-mcp (see REASONER.md).
 
 RECORD
   --extension           record in your own Chrome with the Understudy extension
@@ -85,6 +87,10 @@ RUN
   --flow <slug>         skip matching and run this flow (for an UNSURE match)
   --dry-run             say which flow would run, and run nothing
   plus --value, --headed, --allow-purchases as for replay
+
+EMIT
+  --framework <name>    playwright-ts (default) or cypress-js
+  --out <file>          write to a file instead of printing
 
 DISTILL
   --save <file>         store the agent's answer (validated first)
@@ -639,6 +645,12 @@ async function cmdSave(positional: string[], flags: Flags) {
   printReplay(result);
   if (!result.ok && !flags.has('force')) {
     console.error('\nnot saved — the recording did not replay cleanly. Fix it, or re-record.');
+    // The usual reason an extension recording fails here: you were signed in
+    // in your Chrome, and replay's fresh browser isn't.
+    if (recording.origin === 'chrome-extension' && !recording.entry?.session) {
+      console.error('  were you signed in when you recorded? Record again with "I\'m signed in here" ticked,');
+      console.error('  so replay starts signed in too.');
+    }
     process.exitCode = 3;
     return;
   }
@@ -685,6 +697,25 @@ async function cmdFindings(positional: string[], flags: Flags) {
   }
 }
 
+/** emit <app> <flow> — print a saved flow as a Playwright or Cypress test. */
+async function cmdEmit(positional: string[], flags: Flags) {
+  const [app, slug] = positional;
+  if (!app || !slug) fail('emit needs an app and a flow', 'understudy emit myapp log-in --framework cypress-js');
+  const framework = (str(flags.get('framework')) ?? 'playwright-ts') as Framework;
+  if (framework !== 'playwright-ts' && framework !== 'cypress-js') fail('--framework must be playwright-ts or cypress-js');
+  const { flows } = await store.collections();
+  const flow = await flows.findOne({ app, slug });
+  if (!flow) fail(`no flow '${slug}' for app '${app}'`, `understudy flows ${app}`);
+  const out = emitFlow(flow, framework);
+  const file = str(flags.get('out'));
+  if (file) {
+    await writeFile(file, out.code);
+    console.log(`wrote ${file}`);
+  } else console.log(out.code);
+  for (const w of out.warnings) console.error(`warning: ${w}`);
+  if (out.requiredValues.length) console.error(`reads from the environment: ${out.requiredValues.map((r) => r.replace(/[^a-zA-Z0-9]+/g, '_').toUpperCase()).join(', ')}`);
+}
+
 // --- recordings --------------------------------------------------------------
 
 async function cmdRecordings(positional: string[]) {
@@ -720,6 +751,7 @@ async function main() {
     case 'answer': return cmdAnswer(rest, flags);
     case 'distill': return cmdDistill(rest, flags);
     case 'remember': return cmdRemember(rest);
+    case 'emit': return cmdEmit(rest, flags);
     default: fail(`unknown command '${command}'`, 'understudy --help');
   }
 }
