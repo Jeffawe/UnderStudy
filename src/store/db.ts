@@ -6,7 +6,7 @@
  * connection string. MONGODB_DB picks the database name (default `understudy`).
  */
 
-import 'dotenv/config';
+import './settings.js'; // loads settings before anything reads them
 import { MongoClient, type Db, type Collection, type Document } from 'mongodb';
 import type { App, Flow, Page, Note, Finding, Run, EmbedderMeta } from './types.js';
 import { embedderConfig } from './embed.js';

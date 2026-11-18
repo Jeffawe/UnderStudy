@@ -100,7 +100,7 @@ test('emit: Playwright and Cypress, credentials from the environment, positions 
   const pw = emitFlow(flow);
   assert.match(pw.code, /await page\.goto\('https:\/\/shop\.test\/'\);/);
   assert.match(pw.code, /getByRole\('textbox', \{ name: 'Password' \}\)\.fill\(SECRET_PASSWORD\)/);
-  assert.match(pw.code, /const SECRET_PASSWORD = process\.env\.SECRET_PASSWORD/);
+  assert.match(pw.code, /const SECRET_PASSWORD = process\.env\.UNDERSTUDY_SECRET_PASSWORD/, 'the same variable replay reads');
   assert.match(pw.code, /locator\('div\.code input'\)\.nth\(1\)\.fill\('5'\)/, 'which of several matching boxes is kept');
   assert.match(pw.code, /locator\('\[data-test="go"\]'\)\.click\(\)/);
   assert.deepEqual(pw.requiredValues, ['SECRET.password']);

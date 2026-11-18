@@ -9,7 +9,7 @@
 
 import { recordLive } from '../adapters/recorder/live.js';
 import { parseScript } from '../adapters/recorder/script.js';
-import { startExtensionRecorder, DEFAULT_PORT } from '../adapters/recorder/extension.js';
+import { startExtensionRecorder, DEFAULT_PORT, extensionDir } from '../adapters/recorder/extension.js';
 import { listRecordings, loadRecording, saveRecording } from '../core/recording-store.js';
 import { loadSession, saveSession } from '../core/auth-cache.js';
 import { buildRecording, type RawRecording } from '../core/recording.js';
@@ -18,14 +18,16 @@ import { execute, prove } from '../flows/execute.js';
 import { destructiveControls, remember } from '../memory/notes.js';
 import { start, answer, runPlan, type PlanState } from '../plan/planner.js';
 import { distillRequest, saveDistilled } from '../flows/distill.js';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
+import { join, resolve as resolvePath } from 'node:path';
 import { existsSync } from 'node:fs';
 import { chromium } from 'playwright';
 import { emitFlow, type Framework } from '../flows/emit.js';
-import { saveFlow, recordingFrom } from '../flows/save.js';
+import { recordingFrom, proveAndSave } from '../flows/save.js';
 import { recordRun, type RecordedRun } from '../flows/runs.js';
 import { recall, type Recall } from '../memory/recall.js';
 import * as store from '../store/db.js';
+import { valuesFromEnv, valueEnvName, readConfig, writeConfig, loadedFrom, HOME, expandHome } from '../store/settings.js';
 
 const USAGE = `understudy — learn a web app, then test it by intent
 
@@ -33,9 +35,11 @@ USAGE
   understudy <command> [options]
 
 COMMANDS
+  config                where settings come from; set them, or point at an env file
   doctor                check the MongoDB connection, vector search and embedder
   reembed               rebuild every vector with the model in .env
   record <app>          capture a flow in your own Chrome, with the extension
+  extension             where the Chrome extension is, and how to load it
   import <app> <file>   read an existing Playwright script into a recording
   recordings [app]      list captured recordings
   save <hash> "<name>"  prove a recording by replaying it, then save it as a flow
@@ -98,9 +102,12 @@ DISTILL
 RECALL
   --limit <n>           how many flows and notes to show (default 5)
 
-SETTINGS (.env)
+SETTINGS — from the environment, --env-file <path>, the file saved with
+"understudy config", or ./.env (first wins)
   MONGODB_URI           local Community or your Atlas mongodb+srv:// string
   EMBED_URL, EMBED_MODEL, EMBED_KEY, EMBED_DIMS   optional embedding model
+  UNDERSTUDY_<REF>      login values: a recording's SECRET.password reads
+                        UNDERSTUDY_SECRET_PASSWORD (or pass --value)
 `;
 
 // --- arguments ---------------------------------------------------------------
@@ -151,6 +158,17 @@ function valuesFromFlags(flags: Flags): Record<string, string> {
   return values;
 }
 
+/** Say which login values a recording needs that nobody supplied — and where they can come from. */
+function printNeededValues(recording: RawRecording, given: Record<string, string>) {
+  const refs = [...new Set(recording.events.map((e) => e.valueRef).filter((r): r is string => Boolean(r)))];
+  const fromEnv = valuesFromEnv(refs);
+  const missing = refs.filter((r) => !(r in given) && !(r in fromEnv));
+  if (!missing.length) return;
+  console.log(`this needs ${missing.length} value(s) that are deliberately not stored:`);
+  for (const ref of missing) console.log(`  ${valueEnvName(ref)}=…   (in your env file or environment — or --value ${ref}=…)`);
+  console.log('');
+}
+
 // --- apps --------------------------------------------------------------------
 
 /**
@@ -197,6 +215,19 @@ async function cmdDoctor() {
     console.log(`embedder   ${cfg.model} at ${new URL(cfg.url).host} — ok, ${v!.length} numbers per vector`);
   }
 
+  // Replay needs the headless browser; recording happens in your own Chrome.
+  try {
+    const b = await chromium.launch({ headless: true });
+    await b.close();
+    console.log('browser    headless Chromium ready (replay)');
+  } catch {
+    console.log('browser    headless Chromium MISSING — replay needs it: npx playwright install --only-shell chromium');
+    process.exitCode = 1;
+  }
+  if (!existsSync(chromium.executablePath())) {
+    console.log('           (full Chromium not installed — only needed for record --new-browser and --headed)');
+  }
+
   const states = await store.waitForVectorIndexes(60_000).catch(() => store.vectorIndexStates());
   for (const s of states) {
     console.log(`vector     ${s.collection.padEnd(6)} ${s.queryable ? 'ready' : `NOT READY (${s.status})`}`);
@@ -211,6 +242,83 @@ async function cmdReembed() {
   const { reembed } = await import('../store/reembed.js');
   const r = await reembed();
   console.log(`re-embedded ${r.flows} flows and ${r.notes} notes with ${r.model}`);
+}
+
+// --- config ------------------------------------------------------------------
+
+/**
+ * Quote a value so dotenv reads it back EXACTLY. dotenv doesn't undo escapes
+ * like \" — a password with quotes in it would come back mangled — so pick a
+ * quote character the value doesn't contain: single quotes are fully literal.
+ */
+function envFileQuote(key: string, value: string): string {
+  if (/[\r\n]/.test(value)) fail(`${key}: values can't contain line breaks`);
+  for (const q of ["'", '"', '`']) {
+    if (!value.includes(q)) return q + value + q;
+  }
+  return fail(`${key}: the value contains ', " and \` — put it in the env file by hand, or set it in the environment`);
+}
+
+/**
+ * understudy config                          where settings come from (no secrets shown)
+ * understudy config --env-file <path>        read settings from this env file from now on
+ * understudy config set KEY=value [...]      write settings into that env file
+ * understudy config --clear                  forget the saved env file
+ */
+async function cmdConfig(positional: string[], flags: Flags) {
+  const [sub, ...pairs] = positional;
+  const cfg = readConfig();
+
+  if (flags.has('clear')) {
+    delete cfg.envFile;
+    console.log(`saved ${await writeConfig(cfg)} — no env file remembered`);
+    return;
+  }
+  const chosen = str(flags.get('env-file'));
+  if (chosen) {
+    cfg.envFile = resolvePath(expandHome(chosen));
+    console.log(`saved ${await writeConfig(cfg)} — settings will be read from ${cfg.envFile}`);
+    if (!existsSync(cfg.envFile)) console.log('  (that file does not exist yet — create it, or use `understudy config set KEY=value`)');
+  }
+
+  if (sub === 'set') {
+    if (!pairs.length || pairs.some((p) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(p))) {
+      fail('config set needs KEY=value pairs', 'understudy config set MONGODB_URI="mongodb+srv://…" EMBED_KEY=…');
+    }
+    const file = cfg.envFile ?? join(HOME, 'understudy.env');
+    if (!cfg.envFile) {
+      cfg.envFile = file;
+      await writeConfig(cfg);
+    }
+    await mkdir(HOME, { recursive: true, mode: 0o700 }).catch(() => {});
+    const lines = existsSync(file) ? (await readFile(file, 'utf8')).split('\n') : [];
+    for (const pair of pairs) {
+      const key = pair.slice(0, pair.indexOf('='));
+      const value = pair.slice(pair.indexOf('=') + 1);
+      const line = `${key}=${envFileQuote(key, value)}`;
+      const at = lines.findIndex((l) => l.startsWith(`${key}=`));
+      if (at >= 0) lines[at] = line;
+      else lines.push(line);
+    }
+    await writeFile(file, lines.filter((l, i) => l || i < lines.length - 1).join('\n').replace(/\n*$/, '\n'), { mode: 0o600 });
+    await chmod(file, 0o600).catch(() => {});
+    console.log(`wrote ${pairs.map((p) => p.slice(0, p.indexOf('='))).join(', ')} to ${file}`);
+    return;
+  }
+  if (sub) fail(`unknown: config ${sub}`, 'understudy config [set KEY=value …] [--env-file <path>] [--clear]');
+  if (chosen) return;
+
+  // Show where everything comes from — never the secrets themselves.
+  const shown = (k: string) => (process.env[k] ? 'set' : 'not set');
+  console.log(`config file   ${join(HOME, 'config.json')}${existsSync(join(HOME, 'config.json')) ? '' : ' (none yet)'}`);
+  console.log(`env file      ${cfg.envFile ?? 'none saved — use --env-file <path> or `config set`'}`);
+  console.log(`read now      ${loadedFrom.length ? loadedFrom.join(', ') : 'no env files (only the environment)'}`);
+  console.log(`MONGODB_URI   ${process.env.MONGODB_URI ? store.describeUri() : 'not set'}`);
+  console.log(`EMBED_URL     ${process.env.EMBED_URL || 'not set (goals match flow names, not meaning)'}`);
+  console.log(`EMBED_MODEL   ${process.env.EMBED_MODEL || 'not set'}`);
+  console.log(`EMBED_KEY     ${shown('EMBED_KEY')}`);
+  const logins = Object.keys(process.env).filter((k) => k.startsWith('UNDERSTUDY_') && !['UNDERSTUDY_HOME'].includes(k) && !k.endsWith('_DIR'));
+  console.log(`login values  ${logins.length ? logins.join(', ') : 'none (a recording\'s SECRET.password reads UNDERSTUDY_SECRET_PASSWORD)'}`);
 }
 
 // --- record ------------------------------------------------------------------
@@ -325,6 +433,7 @@ async function cmdRecordExtension(slug: string, flags: Flags) {
   );
   console.log(`waiting for the Understudy extension (${rec.url})`);
   console.log(`  in Chrome: go to where the flow starts, click the Understudy icon, then "Record from this page".`);
+  console.log(`  (extension not loaded yet? understudy extension — it says where it is and how)`);
   console.log(`  stop from the extension when you're done (or press Ctrl+C here to stop and keep what was recorded).\n`);
 
   const onSigint = () => rec.stop();
@@ -352,6 +461,17 @@ async function cmdRecordExtension(slug: string, flags: Flags) {
   console.log(`\nhash  ${out.recording.hash}${existed ? '  (identical recording already existed)' : ''}`);
   console.log(`saved ${path}`);
   console.log(`\nnext: understudy save ${out.recording.hash} "<what this flow does>"`);
+}
+
+/** Where the Chrome extension is, and how to load it — it ships inside the package. */
+function cmdExtension() {
+  const dir = extensionDir();
+  console.log(`the Understudy recorder extension is in:\n  ${dir}\n`);
+  console.log('load it once:');
+  console.log('  1. open chrome://extensions and turn on Developer mode (top right)');
+  console.log('  2. click "Load unpacked" and choose the folder above');
+  console.log('  3. pin it (puzzle-piece icon) so it is one click away');
+  console.log('\nthen record with: understudy record <app>');
 }
 
 // --- import ------------------------------------------------------------------
@@ -404,12 +524,7 @@ async function cmdImport(positional: string[], flags: Flags) {
  */
 async function executeWithReport(recording: RawRecording, flags: Flags, opts: { useLessons: boolean }): Promise<ReplayResult> {
   const values = valuesFromFlags(flags);
-  const needed = [...new Set(recording.events.filter((e) => e.valueRef && !(e.valueRef in values)).map((e) => e.valueRef!))];
-  if (needed.length) {
-    console.log(`this needs ${needed.length} value(s) that are deliberately not stored:`);
-    for (const ref of needed) console.log(`  --value ${ref}=…`);
-    console.log('');
-  }
+  printNeededValues(recording, values);
   const x = await execute(recording, { values, headed: flags.has('headed'), useLessons: opts.useLessons }).catch((e: Error) => fail(e.message));
   if (x.sessionRestoredFrom) console.log(`session: restored (saved ${x.sessionRestoredFrom})`);
   if (x.staleSession) {
@@ -640,6 +755,14 @@ function printRunReport(run: RecordedRun) {
 
 // --- save / flows / findings -------------------------------------------------
 
+/** What proving found out about signing in, for a recording made from a tab. */
+function signInNote(recording: RawRecording, signIn: 'not needed' | 'needed' | 'no session to try'): string | undefined {
+  if (!recording.entry?.session) return undefined;
+  if (recording.entry.requiresSession) return 'used, as you said you were signed in when recording';
+  if (signIn === 'needed') return 'needed — it failed in an empty browser and passed signed in, so it keeps your session';
+  return 'not needed — the session copied when you started recording was deleted';
+}
+
 /**
  * Prove a recording by replaying it, then save it as a flow. A recording that
  * doesn't replay cleanly is refused — memory only holds flows known to work.
@@ -654,34 +777,24 @@ async function cmdSave(positional: string[], flags: Flags) {
 
   console.log(`proving ${hash} by replaying it…\n`);
   const values = valuesFromFlags(flags);
-  // No lessons: what gets saved is what the recording does on its own. prove()
-  // also works out whether it needs to start signed in (see flows/execute.ts).
-  const proven = await prove(recording, { values, headed: flags.has('headed') }).catch((e: Error) => fail(e.message));
-  if (proven.missingValues.length) {
-    console.log(`this needs ${proven.missingValues.length} value(s) that are deliberately not stored:`);
-    for (const ref of proven.missingValues) console.log(`  --value ${ref}=…`);
-    console.log('');
-  }
-  const result = proven.result;
-  printReplay(result);
-  if (recording.entry?.session && recording.entry.requiresSession) {
-    console.log('\nsign-in  used, as you said you were signed in when recording');
-  } else if (proven.signIn === 'needed' && recording.entry?.session) {
-    console.log('\nsign-in  needed — it failed in an empty browser and passed signed in, so it keeps your session');
-  } else if (recording.entry?.session) {
-    console.log('\nsign-in  not needed — the session copied when you started recording was deleted');
-  }
-  if (!result.ok && !flags.has('force')) {
-    console.error('\nnot saved — the recording did not replay cleanly' + (recording.entry?.session ? ', signed in or not' : '') + '. Fix it, or re-record.');
+  printNeededValues(recording, values);
+  const slug = str(flags.get('slug'));
+  const intent = str(flags.get('intent'));
+  // No lessons: what gets saved is what the recording does on its own. Proving
+  // also works out whether it needs to start signed in (flows/execute.ts: prove).
+  const out = await proveAndSave(recording, {
+    title, values, headed: flags.has('headed'), force: flags.has('force'),
+    ...(slug ? { slug } : {}), ...(intent ? { intent } : {}),
+  }).catch((e: Error) => fail(e.message));
+  printReplay(out.proven.result);
+  const note = signInNote(recording, out.proven.signIn);
+  if (note) console.log(`\nsign-in  ${note}`);
+  if (!out.saved) {
+    console.error('not saved — the recording did not replay cleanly' + (recording.entry?.session ? ', signed in or not' : '') + '. Fix it, or re-record.');
     process.exitCode = 3;
     return;
   }
-
-  const slug = str(flags.get('slug'));
-  const intent = str(flags.get('intent'));
-  const flow = await saveFlow(proven.recording, result, { title, ...(slug ? { slug } : {}), ...(intent ? { intent } : {}) });
-  const run = await recordRun({ app: flow.app, flow: flow.slug, result, steps: flow.steps });
-
+  const { flow, run } = out;
   console.log(`\nsaved    ${flow.app}/${flow.slug}  (${flow.steps.length} steps${flow.embedding ? ', searchable by meaning' : ''})`);
   if (flow.destructive) console.log(`         DESTRUCTIVE — ${flow.destructiveBecause}. Replays need --allow-purchases.`);
   printRunReport(run);
@@ -735,7 +848,7 @@ async function cmdEmit(positional: string[], flags: Flags) {
     console.log(`wrote ${file}`);
   } else console.log(out.code);
   for (const w of out.warnings) console.error(`warning: ${w}`);
-  if (out.requiredValues.length) console.error(`reads from the environment: ${out.requiredValues.map((r) => r.replace(/[^a-zA-Z0-9]+/g, '_').toUpperCase()).join(', ')}`);
+  if (out.requiredValues.length) console.error(`reads from the environment: ${out.requiredValues.map(valueEnvName).join(', ')}`);
 }
 
 // --- recordings --------------------------------------------------------------
@@ -760,6 +873,8 @@ async function main() {
 
   switch (command) {
     case 'doctor': return cmdDoctor();
+    case 'config': return cmdConfig(rest, flags);
+    case 'extension': return cmdExtension();
     case 'reembed': return cmdReembed();
     case 'record': return cmdRecord(rest, flags);
     case 'import': return cmdImport(rest, flags);

@@ -24,7 +24,9 @@ specific task.
 
 - **Read `REASONER.md` before using Understudy** to run, plan, distill or
   remember anything. It is the operating contract, and it is short.
-- MongoDB must be reachable at `MONGODB_URI`; check with `understudy doctor`.
+- Settings (MongoDB, embedding model, login values) come from the environment,
+  `--env-file`, or `understudy config`; check with `understudy doctor`. Never
+  ask the user to paste a password into chat — it belongs in their env file.
 - Memory first: `understudy_recall` is free. Decompose goals into sub-goals in
   the app's own words, and say the sub-goals to the user before acting.
 - Be honest about the executor: say whether Understudy ran it or you drove it

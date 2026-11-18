@@ -34,30 +34,45 @@ every future run.
 
 ## Set up (about five minutes)
 
-You need **Node 22+** and a **MongoDB** with vector search — either a free
-[Atlas](https://www.mongodb.com/atlas) cluster, or MongoDB Community Edition
-with `mongot` running locally.
+You need **Node 22+** and a **MongoDB** with vector search — a free
+[Atlas](https://www.mongodb.com/atlas) cluster (nothing to install), or MongoDB
+Community Edition with `mongot` running locally.
 
 ```bash
-git clone https://github.com/Jeffawe/UnderStudy.git && cd UnderStudy
-npm install
-npx playwright install --only-shell chromium   # the headless browser replay uses, ~200 MB
-cp .env.example .env          # then set MONGODB_URI
-npx tsx src/entry/cli.ts doctor
+npm install -g @jeffawe/understudy               # ~80 MB  (not published yet — see below)
+npx playwright install --only-shell chromium     # the headless browser replay uses, ~200 MB
+understudy config set MONGODB_URI="mongodb+srv://…"
+understudy doctor                                # connection, vector search, embedder, browser
+understudy extension                             # where the Chrome recorder is, and how to load it
 ```
 
-`doctor` connects, creates what it needs, and reports whether vector search is
-ready. To match goals by meaning, add an embedding model to `.env` — any
-OpenAI-style endpoint works; Voyage (`voyage-4-lite`, 200M free tokens) is the
-default, and Ollama works offline for free. Without one, goals match flow names.
+**Settings** come from, highest first: real environment variables, then
+`--env-file <path>` on any command, then the env file saved with
+`understudy config`, then a `.env` in the current folder. Keep them wherever
+you like:
+
+```bash
+understudy config set MONGODB_URI="…" EMBED_KEY="…"   # writes ~/.understudy/understudy.env (only you can read it)
+understudy config --env-file ~/secrets/understudy.env  # or point at an env file you already keep
+understudy config                                      # where everything comes from (no secrets shown)
+```
+
+| Setting | What it's for |
+|---|---|
+| `MONGODB_URI` | your Atlas `mongodb+srv://…` string, or local Community |
+| `EMBED_URL`, `EMBED_MODEL`, `EMBED_KEY` | optional: match goals by meaning. Any OpenAI-style endpoint; Voyage `voyage-4-lite` (200M free tokens) is the default, Ollama works offline. Without one, goals match flow names. |
+| `UNDERSTUDY_<REF>` | login values. Passwords are never stored in a recording — a password field is kept as a reference like `SECRET.password`, read from `UNDERSTUDY_SECRET_PASSWORD`. |
 
 > **Atlas free clusters** allow 3 search indexes; Understudy uses 2, so one free
 > cluster holds one Understudy database.
 
+**Until it's published:** clone the repo, `npm install`, and use
+`npx tsx src/entry/cli.ts` wherever this says `understudy`.
+
 ## Use it
 
 ```bash
-understudy record myapp                     # record in your own Chrome (see extension/README.md)
+understudy record myapp                     # record in your own Chrome, with the extension
 understudy save <hash> "log in as a member" # prove it by replaying, then keep it
 understudy flows myapp                      # what it knows how to do
 understudy replay myapp log-in-as-a-member  # run one flow
@@ -66,25 +81,34 @@ understudy findings myapp                   # what looked broken
 understudy emit myapp log-in-as-a-member    # print it as a Playwright (or Cypress) test
 ```
 
-(`understudy` is `npx tsx src/entry/cli.ts` until you `npm run build && npm link`.)
-`understudy --help` lists everything. Prefer a fresh browser over your own
-Chrome? `understudy record myapp --new-browser --url https://…`, after
-`npx playwright install chromium` (the full browser, ~350 MB). A flow that commits something real — a
+`understudy --help` lists everything. A flow that commits something real — a
 purchase, a deletion — is marked destructive and refused unless you pass
-`--allow-purchases`.
+`--allow-purchases`. Prefer a fresh browser over your own Chrome?
+`understudy record myapp --new-browser --url https://…`, after
+`npx playwright install chromium` (the full browser, ~350 MB).
 
 ## With an agent
 
-Register the MCP server (this repo's `.mcp.json` already does):
+Add the MCP server to your agent. It starts and stops with the agent's session;
+settings come from the env file you point it at, so keys never go in the
+agent's config or the chat:
 
-```json
-{ "mcpServers": { "understudy": { "command": "npx", "args": ["tsx", "src/entry/mcp.ts"] } } }
+```bash
+claude mcp add understudy -- npx -y -p @jeffawe/understudy understudy-mcp --env-file ~/.understudy/understudy.env
 ```
 
-Seven tools: `recall`, `run`, `answer`, `distill`, `save_distilled`,
-`remember`, `findings`. [REASONER.md](REASONER.md) is the contract for using
-them — how to split a goal, when to answer a question and when to say "I don't
-know", and what to write down.
+```json
+{ "mcpServers": { "understudy": {
+    "command": "npx",
+    "args": ["-y", "-p", "@jeffawe/understudy", "understudy-mcp", "--env-file", "~/.understudy/understudy.env"]
+} } }
+```
+
+Nine tools: `recall`, `run`, `answer`, `record`, `save`, `distill`,
+`save_distilled`, `remember`, `findings`. The server tells the agent how to use
+them when it connects; [REASONER.md](REASONER.md) is the full version — how to
+split a goal, when to answer a question and when to say "I don't know", and
+what to write down.
 
 ## Learn more
 
@@ -98,4 +122,4 @@ The previous CockroachDB version is on the
 
 ## License
 
-MIT
+Apache-2.0 — see [LICENSE](LICENSE).

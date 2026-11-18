@@ -27,6 +27,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { saveSessionById, type StorageState } from '../../core/auth-cache.js';
 import { buildRecording, type RawEvent, type RawRecording, type RecordingEntry } from '../../core/recording.js';
 import { toRawEvent, type WireEvent } from './wire.js';
@@ -155,4 +156,9 @@ export async function startExtensionRecorder(opts: { appSlug: string; port?: num
   });
 
   return { url: `http://127.0.0.1:${port}`, done, stop: finish };
+}
+
+/** The extension's folder: it ships inside the package, beside dist/ and src/. */
+export function extensionDir(): string {
+  return fileURLToPath(new URL('../../../extension/', import.meta.url));
 }

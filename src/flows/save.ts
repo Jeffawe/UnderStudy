@@ -15,6 +15,8 @@ import type { Flow, Step } from '../store/types.js';
 import { collections, ensureSchema } from '../store/db.js';
 import { embed, embedderConfig } from '../store/embed.js';
 import { flowDestructiveReason } from './destructive.js';
+import { prove } from './execute.js';
+import { recordRun } from './runs.js';
 
 /** "Log in as a member!" → "log-in-as-a-member" */
 export function slugify(title: string): string {
@@ -115,4 +117,25 @@ export async function saveFlow(recording: RawRecording, result: ReplayResult, op
   );
 
   return (await flows.findOne({ app, slug }))!;
+}
+
+export interface ProveAndSave extends SaveOptions {
+  /** Login values, if not in the environment as UNDERSTUDY_<REF>. */
+  values?: Record<string, string>;
+  headed?: boolean;
+  /** Save even though the proving replay failed (it stays marked by its failing run). */
+  force?: boolean;
+}
+
+/**
+ * What `save` does, for the CLI and the MCP server alike: prove the recording
+ * (replaying it headless, working out whether it needs to start signed in),
+ * then — only if it passed — store it as a flow and record that first run.
+ */
+export async function proveAndSave(recording: RawRecording, opts: ProveAndSave) {
+  const proven = await prove(recording, { ...(opts.values ? { values: opts.values } : {}), ...(opts.headed ? { headed: true } : {}) });
+  if (!proven.result.ok && !opts.force) return { saved: false as const, proven };
+  const flow = await saveFlow(proven.recording, proven.result, opts);
+  const run = await recordRun({ app: flow.app, flow: flow.slug, result: proven.result, steps: flow.steps });
+  return { saved: true as const, proven, flow, run };
 }

@@ -23,7 +23,8 @@ Plus `meta`: one document saying which embedding model filled the database.
 
 ```
 src/
-  store/      db.ts (connect, collections, indexes, vector search)
+  store/      settings.ts (where settings come from: env, --env-file, saved env file, ./.env)
+              db.ts (connect, collections, indexes, vector search)
               embed.ts (any OpenAI-style embeddings endpoint)  reembed.ts  types.ts
   core/       recording.ts (the step format)  replay.ts (the player)  sig.ts
               distill.ts (the distill contract)  auth-cache.ts (saved sessions)
@@ -118,6 +119,13 @@ Decisions that look arbitrary until you know what they avoid.
   (MIT) is the one library copied into our files (it must run in the page); its
   notice is inside the bundle, so it travels into `extension/recorder.js` too.
   Everything else is an ordinary npm dependency, not copied.
+- **Settings are never read from beside the code.** Understudy is installed,
+  not cloned, so `store/settings.ts` reads the environment, then `--env-file`,
+  then the env file saved by `understudy config`, then `./.env`. Login values
+  are `UNDERSTUDY_<REF>` settings, so a password never has to pass through an
+  agent's chat.
+- **The MCP server sends its own instructions** on connect (`entry/mcp.ts`): an
+  npm-installed agent never sees REASONER.md, so it gets the essentials there.
 - **Segments copy their steps** rather than referencing the parent's. Simpler
   to read and replay; fixing a selector everywhere is one `updateMany`.
 

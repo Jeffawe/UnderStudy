@@ -14,6 +14,7 @@ import { loadSession, forgetSession, loadSessionById, forgetSessionById } from '
 import type { RawRecording } from '../core/recording.js';
 import { replay, type ReplayResult } from '../core/replay.js';
 import { foldLessons, lessonsFor } from '../memory/notes.js';
+import { valuesFromEnv } from '../store/settings.js';
 
 export interface ExecuteOptions {
   /** Values for steps that deliberately don't store theirs, e.g. { 'SECRET.password': '…' }. */
@@ -43,7 +44,9 @@ export async function execute(recording: RawRecording, opts: ExecuteOptions = {}
         're-record it with --arm-manually',
     );
   }
-  const values = opts.values ?? {};
+  // Login values: given explicitly, else from UNDERSTUDY_<REF> in the environment.
+  const refs = new Set(recording.events.map((e) => e.valueRef).filter((r): r is string => Boolean(r)));
+  const values = { ...valuesFromEnv(refs), ...(opts.values ?? {}) };
   const missingValues = [...new Set(recording.events.filter((e) => e.valueRef && !(e.valueRef in values)).map((e) => e.valueRef!))];
 
   // A late-armed recording starts signed in; a cold browser would land on a

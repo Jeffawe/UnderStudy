@@ -28,6 +28,16 @@ embedding model.
   new flow.
 - Re-fit when the corpus changes a lot, or the embedding model changes.
 
+## To discuss: how an agent's own work feeds memory
+
+Today an agent can read memory, run flows, ask the user to record
+(`understudy_record` → `understudy_save`), and write facts, lessons and
+findings (`understudy_remember`). What it can't do over MCP is turn a flow it
+drove *itself* (exploring, or reaching a goal with its own browser) into a
+saved flow — so that work only lands as notes, or not at all. Ideas raised:
+distilling as the way in (with the user's permission), and exploration as
+input to distillation. Not designed yet.
+
 ## Small things noticed during the rewrite
 
 - **One unexpected page raises two findings** (the step's unexpected page, and

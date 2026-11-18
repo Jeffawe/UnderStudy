@@ -22,9 +22,15 @@ something you drove is the failure that costs trust.
 
 ## Setup
 
-MongoDB must be reachable at `MONGODB_URI` (local Community or Atlas). Check
-with `understudy doctor`. An embedding model (`EMBED_*` in `.env`) is optional:
-without one, recall matches flow names instead of meaning.
+Settings (`MONGODB_URI`, optional `EMBED_*`, login values) come from the
+environment, `--env-file <path>`, or the env file saved with `understudy
+config` — first wins. Check everything with `understudy doctor`. Without an
+embedding model, recall matches flow names instead of meaning.
+
+**Login values never go through the chat.** A recording stores references like
+`SECRET.password`; the value is read from `UNDERSTUDY_SECRET_PASSWORD`. If one
+is missing, ask the user to add it to their Understudy env file (`understudy
+config set UNDERSTUDY_SECRET_PASSWORD=…`) — don't ask them to paste it to you.
 
 The MCP server is long-lived: after source changes, reconnect (`/mcp`) or the
 tools keep running the old code.
@@ -40,6 +46,8 @@ tools keep running the old code.
 | `understudy_save_distilled` | store that (validated; every problem returned at once) |
 | `understudy_remember` | store facts, lessons, findings, and goals you reached yourself |
 | `understudy_findings` | list what looked broken; triage it |
+| `understudy_record` | wait for the user to record a flow in their Chrome |
+| `understudy_save` | prove a recording by replaying it, then keep it as a flow |
 
 **Recall verdicts:** *known* — one flow clearly does it. *unsure* — something is
 close but not clearly it; look before acting. *unknown* — nothing does it.
@@ -53,8 +61,9 @@ one of two questions. Once the plan is complete it runs to the end; anything
 odd on the way (an unexpected page, a 500) comes back as findings, not
 questions. Start with `dryRun: true` — it's free.
 
-Pass credentials in `values` (e.g. `{"SECRET.password": "…"}`); recordings
-never store them. Destructive flows are refused unless `allowPurchases: true`.
+Login values come from the user's settings (see Setup); `values` exists for
+one-off overrides, but prefer settings so a password never enters the chat.
+Destructive flows are refused unless `allowPurchases: true`.
 
 ### Question 1: `decompose` — split the goal into sub-goals
 
@@ -149,12 +158,12 @@ failed — usually its trigger is too broad, or its cause is gone.
 Check with `understudy_recall` first — it's free. If it's a gap, reach the goal
 however works, then capture it so it isn't done twice:
 
-- Something the user can click through: ask them to run `understudy record
-  <app>`, which records in their own Chrome with the extension, on the tab
-  they're on (signed in or not — see `extension/README.md`). Then
-  `understudy save <hash> "<name>"`, which replays it to prove it before
-  storing. (`--new-browser` records in a fresh browser instead; it needs the
-  full Chromium installed.)
+- Something the user can click through: **ask them to record it.** Call
+  `understudy_record` — it returns at once with what to tell them (start in
+  Chrome with the extension, do the flow, stop). When they say they've
+  stopped, call `understudy_save` with a name: it replays the recording to
+  prove it, and keeps it only if every step passes. (From a terminal it's
+  `understudy record <app>`, then `understudy save <hash> "<name>"`.)
 - **Anything with a file upload: never `record`.** Neither recorder can say
   which file was picked. Write a Playwright script, then `understudy import <app>
   <file>`. Read the import warnings: a dropped step is not a clean import.

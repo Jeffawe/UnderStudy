@@ -16,7 +16,7 @@
  * then falls back to matching names.
  */
 
-import 'dotenv/config';
+import './settings.js'; // loads settings before anything reads them
 
 export interface EmbedderConfig {
   url: string;
