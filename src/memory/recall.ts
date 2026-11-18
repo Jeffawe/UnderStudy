@@ -82,7 +82,7 @@ export interface Recall {
 /**
  * When a match by MEANING is good enough to act on. Calibrated 2026-11-18 on
  * the providernow corpus with voyage-4-lite (15 known goals, 14 plausible
- * unknown ones — see ROADMAP.md): no single score separates them, because a
+ * unknown ones): no single score separates them, because a
  * goal the app doesn't have still lands near something. What does separate
  * them is how far the top match is ahead of the runner-up. A different
  * embedding model needs recalibrating.
@@ -151,8 +151,8 @@ async function plan(app: string, slug: string): Promise<Pick<Recall, 'steps' | '
     };
   });
   const refs = [...new Set(flow.steps.map((s) => s.valueRef).filter((r): r is string => Boolean(r)))];
-  const found = valuesFromEnv(refs);
-  const needs = refs.map((placeholder) => ({ placeholder, readFrom: valueEnvNames(placeholder), set: placeholder in found }));
+  const found = valuesFromEnv(refs, app);
+  const needs = refs.map((placeholder) => ({ placeholder, readFrom: valueEnvNames(placeholder, app), set: placeholder in found }));
   return { steps, ...(needs.length ? { needs } : {}) };
 }
 

@@ -46,7 +46,7 @@ export async function execute(recording: RawRecording, opts: ExecuteOptions = {}
   }
   // Login values: given explicitly, else from UNDERSTUDY_<REF> in the environment.
   const refs = new Set(recording.events.map((e) => e.valueRef).filter((r): r is string => Boolean(r)));
-  const values = { ...valuesFromEnv(refs), ...(opts.values ?? {}) };
+  const values = { ...valuesFromEnv(refs, recording.appSlug), ...(opts.values ?? {}) };
   const missingValues = [...refs].filter((r) => !(r in values));
   // Checked BEFORE a browser opens: a run that reached the password step
   // without a password would spend a real login attempt — and some apps lock
@@ -54,7 +54,7 @@ export async function execute(recording: RawRecording, opts: ExecuteOptions = {}
   if (missingValues.length) {
     throw new Error(
       `missing login value(s) — nothing was run:\n` +
-        missingValues.map((r) => `- ${r}: set ${valueEnvNames(r).join(' or ')}, or pass it for this run`).join('\n'),
+        missingValues.map((r) => `- ${r}: set ${valueEnvNames(r, recording.appSlug).join(' or ')}, or pass it for this run`).join('\n'),
     );
   }
 

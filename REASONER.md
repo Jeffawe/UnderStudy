@@ -1,209 +1,65 @@
 # Using Understudy
 
-Understudy runs end-to-end tests against the user's web apps so they don't have
-to click through every flow by hand. It remembers each app — flows, facts,
-lessons, the page map, what looked broken — in MongoDB, and you (the agent)
-supply the judgement. It never calls a model; you are the model.
+Understudy runs end-to-end tests against the user's web apps from flows it
+remembers. You supply the judgement; it never calls a model.
 
-This file is loaded into every session. It is the whole contract.
+## Rules
 
-## The two rules
+- **Memory first.** `understudy_recall` is free and runs nothing. For a known
+  flow it returns the steps and the login values they need, so you can drive it
+  yourself if that's better.
+- **Reach the goal however works** — `understudy_run`, or your own browser —
+  and **say which you used**. Never imply Understudy ran something you drove.
+- **Never ask the user to paste a password into chat.** Recordings store names
+  like `SECRET.password`; Understudy reads the value from the user's settings
+  (`UNDERSTUDY_SECRET_PASSWORD`), or you pass one you fetched yourself in
+  `values`.
+- **Destructive flows** (purchases, deletions) are refused unless
+  `allowPurchases`. Start runs with `dryRun: true`.
 
-**1. The memory is the contract. The executor is not.** Always consult memory
-(`understudy_recall`, free, nothing runs). Then reach the goal however works:
-`understudy_run`, your own Playwright, the Playwright MCP, curl. A third-party
-checkout or a real purchase is an ordinary reason to drive it yourself. Unless
-the user asks for Understudy's executor specifically — then use it, and if it
-can't do the job, say so rather than quietly substituting.
+## The two questions a run can ask
 
-**2. Say which you used.** "Recalled the flow, then drove the checkout myself
-because it's a Stripe page" is one honest sentence. Implying the tool ran
-something you drove is the failure that costs trust.
+Runs plan before any browser opens.
 
-## Setup
+- **decompose** → `{"subGoals": [...]}`: what must happen, **in the order the
+  app does it**, phrased in the words of the app's flows (listed with the
+  question). Include prerequisites the user left out, like logging in. One
+  sub-goal naming a whole recorded flow beats several naming its parts. Tell
+  the user the sub-goals.
+- **seam** → `{"steps": [one click or goto]}` to get from one flow to the next,
+  or `{"steps": []}` **unless you actually know** — an answer is saved and
+  reused forever.
 
-Settings (`MONGODB_URI`, optional `EMBED_*`, login values) come from the
-environment, `--env-file <path>`, or the env file saved with `understudy
-config` — first wins. Check everything with `understudy doctor`. Without an
-embedding model, recall matches flow names instead of meaning.
+## Growing memory
 
-**Login values.** A recording stores a name like `SECRET.password`, never the
-value. At replay Understudy uses, first, a value you pass in `values` — e.g.
-one you fetched yourself from a secrets store or a test database — and
-otherwise reads `UNDERSTUDY_SECRET_PASSWORD` from settings itself, without you
-ever seeing it. Never ask the user to paste a password into chat; if you can't
-get it, ask them to add it to their env file (`understudy config set
-UNDERSTUDY_SECRET_PASSWORD=…`).
+- **The app doesn't have a flow?** Ask the user to record it
+  (`understudy_record`, then `understudy_save` once they've stopped), or drive
+  it yourself and save the Playwright script (`understudy_save` with `script`;
+  read passwords from `process.env`). Saving replays it first and keeps it only
+  if every step passes. Save what the user would want tested again; a one-off
+  is enough as facts and lessons. Saving needs no permission.
+- **Distilling** names a flow and splits it into reusable segments. **Ask the
+  user before each one**; any flow may be distilled. Refer to steps by index
+  only; preconditions are exactly `"authenticated"` or `"not authenticated"`;
+  reuse existing segment slugs rather than inventing synonyms.
+- **Learned something?** Keep a list and put it to the user at a natural pause,
+  then write the approved items in one `understudy_remember`:
+  a **fact** changes plans ("order history is at `/past-invoices`");
+  a **lesson** changes one step, matched by an exact trigger
+  (`url_pattern` / `action` / `role` / `name`, never empty);
+  a **finding** says the app is broken.
+  Reached a goal without `understudy_run`? Record it there as `reached`.
+- **Findings**: `understudy_findings` lists what looked broken; triage each as
+  `issue`, `lesson` or `noise`.
+- **Emails out of memory**: `understudy_app` with `placeholders: ["email"]`
+  makes email fields placeholders and moves the addresses to the user's env file.
 
-The MCP server is long-lived: after source changes, reconnect (`/mcp`) or the
-tools keep running the old code.
+## Traps
 
-## The tools
-
-| Tool | Use it to |
-|---|---|
-| `understudy_recall` | see what memory knows about a goal: closest flows, notes, a verdict — and for a known flow, its steps and the login values they need |
-| `understudy_run` | plan a goal and run it headless; may return a question first |
-| `understudy_answer` | answer a run's question; returns the next question or the result |
-| `understudy_distill` | get a saved flow's numbered steps to name and split |
-| `understudy_save_distilled` | store that (validated; every problem returned at once) |
-| `understudy_remember` | store facts, lessons, findings, and goals you reached yourself |
-| `understudy_findings` | list what looked broken; triage it |
-| `understudy_record` | wait for the user to record a flow in their Chrome |
-| `understudy_save` | prove a recording — or a script of a flow you drove — by replaying it, then keep it as a flow |
-
-**Driving a flow yourself.** For a known flow, recall returns its steps (role
-and name to find each element, or a test id / CSS when there's none, and `nth`
-when several match) and `needs`: each login value the steps use, which
-variable holds it, and whether it's set. A step's `placeholder` (e.g.
-`SECRET.password`) is a login value that was never stored — fetch it yourself
-if you can, or let `understudy_run` use it from settings.
-
-**Recall verdicts:** *known* — one flow clearly does it. *unsure* — something is
-close but not clearly it; look before acting. *unknown* — nothing does it.
-Judge the text, not just the score: a close match that is plainly a different
-thing is a gap.
-
-## Running a goal
-
-`understudy_run(app, goal)` plans before any browser opens, and can stop with
-one of two questions. Once the plan is complete it runs to the end; anything
-odd on the way (an unexpected page, a 500) comes back as findings, not
-questions. Start with `dryRun: true` — it's free.
-
-Login values: pass ones you have in `values`, or leave them to settings (see
-Setup).
-Destructive flows are refused unless `allowPurchases: true`.
-
-### Question 1: `decompose` — split the goal into sub-goals
-
-Answer `{"subGoals": ["log in as a member", "open the cart"]}`.
-
-**This is the highest-leverage thing you do.** Each sub-goal is a search
-against the app's vocabulary, which comes with the question. Phrase sub-goals
-in the words of a listed flow — its slug or title near-verbatim — or nothing
-binds and the run blocks. A sub-goal is one thing that must *happen*, not one
-click. Include prerequisites the user left out (log in first, if the next flow
-needs it). **The list is an order**: put them in the order the app does them,
-which may not be the order a person would say them. If one recorded flow
-covers the whole goal, one sub-goal naming it beats several naming its parts.
-
-**Say the sub-goals in your reply too**, not only in the tool call, so the user
-can correct them before they drive the run. Pass `subGoals` to `understudy_run`
-directly when you already know them.
-
-### Question 2: `seam` — how to get from one flow to the next
-
-Two bound flows often came from different recordings. The planner tries three
-bridges itself (no bridge needed, the page map, a plain URL) and asks only when
-all three fail. The question comes with evidence: where the first flow ends,
-how the next begins, and every known link out of that page.
-
-Answer `{"steps": [{"action": "click", "role": "link", "name": "Cart"}]}` or a
-`goto`. **Answer `{"steps": []}` unless you actually know** — a one-click answer
-is saved to the page map and reused forever, so a plausible guess becomes a
-wrong fact. Go and look first if you can (open the page). `[]` blocks the run,
-which is correct: it means "nobody knows how to get there".
-
-## Distilling a flow
-
-Optional. A saved flow runs as-is; distilling makes it better: what it's FOR,
-and reusable **segments** (e.g. "log in as a member" cut out of a checkout
-recording) — which is what lets one goal combine pieces of several recordings.
-
-**Ask the user before each distillation** — it rewrites how a flow is described
-and adds segments other goals will bind to. Any flow may be distilled, not just
-ones you saved; whether and when to offer is your call. What you learned while
-exploring is what makes a distillation good: you know what each part is for.
-
-You annotate and partition; you never author. Refer to steps by index only.
-`stepRange` is `[start, end)`. Easy to get wrong:
-
-- **Preconditions are exactly `"authenticated"` or `"not authenticated"`** (or
-  empty). Any other wording is rejected.
-- **Reuse existing slugs.** The request lists the app's segments; if a block
-  does the same thing as one, use its exact slug — that merges them. A synonym
-  creates two rivals for the same goal.
-- **Segments belong to the app, not the recording.** Name them so any future
-  flow could use them.
-- **Only report lessons or corrections the recording actually shows.**
-
-## Writing down what you learned
-
-You will learn things memory doesn't have — driving a flow by hand, reading an
-API response, losing an hour to a selector. **Write them down**: one row saves
-the next run.
-
-**Confirm first, and batch the ask.** Don't interrupt per item. Keep a list as
-you work and put it to the user at a natural pause: one line per item, tagged
-fact / lesson / finding. Then send the approved list in one `understudy_remember`.
-
-- A **fact** changes what you plan, and is found by meaning: "order history is
-  at `/past-invoices`", "reaching checkout texts a real phone". Prefer facts
-  about consequences over structure you could see by loading the page. A fact
-  with `marksDestructive: "<control name>"` makes any flow clicking that
-  control destructive.
-- A **lesson** changes one step, matched by exact trigger during execution:
-  "when filling Card number, dismiss Stripe Link first". Trigger keys are
-  `url_pattern`, `action`, `role`, `name`; an empty trigger is refused (it
-  would fire everywhere). `kind: "wait"` makes replay let the page settle
-  before that step.
-- A **finding** says the app is broken and someone should fix the app.
-
-The same observation is a lesson if you accept it and a finding if you don't.
-
-**Reached a goal without `understudy_run`? Record it** with `reached:
-[{goal, passed, drivenBy}]`. It is stored as *attributed*, never as a replay —
-"this goal works" and "the executor can do this" are different claims. Pass
-`sigSequence` only if you actually observed page fingerprints.
-
-## Triaging findings
-
-Detection already ran on every replay (console errors, failed requests, non-2xx
-responses, values that didn't stick, path drift). What's missing is judgement.
-`understudy_findings` lists them; route each as `issue` (fix the app), `lesson`
-(work around it — store the lesson), or `noise` (third-party telemetry,
-framework warnings). Triage the noise or it buries the signal.
-
-A lesson with `timesHelped` at 0 has never fired on a step that previously
-failed — usually its trigger is too broad, or its cause is gone.
-
-## When memory doesn't know something
-
-Check with `understudy_recall` first — it's free. If it's a gap, reach the goal
-however works, then capture it so it isn't done twice. **Would the user want it
-tested again?** Then it should become a flow — a saved flow runs later without
-you, in one cheap call, and is how drift and regressions get noticed. A
-one-off is enough as facts and lessons.
-
-- **You drove it yourself:** save it with `understudy_save` and `script` — a
-  Playwright script of exactly what you did. Read passwords from `process.env`
-  in it; they become placeholders (`ENV.X`, read from `X` at replay), never
-  stored values. It's proven by replay before it's kept, and marked as made by
-  an agent. Saving needs no permission; distilling it does.
-- Something the user can click through: **ask them to record it.** Call
-  `understudy_record` — it returns at once with what to tell them (start in
-  Chrome with the extension, do the flow, stop). When they say they've
-  stopped, call `understudy_save` with a name: it replays the recording to
-  prove it, and keeps it only if every step passes. (From a terminal it's
-  `understudy record <app>`, then `understudy save <hash> "<name>"`.)
-- **Anything with a file upload: never `record`.** Neither recorder can say
-  which file was picked. Write a Playwright script, then `understudy import <app>
-  <file>`. Read the import warnings: a dropped step is not a clean import.
-- **Anything irreversible** (a real order, a submission): don't save it as a
-  flow — saving replays it, and so does every run. Stop before that step
-  (`import --until <n>`), and store what you learned as facts and lessons.
-
-## Things that cost an hour if you don't know them
-
-- **Logins are often rate-limited.** One test app locks the account for 15
-  minutes. Every replay logs in cold. Use `dryRun`, and don't debug by
-  re-running the same replay. A recording made with `--arm-manually` restores
-  a saved session instead.
-- **"Locator matched no elements" isn't always a bad selector.** One app
-  rendered only its sidebar on the first visit after login. Check the page
-  rendered at all (`document.body.innerText`) before rewriting a selector.
-- **On Atlas, a newly saved flow takes a few seconds to become searchable.**
-  A recall straight after saving can miss it.
-- **A free Atlas cluster holds one Understudy database** (3 search indexes per
-  cluster; Understudy uses 2).
+- **File uploads can't be recorded** — write a Playwright script instead.
+- **Don't save anything irreversible** (a real order): saving replays it.
+- **Logins are often rate-limited**; a missing login value stops a run before
+  it opens a browser, so check `needs` from recall first.
+- **"Matched no elements" isn't always a bad selector** — check the page
+  rendered at all.
+- **On Atlas, a just-saved flow takes a few seconds to be searchable.**

@@ -122,7 +122,7 @@ test('recall finds the saved flow by name and by words, and refuses to guess', a
   // Enough to drive it yourself: the steps, and where the password comes from — never the password.
   assert.equal(byWords.steps?.length, 5);
   assert.deepEqual(byWords.steps?.[2], { n: 2, action: 'fill', role: 'textbox', name: 'Password', placeholder: 'SECRET.password' });
-  assert.deepEqual(byWords.needs, [{ placeholder: 'SECRET.password', readFrom: ['UNDERSTUDY_SECRET_PASSWORD'], set: false }]);
+  assert.deepEqual(byWords.needs, [{ placeholder: 'SECRET.password', readFrom: ['UNDERSTUDY_SHOP_SECRET_PASSWORD', 'UNDERSTUDY_SECRET_PASSWORD'], set: false }]);
   assert.equal(JSON.stringify(byWords).includes(values['SECRET.password']), false);
 
   const nope = await recall('shop', 'change my password');

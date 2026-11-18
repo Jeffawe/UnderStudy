@@ -17,6 +17,7 @@ import { embed, embedderConfig } from '../store/embed.js';
 import { flowDestructiveReason } from './destructive.js';
 import { prove } from './execute.js';
 import { recordRun } from './runs.js';
+import { applyPlaceholders } from '../memory/placeholders.js';
 
 /** "Log in as a member!" → "log-in-as-a-member" */
 export function slugify(title: string): string {
@@ -138,7 +139,11 @@ export interface ProveAndSave extends SaveOptions {
 export async function proveAndSave(recording: RawRecording, opts: ProveAndSave) {
   const proven = await prove(recording, { ...(opts.values ? { values: opts.values } : {}), ...(opts.headed ? { headed: true } : {}) });
   if (!proven.result.ok && !opts.force) return { saved: false as const, proven };
-  const flow = await saveFlow(proven.recording, proven.result, opts);
+  let flow = await saveFlow(proven.recording, proven.result, opts);
+  // The app keeps email fields as placeholders? Convert now — AFTER proving,
+  // so proving used the real address and needed no settings.
+  const placeholders = await applyPlaceholders(flow.app, undefined, flow.slug);
+  if (placeholders.converted.length) flow = (await (await collections()).flows.findOne({ _id: flow._id! }))!;
   const run = await recordRun({ app: flow.app, flow: flow.slug, result: proven.result, steps: flow.steps });
-  return { saved: true as const, proven, flow, run };
+  return { saved: true as const, proven, flow, run, placeholders };
 }

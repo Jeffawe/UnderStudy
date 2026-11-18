@@ -9,13 +9,16 @@
  *   runs      one attempt at a goal
  *
  * Steps live inside their flow, because you never want one without the other.
- * See ARCHITECTURE.md for the reasoning.
  */
 
 import type { ObjectId } from 'mongodb';
 import type { RawEvent } from '../core/recording.js';
 
 export type Precondition = 'authenticated' | 'not authenticated';
+
+/** Kinds of typed value an app can choose to keep as placeholders. Just email, for now. */
+export const PLACEHOLDER_KINDS = ['email'] as const;
+export type PlaceholderKind = (typeof PLACEHOLDER_KINDS)[number];
 
 /**
  * One action in a flow. Exactly the shape the recorder emits, minus its
@@ -29,6 +32,12 @@ export interface App {
   name: string;
   /** Base URL per environment, e.g. { local: 'http://localhost:3000' }. */
   urls: Record<string, string>;
+  /**
+   * Kinds of typed value to keep out of memory as placeholders, beyond the
+   * passwords that always are. `email`: email fields become `USER.email`, the
+   * value moves to the user's env file. See memory/placeholders.ts.
+   */
+  placeholders?: PlaceholderKind[];
   createdAt: Date;
 }
 

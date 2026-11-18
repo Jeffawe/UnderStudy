@@ -81,22 +81,70 @@ export function valueEnvName(ref: string): string {
   return `UNDERSTUDY_${ref.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_|_$/g, '').toUpperCase()}`;
 }
 
+/** The per-app variable: `UNDERSTUDY_SHOP_USER_EMAIL` for app `shop`, ref `USER.email`. */
+export function appValueEnvName(app: string, ref: string): string {
+  return valueEnvName(`${app}.${ref}`);
+}
+
 /**
- * Where a reference's value may be set, in the order they're tried.
- * `ENV.X` came from a script that read `process.env.X`, so `X` itself works too.
+ * Where a reference's value may be set, in the order they're tried: the
+ * per-app variable first (so two apps can use different test accounts), then
+ * the shared one. `ENV.X` came from a script that read `process.env.X`, so `X`
+ * itself works too.
  */
-export function valueEnvNames(ref: string): string[] {
-  const names = [valueEnvName(ref)];
+export function valueEnvNames(ref: string, app?: string): string[] {
+  const names = [...(app ? [appValueEnvName(app, ref)] : []), valueEnvName(ref)];
   if (ref.startsWith('ENV.')) names.push(ref.slice(4));
   return names;
 }
 
 /** Values for these references found in the environment. */
-export function valuesFromEnv(refs: Iterable<string>): Record<string, string> {
+export function valuesFromEnv(refs: Iterable<string>, app?: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const ref of refs) {
-    const name = valueEnvNames(ref).find((n) => process.env[n] !== undefined);
+    const name = valueEnvNames(ref, app).find((n) => process.env[n] !== undefined);
     if (name) out[ref] = process.env[name]!;
   }
   return out;
+}
+
+/** The env file Understudy writes to: the one given with --env-file, else the saved one, else ~/.understudy/understudy.env. */
+export function writableEnvFile(): string {
+  return envFileFlag() ?? (readConfig().envFile && expandHome(readConfig().envFile!)) ?? join(HOME, 'understudy.env');
+}
+
+/**
+ * Quote a value so dotenv reads it back EXACTLY. dotenv doesn't undo escapes
+ * like \" — a password with quotes in it would come back mangled — so pick a
+ * quote character the value doesn't contain: single quotes are fully literal.
+ */
+export function envFileQuote(key: string, value: string): string {
+  if (/[\r\n]/.test(value)) throw new Error(`${key}: values can't contain line breaks`);
+  for (const q of ["'", '"', '`']) {
+    if (!value.includes(q)) return q + value + q;
+  }
+  throw new Error(`${key}: the value contains ', " and \` — put it in the env file by hand, or set it in the environment`);
+}
+
+/**
+ * Write KEY=value lines into the env file (replacing a key already there),
+ * readable only by you, and apply them to this process too. If no env file was
+ * chosen yet, ~/.understudy/understudy.env becomes the saved one.
+ */
+export async function writeEnvValues(pairs: Record<string, string>): Promise<string> {
+  const file = writableEnvFile();
+  const cfg = readConfig();
+  if (!envFileFlag() && !cfg.envFile) await writeConfig({ ...cfg, envFile: file });
+  await mkdir(HOME, { recursive: true, mode: 0o700 }).catch(() => {});
+  const lines = existsSync(file) ? readFileSync(file, 'utf8').split('\n') : [];
+  for (const [key, value] of Object.entries(pairs)) {
+    const line = `${key}=${envFileQuote(key, value)}`;
+    const at = lines.findIndex((l) => l.startsWith(`${key}=`));
+    if (at >= 0) lines[at] = line;
+    else lines.push(line);
+    process.env[key] = value;
+  }
+  await writeFile(file, lines.filter((l, i) => l || i < lines.length - 1).join('\n').replace(/\n*$/, '\n'), { mode: 0o600 });
+  await chmod(file, 0o600).catch(() => {});
+  return file;
 }

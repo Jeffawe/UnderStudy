@@ -63,6 +63,8 @@ playwright-report/
 # public IPs and SSH details, the CockroachDB org id, cluster host and SQL user,
 # and absolute paths into a laptop nobody else has. Keep them local.
 CLAUDE.md
+ARCHITECTURE.md
+ROADMAP.md
 # The old CockroachDB-era working docs (BUILDING, PLAN, STATUS, STATUS-HISTORY),
 # archived 2026-11-18. Local only, as they always were.
 .understudy/legacy-docs/

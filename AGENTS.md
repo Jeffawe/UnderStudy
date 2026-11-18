@@ -39,9 +39,8 @@ Without MCP, every tool has a CLI equivalent: `understudy --help`.
 
 ## Changing the code
 
-- **Read `ARCHITECTURE.md` first** — the ideas, the layout, and why it's built
-  the way it is. `ROADMAP.md` is what's next. The old CockroachDB version is on
-  the `legacy-cockroach` branch.
+- Each module opens with a comment saying what it does and why — start there.
+  The old CockroachDB version is on the `legacy-cockroach` branch.
 - Keep it simple and readable: fewer concepts, plain names. Keep dependencies
   minimal unless the user approves a new one.
 - Write memory through `remember` / `saveDistilled`, never by hand: they

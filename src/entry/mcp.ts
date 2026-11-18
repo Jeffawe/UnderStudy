@@ -13,6 +13,7 @@
  *   understudy_findings        list open findings; triage them
  *   understudy_record          wait for the user to record a flow in their Chrome
  *   understudy_save            prove a recording by replaying it, then keep it as a flow
+ *   understudy_app             an app's settings — e.g. keep email fields as placeholders
  *
  * Long-lived: reconnect (/mcp) after changing the source.
  */
@@ -30,25 +31,20 @@ import { startExtensionRecorder, extensionDir, type ExtensionRecorder } from '..
 import { saveRecording, loadRecording } from '../core/recording-store.js';
 import { proveAndSave } from '../flows/save.js';
 import { parseScript } from '../adapters/recorder/script.js';
+import { setPlaceholders, appPlaceholders } from '../memory/placeholders.js';
 
 /**
  * Sent to the agent when it connects — its copy of the contract, since an
  * agent that installed Understudy from npm never sees REASONER.md. Kept short:
  * every session pays for it.
  */
-const INSTRUCTIONS = `Understudy runs end-to-end tests against the user's web apps from flows it remembers. You supply judgement; it never calls a model.
-
-Rules:
-- Memory first: understudy_recall is free (nothing runs). For a known flow it returns the steps and the login values they need, so you can drive it yourself. Reach the goal however works — understudy_run, or your own browser/Playwright. Say which you used; never imply Understudy ran something you drove.
-- Runs plan before any browser opens and may ask two questions:
-  · decompose → {"subGoals": [...]}: the things that must happen, IN THE ORDER the app does them, phrased in the words of the app's flows (listed with the question). Include implicit prerequisites (log in first). One sub-goal naming a whole recorded flow beats several naming its parts. Tell the user the sub-goals too.
-  · seam → {"steps": [one click or goto]}, or {"steps": []} unless you actually KNOW — an answer is saved and reused forever.
-- Start with dryRun: true. Destructive flows (purchases, deletions) are refused unless allowPurchases.
-- Login values: recordings store references like SECRET.password. Understudy reads the value from settings (UNDERSTUDY_SECRET_PASSWORD) itself, or you pass it in "values" — e.g. one you fetched from a secrets store or test database. Never ask the user to paste a password into chat; if you can't get it, ask them to add it to their Understudy env file.
-- Memory doesn't have a flow? Ask the user to record it (understudy_record, then understudy_save once they've stopped), or drive it yourself. If you drove it and the user would want it tested again, save it: understudy_save with "script" — a Playwright script of what you did, passwords read from process.env. Save replays it first and keeps it only if every step passes; yours are marked as made by an agent. A one-off? Just remember the facts and lessons.
-- Distilling names a saved flow and splits it into reusable segments. Ask the user before each distillation; any flow may be distilled.
-- Learned something (a fact that changes plans, a lesson that changes one step, a finding that the app is broken)? Gather them, put the list to the user at a natural pause, and write the approved ones in one understudy_remember. Reached a goal without understudy_run? Record it there too, as "reached".
-- understudy_findings lists what looked broken; triage each as issue, lesson or noise.`;
+const INSTRUCTIONS = `Understudy remembers the user's web-app flows and runs them as end-to-end tests. You supply judgement; it calls no model.
+- Recall first: free, runs nothing. A known flow comes with its steps and the login values it needs. Run it with understudy_run, or drive it yourself — say which.
+- Runs ask before a browser opens. decompose: subGoals in the order the app does them, in the words of its flows. seam: one click or goto, or [] unless you know — answers are reused forever. Start with dryRun.
+- Never ask for a password in chat. Values come from the user's settings (UNDERSTUDY_<NAME>), or pass ones you fetched yourself.
+- No flow for it? understudy_record (the user records) then understudy_save — or save a Playwright script of what you drove (understudy_save with script). Save what's worth testing again.
+- Ask the user before each distill. Gather facts, lessons and findings, get approval, then one understudy_remember.
+Full guide: REASONER.md in the package.`;
 
 const server = new McpServer({ name: 'understudy', version: '0.2.0' }, { instructions: INSTRUCTIONS });
 
@@ -90,18 +86,18 @@ async function continueRun(state: PlanState, opts: { headed?: boolean }) {
 }
 
 const values = z.record(z.string(), z.string()).optional()
-  .describe('Login values, e.g. {"SECRET.password":"…"} — ones you fetched yourself. Otherwise Understudy reads UNDERSTUDY_<REF> from settings. Never stored.');
+  .describe('Login values you fetched yourself, e.g. {"SECRET.password":"…"}; otherwise read from settings. Never stored.');
 
 server.registerTool('understudy_recall', {
-  description: 'What memory knows about a goal: closest flows and notes, and a verdict (known / unsure / unknown). When known, also the flow\'s steps — enough to drive it yourself — and the login values it needs (where they\'re set, never the values). Free, no browser. Call it before acting.',
+  description: 'What memory knows about a goal: closest flows and notes, and a verdict. A known flow comes with its steps and needed login values. Free; nothing runs.',
   inputSchema: { app: z.string(), goal: z.string(), limit: z.number().int().positive().optional() },
 }, ({ app, goal, limit }) => wrap(() => recall(app, goal, { withSteps: true, ...(limit ? { limit } : {}) })));
 
 server.registerTool('understudy_run', {
-  description: 'Plan a goal and run it headless. Returns a question (status "waiting": answer with understudy_answer), "blocked" with why, or the result. Pass subGoals to skip the decompose question. Destructive flows are refused unless allowPurchases.',
+  description: 'Plan a goal and run it headless. Returns a question to answer with understudy_answer, "blocked" with why, or the result.',
   inputSchema: {
     app: z.string(), goal: z.string(),
-    subGoals: z.array(z.string()).optional().describe('The goal split into sub-goals, in order, phrased in the app\'s words.'),
+    subGoals: z.array(z.string()).optional().describe('Skip the decompose question.'),
     dryRun: z.boolean().optional().describe('Plan only; open no browser.'),
     allowPurchases: z.boolean().optional(),
     values, headed: z.boolean().optional(),
@@ -118,7 +114,7 @@ server.registerTool('understudy_run', {
 }));
 
 server.registerTool('understudy_answer', {
-  description: 'Answer a waiting run\'s question. decompose → {"subGoals":[…]}. seam → {"steps":[{"action":"click","role":"…","name":"…"}]}, or {"steps":[]} unless you actually know (an answer is reused forever). Returns the next question, or the result.',
+  description: 'Answer a waiting run\'s question; returns the next one, or the result. decompose: {"subGoals":[…]}. seam: {"steps":[…]}, or {"steps":[]} unless you know.',
   inputSchema: { runId: z.string(), answer: z.record(z.string(), z.unknown()), values, headed: z.boolean().optional() },
 }, (a) => wrap(async () => {
   if (a.values) valuesByRun.set(a.runId, a.values);
@@ -126,17 +122,17 @@ server.registerTool('understudy_answer', {
 }));
 
 server.registerTool('understudy_distill', {
-  description: 'A saved flow\'s numbered, proven steps plus the app\'s vocabulary and instructions. Name it and split it into reusable segments by step index — never invent steps — then call understudy_save_distilled.',
+  description: 'A saved flow\'s numbered steps and the app\'s vocabulary, to name it and split it into segments. Ask the user first.',
   inputSchema: { app: z.string(), flow: z.string() },
 }, ({ app, flow }) => wrap(() => distillRequest(app, flow)));
 
 server.registerTool('understudy_save_distilled', {
-  description: 'Validate and store a distillation of a saved flow. Every problem is returned at once; nothing is written unless all is valid. Reusing an existing segment slug replaces that segment.',
+  description: 'Store a distillation. Validated; every problem returned at once; nothing written unless all is valid.',
   inputSchema: { app: z.string(), flow: z.string(), distilled: z.record(z.string(), z.unknown()) },
 }, ({ app, flow, distilled }) => wrap(() => saveDistilled(app, flow, distilled)));
 
 server.registerTool('understudy_remember', {
-  description: 'Store what you learned, in one batch: facts (change the plan), lessons (change one step; trigger keys url_pattern/action/role/name, never empty), findings (the app is broken), reached (a goal you reached WITHOUT understudy_run). Validated; every problem at once. Confirm the list with the user first.',
+  description: 'Store what you learned, as one approved batch: facts, lessons (trigger never empty), findings, and goals you reached without understudy_run.',
   inputSchema: {
     app: z.string(),
     facts: z.array(z.object({ text: z.string(), marksDestructive: z.string().optional() })).optional(),
@@ -152,7 +148,7 @@ server.registerTool('understudy_remember', {
 }))));
 
 server.registerTool('understudy_findings', {
-  description: 'Open findings for an app, most frequent first. Pass triage to route them: issue (the app should be fixed), lesson (accepted; store the workaround with understudy_remember), noise.',
+  description: 'Open findings for an app, most frequent first. Pass triage to route them: issue, lesson or noise.',
   inputSchema: {
     app: z.string(),
     triage: z.array(z.object({ fingerprint: z.string(), verdict: z.enum(['issue', 'lesson', 'noise']) })).optional(),
@@ -173,8 +169,8 @@ let recording: { app: string; rec: ExtensionRecorder } | null = null;
 const finished = new Map<string, { hash: string; steps: number; droppedUploads: number; at: Date }>();
 
 server.registerTool('understudy_record', {
-  description: 'Wait for the USER to record a flow in their own Chrome with the Understudy extension. Returns at once with what to tell them; when they stop, the recording is kept, then call understudy_save. Use when memory doesn\'t know a flow.',
-  inputSchema: { app: z.string(), port: z.number().int().min(0).max(65535).optional().describe('Default 7397; 0 = any free port.') },
+  description: 'Wait for the user to record a flow in their Chrome. Returns at once with what to tell them; then call understudy_save.',
+  inputSchema: { app: z.string(), port: z.number().int().min(0).max(65535).optional().describe('Default 7397.') },
 }, ({ app, port }) => wrap(async () => {
   if (recording) throw new Error(`already waiting for a recording of "${recording.app}" — the user needs to stop it first`);
   const rec = await startExtensionRecorder({ appSlug: app, ...(port ? { port } : {}) });
@@ -199,11 +195,11 @@ server.registerTool('understudy_record', {
 }));
 
 server.registerTool('understudy_save', {
-  description: 'Prove a flow by replaying it headless, then keep it — only if every step passes. Either the recording the user just finished (understudy_record), a recording hash, or `script`: a Playwright script of a flow YOU drove, kept as made by an agent. Save what the user would want tested again.',
+  description: 'Prove a flow by replaying it, and keep it only if every step passes: the user\'s latest recording, a recording hash, or a script of a flow you drove.',
   inputSchema: {
     app: z.string(), name: z.string().describe('What the flow does, as someone would ask for it.'),
     hash: z.string().optional(),
-    script: z.string().optional().describe('Path to a Playwright script (.ts/.js) of a flow you drove yourself. Read passwords from process.env in it; they become placeholders.'),
+    script: z.string().optional().describe('Path to a Playwright script of a flow you drove; read passwords from process.env.'),
     intent: z.string().optional(), slug: z.string().optional(), values,
   },
 }, (a) => wrap(async () => {
@@ -241,7 +237,19 @@ server.registerTool('understudy_save', {
     saved: true, flow: out.flow.slug, steps: out.flow.steps.length, madeBy, ...base,
     ...(out.flow.destructive ? { destructive: out.flow.destructiveBecause } : {}),
     findings: out.run.findings.map((f) => f.statement),
+    ...(out.placeholders.converted.length ? { placeholders: out.placeholders.converted } : {}),
   };
+}));
+
+server.registerTool('understudy_app', {
+  description: 'An app\'s settings. placeholders ["email"] keeps email addresses out of memory: they become placeholders, and the values move to the user\'s env file.',
+  inputSchema: {
+    app: z.string(),
+    placeholders: z.array(z.enum(['email'])).optional().describe('[] turns it off for new flows.'),
+  },
+}, ({ app, placeholders }) => wrap(async () => {
+  if (placeholders) return setPlaceholders(app, placeholders);
+  return { app, placeholders: await appPlaceholders(app) };
 }));
 
 await server.connect(new StdioServerTransport());

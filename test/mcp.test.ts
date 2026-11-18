@@ -13,10 +13,12 @@ const DB = 'understudy_test_mcp';
 let client: Client;
 let shop: FixtureApp;
 let recordings: string;
+let home: string;
 
 before(async () => {
   shop = await startFixtureApp();
   recordings = await mkdtemp(join(tmpdir(), 'understudy-recordings-'));
+  home = await mkdtemp(join(tmpdir(), 'understudy-home-'));
   client = new Client({ name: 'test', version: '1' });
   await client.connect(new StdioClientTransport({
     command: process.execPath,
@@ -24,6 +26,7 @@ before(async () => {
     env: {
       ...process.env, MONGODB_DB: DB, EMBED_URL: '', EMBED_MODEL: '', EMBED_KEY: '',
       UNDERSTUDY_RECORDINGS_DIR: recordings,
+      UNDERSTUDY_HOME: home, // anything it writes to an env file goes here, not your real one
       // A login value from settings, the way a user would set it — never through the chat.
       UNDERSTUDY_SECRET_PASSWORD: 'not-a-real-password',
       // An agent's own script reads its own variable; that works too.
@@ -34,6 +37,7 @@ before(async () => {
 after(async () => {
   await shop.close();
   await rm(recordings, { recursive: true, force: true });
+  await rm(home, { recursive: true, force: true });
   process.env.MONGODB_DB = DB;
   const { connect, close } = await import('../src/store/db.js');
   const d = await connect();
@@ -44,17 +48,17 @@ after(async () => {
 
 const text = (r: unknown) => ((r as { content: { text: string }[] }).content[0]!.text);
 
-test('nine tools and short instructions — every session pays for them', async () => {
+test('ten tools and short instructions — every session pays for them', async () => {
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map((t) => t.name).sort(), [
-    'understudy_answer', 'understudy_distill', 'understudy_findings', 'understudy_recall', 'understudy_record',
+    'understudy_answer', 'understudy_app', 'understudy_distill', 'understudy_findings', 'understudy_recall', 'understudy_record',
     'understudy_remember', 'understudy_run', 'understudy_save', 'understudy_save_distilled',
   ]);
   const total = tools.reduce((n, t) => n + (t.description?.length ?? 0) + JSON.stringify(t.inputSchema).length, 0);
   assert.ok(total < 11000, `tool definitions are ${total} chars — keep them lean`);
   const instructions = client.getInstructions() ?? '';
-  assert.match(instructions, /Memory first/, 'an npm-installed agent gets the contract on connect');
-  assert.ok(instructions.length < 2500, `instructions are ${instructions.length} chars — keep them short`);
+  assert.match(instructions, /Recall first/, 'an npm-installed agent gets the contract on connect');
+  assert.ok(instructions.length < 1400, `instructions are ${instructions.length} chars — keep them short`);
 });
 
 test('recall on an empty app says it does not know', async () => {
@@ -129,7 +133,7 @@ test('view the profile', async ({ page }) => {
 
     const recall = JSON.parse(text(await client.callTool({ name: 'understudy_recall', arguments: { app: 'shop', goal: 'view-the-profile' } })));
     assert.equal(recall.best.madeBy, 'agent');
-    assert.deepEqual(recall.needs, [{ placeholder: 'ENV.AGENT_SHOP_PASSWORD', readFrom: ['UNDERSTUDY_ENV_AGENT_SHOP_PASSWORD', 'AGENT_SHOP_PASSWORD'], set: true }]);
+    assert.deepEqual(recall.needs, [{ placeholder: 'ENV.AGENT_SHOP_PASSWORD', readFrom: ['UNDERSTUDY_SHOP_ENV_AGENT_SHOP_PASSWORD', 'UNDERSTUDY_ENV_AGENT_SHOP_PASSWORD', 'AGENT_SHOP_PASSWORD'], set: true }]);
 
     // A step that can't be replayed is refused outright, not saved with a hole in it.
     const bad = join(dir, 'bad.spec.ts');
@@ -142,6 +146,36 @@ test('x', async ({ page }) => {
     const refused = await client.callTool({ name: 'understudy_save', arguments: { app: 'shop', name: 'Bad', script: bad } });
     assert.equal(refused.isError, true);
     assert.match(text(refused), /can't be replayed/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an agent turns on email placeholders; a flow saved afterwards keeps its address out of memory', { timeout: 120_000 }, async () => {
+  const set = JSON.parse(text(await client.callTool({ name: 'understudy_app', arguments: { app: 'shop', placeholders: ['email'] } })));
+  assert.deepEqual(set.placeholders, ['email']);
+  const shown = JSON.parse(text(await client.callTool({ name: 'understudy_app', arguments: { app: 'shop' } })));
+  assert.deepEqual(shown.placeholders, ['email']);
+
+  const dir = await mkdtemp(join(tmpdir(), 'understudy-agent-script-'));
+  try {
+    const { writeFile } = await import('node:fs/promises');
+    const script = join(dir, 'with-email.spec.ts');
+    // The shop ignores what's typed as the username — an email works as well as 'demo'.
+    await writeFile(script, `import { test } from '@playwright/test';
+test('log in by email', async ({ page }) => {
+  await page.goto('${shop.url}');
+  await page.getByRole('textbox', { name: 'Username' }).fill('tester@shop.test');
+  await page.getByRole('textbox', { name: 'Password' }).fill(process.env.AGENT_SHOP_PASSWORD!);
+  await page.getByRole('button', { name: 'Log in' }).click();
+});`);
+    const saved = JSON.parse(text(await client.callTool({ name: 'understudy_save', arguments: { app: 'shop', name: 'Log in by email', script } })));
+    assert.equal(saved.saved, true, JSON.stringify(saved));
+    assert.equal(saved.placeholders?.[0]?.placeholder, 'USER.email', 'converted after it was proven');
+
+    const recall = JSON.parse(text(await client.callTool({ name: 'understudy_recall', arguments: { app: 'shop', goal: 'log-in-by-email' } })));
+    assert.equal(JSON.stringify(recall).includes('tester@shop.test'), false, 'the address is no longer in memory');
+    assert.ok(recall.needs.some((n: { placeholder: string; set: boolean }) => n.placeholder === 'USER.email' && n.set), 'and replay can find it');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

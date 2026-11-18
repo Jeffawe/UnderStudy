@@ -26,8 +26,9 @@ import { emitFlow, type Framework } from '../flows/emit.js';
 import { recordingFrom, proveAndSave } from '../flows/save.js';
 import { recordRun, type RecordedRun } from '../flows/runs.js';
 import { recall, type Recall } from '../memory/recall.js';
+import { setPlaceholders, appPlaceholders } from '../memory/placeholders.js';
 import * as store from '../store/db.js';
-import { valuesFromEnv, valueEnvName, readConfig, writeConfig, loadedFrom, HOME, expandHome } from '../store/settings.js';
+import { valueEnvName, readConfig, writeConfig, loadedFrom, HOME, expandHome, writeEnvValues } from '../store/settings.js';
 
 const USAGE = `understudy — learn a web app, then test it by intent
 
@@ -40,6 +41,7 @@ COMMANDS
   reembed               rebuild every vector with the model in .env
   record <app>          capture a flow in your own Chrome, with the extension
   extension             where the Chrome extension is, and how to load it
+  app <app>             an app's settings, e.g. --placeholder email
   import <app> <file>   read an existing Playwright script into a recording
   recordings [app]      list captured recordings
   save <hash> "<name>"  prove a recording by replaying it, then save it as a flow
@@ -237,19 +239,6 @@ async function cmdReembed() {
 // --- config ------------------------------------------------------------------
 
 /**
- * Quote a value so dotenv reads it back EXACTLY. dotenv doesn't undo escapes
- * like \" — a password with quotes in it would come back mangled — so pick a
- * quote character the value doesn't contain: single quotes are fully literal.
- */
-function envFileQuote(key: string, value: string): string {
-  if (/[\r\n]/.test(value)) fail(`${key}: values can't contain line breaks`);
-  for (const q of ["'", '"', '`']) {
-    if (!value.includes(q)) return q + value + q;
-  }
-  return fail(`${key}: the value contains ', " and \` — put it in the env file by hand, or set it in the environment`);
-}
-
-/**
  * understudy config                          where settings come from (no secrets shown)
  * understudy config --env-file <path>        read settings from this env file from now on
  * understudy config set KEY=value [...]      write settings into that env file
@@ -275,23 +264,8 @@ async function cmdConfig(positional: string[], flags: Flags) {
     if (!pairs.length || pairs.some((p) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(p))) {
       fail('config set needs KEY=value pairs', 'understudy config set MONGODB_URI="mongodb+srv://…" EMBED_KEY=…');
     }
-    const file = cfg.envFile ?? join(HOME, 'understudy.env');
-    if (!cfg.envFile) {
-      cfg.envFile = file;
-      await writeConfig(cfg);
-    }
-    await mkdir(HOME, { recursive: true, mode: 0o700 }).catch(() => {});
-    const lines = existsSync(file) ? (await readFile(file, 'utf8')).split('\n') : [];
-    for (const pair of pairs) {
-      const key = pair.slice(0, pair.indexOf('='));
-      const value = pair.slice(pair.indexOf('=') + 1);
-      const line = `${key}=${envFileQuote(key, value)}`;
-      const at = lines.findIndex((l) => l.startsWith(`${key}=`));
-      if (at >= 0) lines[at] = line;
-      else lines.push(line);
-    }
-    await writeFile(file, lines.filter((l, i) => l || i < lines.length - 1).join('\n').replace(/\n*$/, '\n'), { mode: 0o600 });
-    await chmod(file, 0o600).catch(() => {});
+    const values = Object.fromEntries(pairs.map((p) => [p.slice(0, p.indexOf('=')), p.slice(p.indexOf('=') + 1)]));
+    const file = await writeEnvValues(values).catch((e: Error) => fail(e.message));
     console.log(`wrote ${pairs.map((p) => p.slice(0, p.indexOf('='))).join(', ')} to ${file}`);
     return;
   }
@@ -452,6 +426,29 @@ async function cmdRecordExtension(slug: string, flags: Flags) {
   console.log(`\nhash  ${out.recording.hash}${existed ? '  (identical recording already existed)' : ''}`);
   console.log(`saved ${path}`);
   console.log(`\nnext: understudy save ${out.recording.hash} "<what this flow does>"`);
+}
+
+/**
+ * understudy app <app>                          the app's settings
+ * understudy app <app> --placeholder email      keep its email fields as placeholders
+ * understudy app <app> --no-placeholders        stop doing that for new flows
+ */
+async function cmdApp(positional: string[], flags: Flags) {
+  const app = positional[0] ?? fail('app needs an app name', 'understudy app myapp --placeholder email');
+  const kinds = all(flags, 'placeholder');
+  if (!kinds.length && !flags.has('no-placeholders')) {
+    const current = await appPlaceholders(app);
+    console.log(`${app}: placeholders ${current.length ? current.join(', ') : 'passwords only (the default)'}`);
+    return;
+  }
+  const out = await setPlaceholders(app, flags.has('no-placeholders') ? [] : kinds).catch((e: Error) => fail(e.message));
+  console.log(`${app}: placeholders ${out.placeholders.length ? out.placeholders.join(', ') + ' (and passwords)' : 'passwords only'}`);
+  for (const c of out.converted) {
+    console.log(`  ${c.placeholder.padEnd(14)} now used by ${c.flows.length} flow(s): ${c.flows.slice(0, 4).join(', ')}${c.flows.length > 4 ? ', …' : ''}`);
+    console.log(`  ${''.padEnd(14)} value in ${c.valueIn}`);
+  }
+  if (out.envFile) console.log(`moved the address(es) into ${out.envFile} — memory no longer holds them`);
+  else if (out.placeholders.includes('email') && !out.converted.length) console.log('no email fields with stored addresses in its flows — new ones will be converted when saved');
 }
 
 /** Where the Chrome extension is, and how to load it — it ships inside the package. */
@@ -797,6 +794,7 @@ async function cmdSave(positional: string[], flags: Flags) {
     return;
   }
   const { flow, run } = out;
+  for (const c of out.placeholders.converted) console.log(`\nemail    uses ${c.placeholder} (value in ${c.valueIn}) — this app keeps emails out of memory`);
   console.log(`\nsaved    ${flow.app}/${flow.slug}  (${flow.steps.length} steps${flow.embedding ? ', searchable by meaning' : ''})`);
   if (flow.destructive) console.log(`         DESTRUCTIVE — ${flow.destructiveBecause}. Replays need --allow-purchases.`);
   printRunReport(run);
@@ -877,6 +875,7 @@ async function main() {
     case 'doctor': return cmdDoctor();
     case 'config': return cmdConfig(rest, flags);
     case 'extension': return cmdExtension();
+    case 'app': return cmdApp(rest, flags);
     case 'reembed': return cmdReembed();
     case 'record': return cmdRecord(rest, flags);
     case 'import': return cmdImport(rest, flags);

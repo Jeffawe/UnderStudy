@@ -98,6 +98,7 @@ understudy replay myapp log-in-as-a-member  # run one flow
 understudy run myapp "sign in"              # find the flow for a goal, and run it
 understudy findings myapp                   # what looked broken
 understudy emit myapp log-in-as-a-member    # print it as a Playwright (or Cypress) test
+understudy app myapp --placeholder email    # keep email addresses out of memory (moves them to your env file)
 ```
 
 `understudy --help` lists everything. A flow that commits something real — a
@@ -131,7 +132,6 @@ what to write down.
 
 ## Learn more
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — how it fits together, for changing the code
 - [REASONER.md](REASONER.md) — how an agent should use it
 - [extension/README.md](extension/README.md) — the Chrome recorder
 

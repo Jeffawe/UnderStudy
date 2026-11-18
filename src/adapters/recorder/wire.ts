@@ -74,6 +74,8 @@ export function toRawEvent(
     ...(wire.testId ? { testId: wire.testId } : {}),
     ...(wire.testIdAttr ? { testIdAttr: wire.testIdAttr } : {}),
     ...(wire.frameHint ? { frameHint: wire.frameHint } : {}),
+    // Kept so an app can later choose to treat email fields as placeholders.
+    ...(wire.inputType === 'email' ? { hints: { inputType: 'email' } } : {}),
     url: wire.url,
     resolution,
   };
