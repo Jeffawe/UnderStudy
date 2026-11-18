@@ -35,7 +35,8 @@
     "prelude:check": "tsx src/core/prelude-check.ts",
     "handoff:check": "tsx src/core/handoff-check.ts",
     "upload:check": "tsx src/adapters/recorder/upload-check.ts",
-    "hair-loss:book": "tsx .understudy/explorations/hair-loss-book.ts"
+    "hair-loss:book": "tsx .understudy/explorations/hair-loss-book.ts",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/bedrock-sdk": "^0.32.1",
@@ -45,6 +46,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "dom-accessibility-api": "^0.7.1",
     "dotenv": "^17.2.3",
+    "mongodb": "^7.9.0",
     "pg": "^8.16.3",
     "pixelmatch": "^7.2.0",
     "playwright": "^1.62.1",

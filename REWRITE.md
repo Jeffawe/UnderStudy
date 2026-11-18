@@ -1,0 +1,245 @@
+# Understudy rewrite plan
+
+Written 2026-11-18. The plan for rebuilding Understudy in place on MongoDB.
+Nothing here is built yet. When a phase ships, tick it off here.
+
+## Goals
+
+1. **Easy to understand.** Few ideas, plain names. You should be able to read
+   any one file and know what it does without a map.
+2. **Easy to set up.** One connection string. No database binary to install,
+   no embedding model to download, no AWS.
+3. **Cheap.** Free for one person on a free Atlas cluster or a local Community
+   install.
+4. **Still efficient.** Keep what made Understudy worth having: recall that
+   hands back a working plan in about 1.5k tokens instead of 40–100k spent
+   driving a browser blind.
+5. **Works without AI.** Record, replay and run a named flow with no model and
+   no agent. The AI agent is an add-on that makes it smarter, not a requirement.
+
+## What changes, in one table
+
+| | Today | After |
+|---|---|---|
+| Database | CockroachDB, 19 tables, 12 migrations | MongoDB, 6 collections, no migrations |
+| Where the DB runs | Local binary or CockroachDB Cloud | Your Atlas cluster **or** Community Edition — any `MONGODB_URI` |
+| Embeddings | Local 1024-dim ONNX model, downloaded on first use | Voyage API (200M free tokens), optional |
+| Models | Bedrock (never used) + host agent | Host agent only, optional |
+| Recording | Playwright opens a new browser | Chrome extension on the tab you already have open (Playwright recorder kept as a fallback until the extension is proven) |
+| Replay | Local | Local only. A hosted instance never runs a browser |
+| Code | ~14.5k lines | Target ~5–6k |
+| Docs | ~28k words across 7 files | README + REASONER.md + ARCHITECTURE.md |
+| MCP tools | 11 | 7 |
+
+## The ideas you need — the whole list
+
+These seven nouns are the entire model. If a piece of code doesn't serve one of
+them, it goes.
+
+| Idea | Plain meaning |
+|---|---|
+| **App** | A website you test. Has a slug, one or more base URLs (local, staging, prod). |
+| **Flow** | A sequence of steps that does one thing — "log in as a member". A *recording* is a flow; a *segment* is a flow cut out of a recording so other flows can reuse it. |
+| **Step** | One action: `{action, target, value}`. `target` is how to find the element — role + accessible name first, test id or CSS as fallback. |
+| **Page** | A fingerprint of a page state (`sig()`): url pattern + title + landmarks + top control names. Lets a run check "am I where I expected?" Pages also store the known links between them. |
+| **Note** | Something learned. A *fact* changes what you plan ("order history is at `/past-invoices`"). A *lesson* has a trigger and changes one step ("when filling Card number, dismiss Stripe Link first"). |
+| **Finding** | "The app is broken here" — a 500 the UI swallowed, a value that didn't save. Someone fixes the app. |
+| **Run** | One attempt at a goal: the plan, what happened, the pages it passed through, and — if it is paused waiting on the agent — the open question. |
+
+Gone as separate ideas: mined macros, the shared selectors table, selector
+health and quarantine, memory chunks, context requests, sessions/messages, the
+embedder guard, run budgets.
+
+## Collections
+
+One collection per idea except Step, which lives inside its flow. A flow is
+naturally one document — you always want its steps with it — so there are no
+join tables and no composite keys to get wrong.
+
+```
+apps       { slug, name, urls: { local, staging, ... } }
+
+flows      { app, slug, title, intent, kind: 'recording'|'segment',
+             from?: { recording, steps: [start, end] },   // segments only
+             preconditions: ['authenticated'|'not authenticated'],
+             outcome, destructive, corrections: [...],
+             steps: [{ action, role?, name?, testId?, css?, frameHint?,
+                       value?, valueRef?, url, expectedSig? }],   // same shape the recorder emits
+             embedding?: [...], searchText }
+
+pages      { app, sig, urlPattern, title,
+             links: [{ to: sig, via: {role, name} }] }
+
+notes      { app, kind: 'fact'|'lesson', text,
+             trigger?: { url?, action?, role?, name? },   // lessons only
+             timesApplied, timesHelped, embedding?, searchText }
+
+findings   { app, kind, severity, statement, evidence, fingerprint,
+             occurrences, firstSeen, lastSeen, status: 'open'|'issue'|'lesson'|'noise' }
+
+runs       { app, goal, mode: 'run'|'replay'|'attributed', plan, status,
+             sigSequence: [...], events: [...], question?, startedAt, endedAt }
+```
+
+**Indexes.** Two vector indexes (`flows.embedding`, `notes.embedding`), each
+with `app` as a filter field. The free Atlas tier allows three search indexes
+per cluster, so this leaves one spare. Ordinary indexes on `{app, slug}`,
+`{app, sig}` and `{app, fingerprint}`.
+
+**Fixing a selector once fixes every flow.** The old shared selectors table
+existed for this. In Mongo it is one `updateMany` with an array filter on
+`steps.target` — no table needed.
+
+**Recordings stay on disk** under `.understudy/recordings/`, as now. They can
+hold typed values from real forms, so they never go to a shared database.
+Credentials are still `valueRef`s, never values.
+
+## Embeddings: Understudy calls Voyage directly
+
+MongoDB can embed for you ("automated embedding", index type `autoEmbed`), which
+would mean zero embedding code. **Not using it for now**, for two reasons found
+in the docs on 2026-11-18:
+
+- It is **Preview** on both Atlas and Community, and "might change at any time".
+- It embeds **one query per `$vectorSearch`**, so a goal with four sub-goals is
+  four embedding requests. Calling Voyage ourselves sends all four texts in
+  **one** request, and we can cache query vectors.
+
+Instead, Understudy makes one HTTP call to Voyage (`voyage-4-lite`, cheapest,
+$0.02 per 1M tokens after the free allowance) and stores the vector on the
+document. That is ~40 lines of code, works the same on Atlas and Community, and
+is easy to swap for `autoEmbed` later — the collections don't change.
+
+**Cost.** The first 200M tokens per model are free, one-time. A recall query is
+tens of tokens and a whole corpus is well under a million, so one person never
+pays. **But without a payment method on the Voyage account, it is capped at 3
+requests and 10K tokens per minute.** Adding a card lifts the cap and still
+costs $0 inside the free tokens. Batching (above) is what keeps us usable under
+the cap if someone doesn't add a card.
+
+**No Voyage key?** Recall falls back to matching flow names and titles. Record,
+replay and "run flow X by name" don't need search at all.
+
+## How it works after the rewrite
+
+**Without AI** — the whole loop:
+
+```
+record (extension)  →  understudy save <name>   → a flow
+understudy replay <flow>                        → runs it headless, reports pass/fail,
+                                                   console errors, failed requests,
+                                                   page drift vs last run
+understudy run "<flow name or goal>"            → picks the best-matching flow, runs it
+```
+
+**With an agent** (Claude Code, Codex, Cursor — over MCP), it adds four things:
+
+1. **Split** a recording into reusable segments (the distill step: annotate and
+   partition by step index, never invent steps).
+2. **Decompose** a goal into sub-goals so it can bind several flows.
+3. **Bridge** two segments that never appeared together (seams).
+4. **Judge** findings and propose notes.
+
+The pause-and-ask mechanism stays as it is: the run suspends, returns a
+question, the agent answers, the run continues. The open question lives on the
+run document instead of a separate table.
+
+**Seams get simpler.** Five rungs become three: (1) the pages already match,
+(2) the page graph has a link from here to there, (3) same site, so `goto` the
+URL. Otherwise ask the agent, and if it doesn't know, the run stops. The
+bridge-segment search and the live probe go.
+
+## The seven MCP tools
+
+| Tool | Does |
+|---|---|
+| `recall` | What does memory know about this goal? Free, no browser. |
+| `run` | Start a goal. Returns at the first question or the end. |
+| `answer` | Answer the run's open question. Returns at the next one or the end. |
+| `distill` | Hand the agent a recording's verified steps to split. |
+| `save_distilled` | Validate and store the split. Returns every problem at once. |
+| `remember` | Store facts, lessons and findings in one batch. Also records a goal the agent drove by hand. |
+| `findings` | List open findings; triage them when given a verdict. |
+
+Removed: `vocabulary` (it comes with `run`'s decompose question), `recordings`
+(the CLI lists them), `record_run` (folded into `remember`), `triage_finding`
+(folded into `findings`).
+
+## What happens to each part of the code
+
+**Keep, mostly as is** — this is the valuable part:
+`sig.ts`, the step format (`flow-ir.ts`), `injected.ts` and the accessible-name
+bundle (the in-page recorder — becomes the extension's content script), the
+script importer (`script.ts`, the only way to capture file uploads),
+`destructive.ts`, `lessons.ts`/`trigger.ts`, `drift.ts`, the distill contract
+(`distill.ts`), `emit.ts` (export a flow as a Playwright test).
+
+**Rewrite, smaller:**
+- `replay.ts` + `execute.ts` + `run.ts` → one **player** (walks steps in
+  Playwright, checks pages, applies lessons, collects events) and one **runner**
+  (plans and pauses). Currently 1,800 lines across three files with overlap.
+- `recall.ts`, `plan.ts`, `seams.ts` → on `$vectorSearch`, with the three-rung
+  seams above.
+- `ingest.ts` → `save.ts`: replay to prove it, then write one flow document.
+- `cli.ts` (1,378 lines) and `mcp.ts` → thin wrappers over the same functions.
+- `session.ts` + `auth-cache.ts` → one small saved-login cache.
+
+**Remove:**
+- `adapters/bedrock/*`, `adapters/distiller/*`, `adapters/reasoner/bedrock.ts`,
+  `adapters/embedder/*` (~800 lines)
+- `db/` (schema + 12 migrations), `scripts/db*.sh`, `cockroach-data/` (2 GB)
+- `macros.ts`, `health.ts`, `selector-identity.ts`, `budget.ts`, `vocabulary.ts`
+- The `*-check.ts` scripts → replaced by a real test suite (`node --test`)
+  against the local Community instance.
+
+**Park — not in the first version, maybe later:**
+- `explore.ts` (the automatic crawler) — 632 lines; useful but not core.
+- `visual.ts` + pixelmatch — screenshot diffs.
+- Preludes (`record --after`) and the mid-run handoff (`needs_capture`). The
+  extension changes both problems: recording in your real browser means you are
+  already logged in and already wherever you need to be.
+
+## Chrome extension recorder
+
+- Click the extension icon on the tab you're already using. That grants it the
+  page (`activeTab`), with no relaunch and no special flags.
+- A content script (today's `injected.ts`) records clicks, typing, selects and
+  navigation, using accessible names, as now.
+- It streams events to `understudy` over a localhost WebSocket. The CLI is the
+  thing that saves the recording; the extension stores nothing.
+- No `chrome.debugger` — it shows a "debugging this browser" banner and isn't
+  needed. Console and network capture happen at replay, which already does it.
+- Password fields become `valueRef`s in the content script, before anything
+  leaves the page.
+- Known limits: cross-origin iframes (payment forms) may be unreachable,
+  `chrome://` pages can't be recorded, file inputs give a name but no path (so
+  uploads still go through the script importer).
+- Distributed as an unpacked extension in the repo first; Chrome Web Store
+  later if there's demand.
+
+## Build order
+
+The rewrite happens on `main`. The old CockroachDB version is preserved on the
+`legacy-cockroach` branch (cut from `b47aac3`); each phase deletes from `main`
+what it replaces.
+
+| Phase | Builds | Done when |
+|---|---|---|
+| **0. Spike** | Connect to local Community + your Atlas free cluster. Create both vector indexes, embed via Voyage, query with `app` filter. | Same test passes on both URIs. **Local: done 2026-11-18** (`npm test`, `understudy doctor`). Atlas and Voyage still to do. |
+| **1. Store** | `src/store/`: types for the six collections, connect from `MONGODB_URI`, create indexes on first run. Delete Cockroach + Bedrock + ONNX code. | `understudy doctor` reports a healthy connection on both URIs. |
+| **2. Record & replay, no AI** | Player, `save`, `replay`, `flows`. Live recorder + script import ported. | Record login on a test app, replay it, see drift and findings. No key, no agent. |
+| **3. Run by goal, no AI** | Recall on Voyage (name match without a key), `run` picks one flow, safety gate, run documents. | `understudy run myapp "log in"` binds and runs the login flow. |
+| **4. Agent layer** | The seven MCP tools: distill/segments, decompose, three-rung seams, remember, findings. Rewrite `REASONER.md` to match. | A goal spanning two recordings binds two segments and runs. |
+| **5. Extension** | Chrome extension + localhost WebSocket. | Record a flow in your normal Chrome, replay it headless. |
+| **6. Clean up** | Copy the corpus across (one-off script). Rewrite README, write ARCHITECTURE.md, delete BUILDING/PLAN/STATUS/STATUS-HISTORY. | Fresh clone → working in under five minutes. |
+| **7. Hosted (later)** | Memory-only server: anyone points it at their own Mongo URI. No browsers. | Not scheduled. |
+
+## Decisions (2026-11-18)
+
+1. **Existing corpus:** a one-off script copies CockroachDB → Mongo, then is
+   deleted. Keeps facts and lessons no recording holds.
+2. **Playwright live recorder:** kept permanently as a fallback people can
+   choose. It is not removed in phase 6.
+3. **Export:** keep both Playwright and Cypress.
+4. **Build against local Community first.** Atlas is the same driver and the
+   same queries — switching is a connection-string change.

@@ -56,7 +56,8 @@ USAGE
   understudy <command> [options]
 
 COMMANDS
-  explore <slug>        crawl an app and learn its map, facts and boundaries
+  doctor                check the MongoDB connection and vector search
+  explore <slug>       crawl an app and learn its map, facts and boundaries
   recall <slug> <goal>  query the memory for a goal (what the planner sees)
   record <slug>         capture a flow in a headed browser
   recordings [slug]     list captured recordings
@@ -1287,6 +1288,33 @@ async function cmdRecall(positional: string[], flags: Flags) {
   );
 }
 
+/**
+ * Is the MongoDB connection healthy? Connects, creates any missing collections
+ * and indexes, and reports whether vector search is ready. Works the same
+ * against local Community and Atlas.
+ */
+async function cmdDoctor() {
+  const store = await import('../store/db.js');
+  console.log(`MongoDB    ${store.describeUri()}  (database: ${process.env.MONGODB_DB ?? 'understudy'})`);
+  try {
+    const db = await store.connect();
+    const info = await db.admin().serverInfo();
+    console.log(`server     ${info.version}`);
+    await store.ensureSchema();
+    console.log('schema     6 collections and their indexes present');
+    const states = await store.waitForVectorIndexes(60_000).catch(() => store.vectorIndexStates());
+    for (const s of states) {
+      console.log(`vector     ${s.collection.padEnd(6)} ${s.queryable ? 'ready' : `NOT READY (${s.status})`}`);
+    }
+    if (!states.every((s) => s.queryable)) {
+      console.log('\nvector search is not ready yet — a new index can take a minute; run doctor again.');
+      process.exitCode = 1;
+    }
+  } finally {
+    await store.close();
+  }
+}
+
 function notBuilt(command: string, blockedBy: string): never {
   console.error(`'understudy ${command}' is not built yet.`);
   console.error(`  blocked by: ${blockedBy}`);
@@ -1311,6 +1339,9 @@ async function main() {
   const [command, ...rest] = positional;
 
   switch (command) {
+    case 'doctor':
+      await cmdDoctor();
+      break;
     case 'explore':
       await cmdExplore(rest, flags);
       break;
