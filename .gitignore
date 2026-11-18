@@ -38,6 +38,11 @@ dist/
 # Local cockroach data dir
 cockroach-data/
 
+# JSON dump of the old CockroachDB corpus (2026-11-18), input to the one-off
+# copy into MongoDB. Same contents as the database: run events and steps can
+# carry real form data, so it stays local.
+.understudy/export/
+
 # Playwright
 playwright/.auth/
 test-results/

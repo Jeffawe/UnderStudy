@@ -1,5 +1,9 @@
 # AGENTS.md
 
+> **Mid-rewrite (2026-11-18):** `main` is moving to MongoDB and no longer has
+> CockroachDB or the `understudy_*` MCP tools. Read `REWRITE.md` first; the
+> CockroachDB version this file describes is on the `legacy-cockroach` branch.
+
 **Understudy** is an agent-assist tool that learns web apps from browser
 recordings and stores that knowledge as queryable memory in CockroachDB. The
 user should be able to ask for a goal, such as "test login", and have the

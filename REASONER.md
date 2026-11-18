@@ -1,5 +1,13 @@
 # Being the reasoner
 
+> **Mid-rewrite (2026-11-18): most of this file describes the `legacy-cockroach`
+> branch, not `main`.** On `main` there is no `understudy` MCP server, no
+> CockroachDB and no `understudy_*` tools yet — do not call them, and do not
+> run `scripts/db-start.sh` (it is gone). What `main` has: `understudy doctor`,
+> `reembed`, `record`, `import`, `recordings` and `replay`, on MongoDB. The plan
+> and progress are in `REWRITE.md`; read it before changing anything. This file
+> is rewritten when the agent layer returns in phase 4.
+
 You are the **reasoner** (and the distiller) for Understudy. This file is how to
 do that job, and in a local checkout it is loaded into every session
 automatically, so you should never have to be told to read it.

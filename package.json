@@ -1,53 +1,30 @@
 {
   "name": "understudy",
   "version": "0.1.0",
-  "description": "An agent that learns your app from browser recordings and stores that knowledge as queryable memory in CockroachDB.",
+  "description": "Learns a web app from browser recordings and keeps that knowledge as searchable memory in MongoDB, so you can say \"test login\" and it works.",
   "type": "module",
   "license": "MIT",
   "engines": {
     "node": ">=22"
   },
   "bin": {
-    "understudy": "./dist/entry/cli.js",
-    "understudy-mcp": "./dist/entry/mcp.js"
+    "understudy": "./dist/entry/cli.js"
   },
   "files": [
-    "dist",
-    "db/schema.sql",
-    "db/00-enable-vector.sql"
+    "dist"
   ],
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "db:start": "./scripts/db-start.sh",
-    "db:stop": "./scripts/db-stop.sh",
-    "db:sql": "./scripts/db.sh",
-    "db:schema": "./scripts/apply-schema.sh",
-    "embedder:check": "tsx src/adapters/embedder/check.ts",
-    "recall:check": "tsx src/core/recall-check.ts",
-    "sig:check": "tsx src/core/sig-check.ts",
-    "explore:check": "tsx src/core/explore-check.ts",
-    "auth:check": "tsx src/core/auth-check.ts",
     "understudy": "tsx src/entry/cli.ts",
     "vendor:accname": "node scripts/vendor-accname.mjs",
-    "mcp": "tsx src/entry/mcp.ts",
-    "bedrock:check": "tsx src/adapters/bedrock/check.ts",
-    "prelude:check": "tsx src/core/prelude-check.ts",
-    "handoff:check": "tsx src/core/handoff-check.ts",
-    "upload:check": "tsx src/adapters/recorder/upload-check.ts",
     "hair-loss:book": "tsx .understudy/explorations/hair-loss-book.ts",
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@anthropic-ai/bedrock-sdk": "^0.32.1",
-    "@anthropic-ai/sdk": "^0.116.0",
-    "@aws-sdk/client-bedrock-runtime": "^3.1107.0",
-    "@huggingface/transformers": "^3.7.6",
-    "@modelcontextprotocol/sdk": "^1.30.0",
     "dom-accessibility-api": "^0.7.1",
     "dotenv": "^17.2.3",
     "mongodb": "^7.9.0",
-    "pg": "^8.16.3",
     "pixelmatch": "^7.2.0",
     "playwright": "^1.62.1",
     "pngjs": "^7.0.0",
@@ -55,7 +32,6 @@
   },
   "devDependencies": {
     "@types/node": "^22.18.9",
-    "@types/pg": "^8.15.6",
     "@types/pngjs": "^6.0.5",
     "tsx": "^4.20.6"
   }

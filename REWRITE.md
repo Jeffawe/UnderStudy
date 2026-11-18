@@ -251,7 +251,7 @@ what it replaces.
 | Phase | Builds | Done when |
 |---|---|---|
 | **0. Spike** | Connect to local Community + your Atlas free cluster. Create both vector indexes, embed via Voyage, query with `app` filter. | Same test passes on both URIs. **Done 2026-11-18.** Local: `npm test` + `doctor`. Atlas: `doctor` + a real Voyage search, same rankings and scores as local. See *What phase 0 taught us*. |
-| **1. Store** | `src/store/`: types for the six collections, connect from `MONGODB_URI`, create indexes on first run. Delete Cockroach + Bedrock + ONNX code. | `understudy doctor` reports a healthy connection on both URIs. |
+| **1. Store** | `src/store/`: types for the six collections, connect from `MONGODB_URI`, create indexes on first run. Delete Cockroach + Bedrock + ONNX code. | `understudy doctor` reports a healthy connection on both URIs. **Done 2026-11-18** — see *Phase 1 notes*. |
 | **2. Record & replay, no AI** | Player, `save`, `replay`, `flows`. Live recorder + script import ported. | Record login on a test app, replay it, see drift and findings. No key, no agent. |
 | **3. Run by goal, no AI** | Recall on Voyage (name match without a key), `run` picks one flow, safety gate, run documents. | `understudy run myapp "log in"` binds and runs the login flow. |
 | **4. Agent layer** | The seven MCP tools: distill/segments, decompose, three-rung seams, remember, findings. Rewrite `REASONER.md` to match. | A goal spanning two recordings binds two segments and runs. |
@@ -277,6 +277,29 @@ what it replaces.
   "I don't know this" cutoff gets calibrated on real flows in phase 3.
 - Atlas free runs MongoDB 8.0.37; local Community runs 9.0.8. No difference
   seen for anything used so far.
+
+## Phase 1 notes (2026-11-18)
+
+- **What `main` can do now:** `doctor`, `reembed`, `record`, `import`,
+  `recordings`, `replay`. The CLI remembers an app's base URL in MongoDB's
+  `apps` collection (`urls.default`). Everything else returns in phases 2–4.
+- **Not yet back:** `record --after` and replaying a recording that has a
+  prelude (refused with a clear message), and lessons during replay (phase 3).
+- **Removed:** Bedrock, ONNX embedder, reasoner/distiller adapters, the MCP
+  server, `pg`, the schema and migrations, the `db*.sh` scripts, all
+  `*-check.ts` scripts, and the core modules that only talked to CockroachDB.
+  `node_modules` went from 514 MB to 95 MB; `src/` went from ~14.5k lines to
+  ~5k (before phases 2–4 add back what they rebuild).
+- **Ported later, not rewritten from memory:** several removed files hold logic
+  the plan keeps (`destructive`, `lessons`, `drift`, `emit`, `flow-ir`,
+  `remember`, `seams`). When a phase needs one, start from
+  `git show legacy-cockroach:src/core/<file>.ts` and swap SQL for MongoDB.
+- **The old corpus is exported** to `.understudy/export/*.json` (all 19 tables,
+  2.5 MB, gitignored, vectors dropped — they get re-embedded with Voyage). That
+  is the input to the phase 6 copy; CockroachDB is no longer needed to read it.
+- **Known replay failure, not a regression:** old saucedemo recordings predate
+  `testIdAttr`, so a bare `data-test` id like `shopping-cart-link` matches
+  nothing. Re-record or re-import them.
 
 ## Decisions (2026-11-18)
 

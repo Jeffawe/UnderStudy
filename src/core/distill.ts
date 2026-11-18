@@ -29,7 +29,25 @@ import { join, resolve } from 'node:path';
 import { triggerProblems } from './trigger.js';
 import type { RawRecording } from './recording.js';
 import type { ReplayResult } from './replay.js';
-import type { Vocabulary } from './vocabulary.js';
+/**
+ * What the app already knows, handed to the distiller so it reuses existing
+ * segment slugs instead of inventing synonyms. Built from MongoDB in phase 4.
+ */
+export interface Vocabulary {
+  /** Reusable segments — the primary vocabulary, what a sub-goal binds to. */
+  segments: Array<{
+    slug: string;
+    title: string;
+    intent: string;
+    steps: number;
+    preconditions: string[];
+    outcome: string | null;
+  }>;
+  /** Whole recorded flows, for coarser matches. */
+  flows: Array<{ slug: string; title: string; intent: string }>;
+  /** What is known to be true about the app, phrased as the corpus phrases it. */
+  facts: string[];
+}
 
 export const DISTILLED_DIR =
   process.env.UNDERSTUDY_DISTILLED_DIR ?? resolve('.understudy/distilled');

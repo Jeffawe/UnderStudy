@@ -1,5 +1,12 @@
 # Understudy
 
+> **Being rewritten on MongoDB (November 2026).** `main` is mid-rewrite: today
+> it records, imports and replays flows, and `understudy doctor` checks a
+> MongoDB connection. Memory, planning and the MCP tools come back in the next
+> phases — see [REWRITE.md](REWRITE.md). The previous CockroachDB version,
+> which the rest of this README describes, is on the
+> [`legacy-cockroach`](../../tree/legacy-cockroach) branch.
+
 A system that learns a web app from browser recordings and stores what it learned
 as **queryable memory**, so you can say *"test login"* and it works — including
 for goals no single recording covers.
