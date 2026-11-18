@@ -8,13 +8,11 @@
 
 import 'dotenv/config';
 import { MongoClient, type Db, type Collection, type Document } from 'mongodb';
-import type { App, Flow, Page, Note, Finding, Run } from './types.js';
+import type { App, Flow, Page, Note, Finding, Run, EmbedderMeta } from './types.js';
+import { embedderConfig } from './embed.js';
 
-/**
- * Length of every embedding. voyage-4-lite's default output size. Changing it
- * means re-embedding everything, and the vector indexes are rebuilt to match.
- */
-export const EMBED_DIMS = 1024;
+/** Vector length when no model has ever been configured. */
+const DEFAULT_DIMS = 1024;
 
 let client: MongoClient | undefined;
 let db: Db | undefined;
@@ -60,6 +58,7 @@ export async function collections() {
     notes: d.collection<Note>('notes'),
     findings: d.collection<Finding>('findings'),
     runs: d.collection<Run>('runs'),
+    meta: d.collection<EmbedderMeta>('meta'),
   };
 }
 
@@ -93,10 +92,10 @@ async function vectorIndexInfo(coll: Collection<Document>): Promise<SearchIndexI
   return (await coll.listSearchIndexes(VECTOR_INDEX).toArray())[0] as SearchIndexInfo | undefined;
 }
 
-function vectorDefinition() {
+function vectorDefinition(dims: number) {
   return {
     fields: [
-      { type: 'vector', path: 'embedding', numDimensions: EMBED_DIMS, similarity: 'cosine' },
+      { type: 'vector', path: 'embedding', numDimensions: dims, similarity: 'cosine' },
       { type: 'filter', path: 'app' },
       { type: 'filter', path: 'kind' },
     ],
@@ -104,12 +103,39 @@ function vectorDefinition() {
 }
 
 /**
+ * One embedding model per database. The first time a model is configured it is
+ * recorded; after that, a different model in .env stops everything with a clear
+ * message instead of silently mixing two incomparable kinds of vector.
+ * Returns the vector length the indexes should use.
+ */
+export async function checkEmbedder(): Promise<number> {
+  const { meta } = await collections();
+  const cfg = embedderConfig();
+  const stored = await meta.findOne({ _id: 'embedder' });
+
+  if (!cfg) return stored?.dims ?? DEFAULT_DIMS; // no model: name matching only
+  if (!stored) {
+    await meta.insertOne({ _id: 'embedder', model: cfg.model, dims: cfg.dims, setAt: new Date() });
+    return cfg.dims;
+  }
+  if (stored.model !== cfg.model || stored.dims !== cfg.dims) {
+    throw new Error(
+      `this database was embedded with ${stored.model} (${stored.dims} numbers per vector), ` +
+        `but .env says ${cfg.model} (${cfg.dims}). Vectors from different models can't be compared. ` +
+        `Either set EMBED_MODEL back, or run \`understudy reembed\` to rebuild everything with the new model.`,
+    );
+  }
+  return cfg.dims;
+}
+
+/**
  * Create anything missing. Safe to call on every start: existing collections
- * and indexes are left alone, and a vector index whose definition has drifted
- * (e.g. EMBED_DIMS changed) is updated in place.
+ * and indexes are left alone, and a vector index whose length no longer
+ * matches the model is updated in place.
  */
 export async function ensureSchema(): Promise<void> {
   const d = await connect();
+  const dims = await checkEmbedder();
   const existing = new Set((await d.listCollections({}, { nameOnly: true }).toArray()).map((c) => c.name));
 
   for (const [name, indexes] of Object.entries(INDEXES)) {
@@ -123,7 +149,7 @@ export async function ensureSchema(): Promise<void> {
   for (const name of VECTOR_COLLECTIONS) {
     const coll = d.collection(name);
     const current = await vectorIndexInfo(coll);
-    const wanted = vectorDefinition();
+    const wanted = vectorDefinition(dims);
     if (!current) {
       await coll.createSearchIndex({ name: VECTOR_INDEX, type: 'vectorSearch', definition: wanted });
     } else if (JSON.stringify(current.latestDefinition) !== JSON.stringify(wanted)) {

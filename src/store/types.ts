@@ -110,6 +110,18 @@ export interface Finding {
   status: 'open' | 'issue' | 'lesson' | 'noise';
 }
 
+/**
+ * Which embedding model filled this database. Vectors from two models can't be
+ * compared, so Understudy refuses to start if .env names a different one.
+ * Lives in the one-document `meta` collection.
+ */
+export interface EmbedderMeta {
+  _id: 'embedder';
+  model: string;
+  dims: number;
+  setAt: Date;
+}
+
 export interface Run {
   _id?: ObjectId;
   app: string;

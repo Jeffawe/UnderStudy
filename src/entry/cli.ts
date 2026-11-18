@@ -56,7 +56,8 @@ USAGE
   understudy <command> [options]
 
 COMMANDS
-  doctor                check the MongoDB connection and vector search
+  doctor                check the MongoDB connection, vector search and embedder
+  reembed               rebuild every vector with the model in .env
   explore <slug>       crawl an app and learn its map, facts and boundaries
   recall <slug> <goal>  query the memory for a goal (what the planner sees)
   record <slug>         capture a flow in a headed browser
@@ -1301,7 +1302,16 @@ async function cmdDoctor() {
     const info = await db.admin().serverInfo();
     console.log(`server     ${info.version}`);
     await store.ensureSchema();
-    console.log('schema     6 collections and their indexes present');
+    console.log('schema     collections and indexes present');
+
+    const { embedderConfig, embed } = await import('../store/embed.js');
+    const cfg = embedderConfig();
+    if (!cfg) {
+      console.log('embedder   none configured — search will match names only (set EMBED_URL + EMBED_MODEL)');
+    } else {
+      const [v] = await embed(['understudy doctor'], 'query', cfg);
+      console.log(`embedder   ${cfg.model} at ${new URL(cfg.url).host} — ok, ${v!.length} numbers per vector`);
+    }
     const states = await store.waitForVectorIndexes(60_000).catch(() => store.vectorIndexStates());
     for (const s of states) {
       console.log(`vector     ${s.collection.padEnd(6)} ${s.queryable ? 'ready' : `NOT READY (${s.status})`}`);
@@ -1342,6 +1352,17 @@ async function main() {
     case 'doctor':
       await cmdDoctor();
       break;
+    case 'reembed': {
+      const { reembed } = await import('../store/reembed.js');
+      const { close } = await import('../store/db.js');
+      try {
+        const r = await reembed();
+        console.log(`re-embedded ${r.flows} flows and ${r.notes} notes with ${r.model}`);
+      } finally {
+        await close();
+      }
+      break;
+    }
     case 'explore':
       await cmdExplore(rest, flags);
       break;

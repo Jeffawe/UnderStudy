@@ -21,9 +21,9 @@ Nothing here is built yet. When a phase ships, tick it off here.
 
 | | Today | After |
 |---|---|---|
-| Database | CockroachDB, 19 tables, 12 migrations | MongoDB, 6 collections, no migrations |
+| Database | CockroachDB, 19 tables, 12 migrations | MongoDB, 6 collections (+ a one-document `meta`), no migrations |
 | Where the DB runs | Local binary or CockroachDB Cloud | Your Atlas cluster **or** Community Edition — any `MONGODB_URI` |
-| Embeddings | Local 1024-dim ONNX model, downloaded on first use | Voyage API (200M free tokens), optional |
+| Embeddings | Local 1024-dim ONNX model, downloaded on first use | Any OpenAI-style endpoint — Voyage by default (200M free tokens), Ollama for free/offline — optional |
 | Models | Bedrock (never used) + host agent | Host agent only, optional |
 | Recording | Playwright opens a new browser | Chrome extension on the tab you already have open (Playwright recorder kept as a fallback until the extension is proven) |
 | Replay | Local | Local only. A hosted instance never runs a browser |
@@ -79,6 +79,8 @@ findings   { app, kind, severity, statement, evidence, fingerprint,
 
 runs       { app, goal, mode: 'run'|'replay'|'attributed', plan, status,
              sigSequence: [...], events: [...], question?, startedAt, endedAt }
+
+meta       { _id: 'embedder', model, dims, setAt }   // one document: which model filled this database
 ```
 
 **Indexes.** Two vector indexes (`flows.embedding`, `notes.embedding`), each
@@ -94,31 +96,54 @@ existed for this. In Mongo it is one `updateMany` with an array filter on
 hold typed values from real forms, so they never go to a shared database.
 Credentials are still `valueRef`s, never values.
 
-## Embeddings: Understudy calls Voyage directly
+## Embeddings: any model, one adapter
 
-MongoDB can embed for you ("automated embedding", index type `autoEmbed`), which
-would mean zero embedding code. **Not using it for now**, for two reasons found
-in the docs on 2026-11-18:
+**Built 2026-11-18** — `src/store/embed.ts`, `src/store/reembed.ts`.
 
-- It is **Preview** on both Atlas and Community, and "might change at any time".
-- It embeds **one query per `$vectorSearch`**, so a goal with four sub-goals is
-  four embedding requests. Calling Voyage ourselves sends all four texts in
-  **one** request, and we can cache query vectors.
+Understudy makes the vectors itself and stores them on the document. MongoDB
+doesn't care where a vector came from, so **any embedding model works**.
 
-Instead, Understudy makes one HTTP call to Voyage (`voyage-4-lite`, cheapest,
-$0.02 per 1M tokens after the free allowance) and stores the vector on the
-document. That is ~40 lines of code, works the same on Atlas and Community, and
-is easy to swap for `autoEmbed` later — the collections don't change.
+Most providers speak the same format — POST `{ model, input: [texts] }` to
+`/v1/embeddings`, get back `data[].embedding` — so there is **one adapter**,
+configured by four settings, not one adapter per vendor:
 
-**Cost.** The first 200M tokens per model are free, one-time. A recall query is
-tens of tokens and a whole corpus is well under a million, so one person never
-pays. **But without a payment method on the Voyage account, it is capped at 3
-requests and 10K tokens per minute.** Adding a card lifts the cap and still
-costs $0 inside the free tokens. Batching (above) is what keeps us usable under
-the cap if someone doesn't add a card.
+```
+EMBED_URL=https://api.voyageai.com/v1/embeddings   # or OpenAI, Mistral, Together…
+EMBED_MODEL=voyage-4-lite                          # or http://localhost:11434/v1/embeddings (Ollama: free, offline)
+EMBED_KEY=…                                        # if the endpoint needs one
+EMBED_DIMS=1024                                    # vector length the model returns
+```
 
-**No Voyage key?** Recall falls back to matching flow names and titles. Record,
-replay and "run flow X by name" don't need search at all.
+The one vendor-specific line: Voyage embeds search queries and stored documents
+differently and is told which by `input_type`, so that field is sent to Voyage
+only (other providers reject unknown fields).
+
+**Two rules that come with choosing:**
+
+1. **One model per database.** Vectors from two models can't be compared, and
+   mixing them returns confident nonsense with no error. The first model seen
+   is recorded in a one-document `meta` collection; a different model in `.env`
+   stops everything with a message saying so.
+2. **Changing model = `understudy reembed`.** Rebuilds every vector and resizes
+   the indexes. A corpus is a few hundred short texts — a handful of requests.
+
+**Voyage is the default.** Cheapest is `voyage-4-lite` at $0.02 per 1M tokens
+after the free allowance. The first 200M tokens per model are free, one-time; a
+recall query is tens of tokens and a whole corpus is well under a million, so
+one person never pays. **But without a payment method on the Voyage account it
+is capped at 3 requests and 10K tokens per minute.** Adding a card lifts the cap
+and still costs $0 inside the free tokens. The adapter sends up to 128 texts per
+request and waits and retries on a 429, which keeps it usable under the cap.
+
+**MongoDB's own embedding** ("automated embedding", index type `autoEmbed`)
+would be a *second mode*, not another adapter: Understudy sends text, the index
+embeds it, the adapter goes unused. Not used for now — it is **Preview** on
+Atlas and Community, and it embeds one query per `$vectorSearch` where the
+adapter batches several sub-goals into one request.
+
+**No model at all?** Leave `EMBED_URL` and `EMBED_MODEL` unset. Recall falls
+back to matching flow names and titles. Record, replay and "run flow X by
+name" don't need search at all.
 
 ## How it works after the rewrite
 
