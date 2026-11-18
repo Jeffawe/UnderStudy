@@ -27,10 +27,13 @@ environment, `--env-file <path>`, or the env file saved with `understudy
 config` — first wins. Check everything with `understudy doctor`. Without an
 embedding model, recall matches flow names instead of meaning.
 
-**Login values never go through the chat.** A recording stores references like
-`SECRET.password`; the value is read from `UNDERSTUDY_SECRET_PASSWORD`. If one
-is missing, ask the user to add it to their Understudy env file (`understudy
-config set UNDERSTUDY_SECRET_PASSWORD=…`) — don't ask them to paste it to you.
+**Login values.** A recording stores a name like `SECRET.password`, never the
+value. At replay Understudy uses, first, a value you pass in `values` — e.g.
+one you fetched yourself from a secrets store or a test database — and
+otherwise reads `UNDERSTUDY_SECRET_PASSWORD` from settings itself, without you
+ever seeing it. Never ask the user to paste a password into chat; if you can't
+get it, ask them to add it to their env file (`understudy config set
+UNDERSTUDY_SECRET_PASSWORD=…`).
 
 The MCP server is long-lived: after source changes, reconnect (`/mcp`) or the
 tools keep running the old code.
@@ -61,8 +64,8 @@ one of two questions. Once the plan is complete it runs to the end; anything
 odd on the way (an unexpected page, a 500) comes back as findings, not
 questions. Start with `dryRun: true` — it's free.
 
-Login values come from the user's settings (see Setup); `values` exists for
-one-off overrides, but prefer settings so a password never enters the chat.
+Login values: pass ones you have in `values`, or leave them to settings (see
+Setup).
 Destructive flows are refused unless `allowPurchases: true`.
 
 ### Question 1: `decompose` — split the goal into sub-goals

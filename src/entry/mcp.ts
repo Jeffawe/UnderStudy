@@ -43,7 +43,7 @@ Rules:
   · decompose → {"subGoals": [...]}: the things that must happen, IN THE ORDER the app does them, phrased in the words of the app's flows (listed with the question). Include implicit prerequisites (log in first). One sub-goal naming a whole recorded flow beats several naming its parts. Tell the user the sub-goals too.
   · seam → {"steps": [one click or goto]}, or {"steps": []} unless you actually KNOW — an answer is saved and reused forever.
 - Start with dryRun: true. Destructive flows (purchases, deletions) are refused unless allowPurchases.
-- Login values: recordings store references like SECRET.password, read from settings as UNDERSTUDY_SECRET_PASSWORD. Never ask the user to paste a password into chat; ask them to add it to their Understudy env file.
+- Login values: recordings store references like SECRET.password. Understudy reads the value from settings (UNDERSTUDY_SECRET_PASSWORD) itself, or you pass it in "values" — e.g. one you fetched from a secrets store or test database. Never ask the user to paste a password into chat; if you can't get it, ask them to add it to their Understudy env file.
 - Memory doesn't have a flow? Ask the user to record it: understudy_record, then understudy_save when they've stopped. Save replays it first and keeps it only if every step passes.
 - Learned something (a fact that changes plans, a lesson that changes one step, a finding that the app is broken)? Gather them, put the list to the user at a natural pause, and write the approved ones in one understudy_remember. Reached a goal without understudy_run? Record it there too, as "reached".
 - understudy_findings lists what looked broken; triage each as issue, lesson or noise.`;
@@ -88,7 +88,7 @@ async function continueRun(state: PlanState, opts: { headed?: boolean }) {
 }
 
 const values = z.record(z.string(), z.string()).optional()
-  .describe('Values for steps that deliberately store none, e.g. {"SECRET.password":"…"}. Never stored.');
+  .describe('Login values, e.g. {"SECRET.password":"…"} — ones you fetched yourself. Otherwise Understudy reads UNDERSTUDY_<REF> from settings. Never stored.');
 
 server.registerTool('understudy_recall', {
   description: 'What memory knows about a goal: closest flows and notes, and a verdict (known / unsure / unknown). A database query — free, no browser. Call it before acting.',

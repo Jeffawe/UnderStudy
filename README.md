@@ -39,35 +39,39 @@ You need **Node 22+** and a **MongoDB** with vector search — a free
 Community Edition with `mongot` running locally.
 
 ```bash
-npm install -g @jeffawe/understudy               # ~80 MB  (not published yet — see below)
+npm install -g @jeffawe/understudy               # 
 npx playwright install --only-shell chromium     # the headless browser replay uses, ~200 MB
-understudy config set MONGODB_URI="mongodb+srv://…"
-understudy doctor                                # connection, vector search, embedder, browser
-understudy extension                             # where the Chrome recorder is, and how to load it
+
+understudy config set \
+  MONGODB_URI="mongodb+srv://…" \
+  EMBED_URL=https://api.voyageai.com/v1/embeddings EMBED_MODEL=voyage-4-lite EMBED_KEY="…"
 ```
 
-**Settings** come from, highest first: real environment variables, then
-`--env-file <path>` on any command, then the env file saved with
-`understudy config`, then a `.env` in the current folder. Keep them wherever
-you like:
+That writes `~/.understudy/understudy.env`, readable only by you. Already keep
+your settings in an env file? Point at it instead:
 
 ```bash
-understudy config set MONGODB_URI="…" EMBED_KEY="…"   # writes ~/.understudy/understudy.env (only you can read it)
-understudy config --env-file ~/secrets/understudy.env  # or point at an env file you already keep
-understudy config                                      # where everything comes from (no secrets shown)
+understudy config --env-file ~/secrets/understudy.env
 ```
+
+Optional, any time: `understudy doctor` checks the connection, search, model and
+browser; `understudy config` shows where every setting came from (no secrets
+shown); `understudy extension` says where the Chrome recorder is, for loading it
+once.
+
+Settings come from, highest first: real environment variables, `--env-file
+<path>` on any command, the env file saved with `understudy config`, then a
+`.env` in the current folder.
 
 | Setting | What it's for |
 |---|---|
 | `MONGODB_URI` | your Atlas `mongodb+srv://…` string, or local Community |
-| `EMBED_URL`, `EMBED_MODEL`, `EMBED_KEY` | optional: match goals by meaning. Any OpenAI-style endpoint; Voyage `voyage-4-lite` (200M free tokens) is the default, Ollama works offline. Without one, goals match flow names. |
-| `UNDERSTUDY_<REF>` | login values. Passwords are never stored in a recording — a password field is kept as a reference like `SECRET.password`, read from `UNDERSTUDY_SECRET_PASSWORD`. |
+| `EMBED_URL`, `EMBED_MODEL`, `EMBED_KEY` | optional: match goals by meaning. Any OpenAI-style endpoint: Voyage `voyage-4-lite` is the default (200M free tokens); for free and offline, run [Ollama](https://ollama.com) (`ollama pull mxbai-embed-large`) and set `EMBED_URL=http://localhost:11434/v1/embeddings`, `EMBED_MODEL=mxbai-embed-large`, `EMBED_DIMS=1024`, no key. Without a model, goals match flow names. |
+| `UNDERSTUDY_<REF>` | login values. A recording never stores a password: the field is kept as a name like `SECRET.password`, and at replay Understudy reads the value from `UNDERSTUDY_SECRET_PASSWORD`. Or pass it per run (`--value SECRET.password=…`, or `values` from an agent). Exported tests read the same variable. |
 
-> **Atlas free clusters** allow 3 search indexes; Understudy uses 2, so one free
-> cluster holds one Understudy database.
-
-**Until it's published:** clone the repo, `npm install`, and use
-`npx tsx src/entry/cli.ts` wherever this says `understudy`.
+> **Another embedding model?** The line between "a flow I know" and "close, but
+> not it" was calibrated on Voyage. Other models score differently, so check a
+> few goals with `understudy recall` (see ROADMAP.md).
 
 ## Use it
 
@@ -115,10 +119,6 @@ what to write down.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — how it fits together, for changing the code
 - [REASONER.md](REASONER.md) — how an agent should use it
 - [extension/README.md](extension/README.md) — the Chrome recorder
-- [ROADMAP.md](ROADMAP.md) — what's next
-
-The previous CockroachDB version is on the
-[`legacy-cockroach`](../../tree/legacy-cockroach) branch.
 
 ## License
 
