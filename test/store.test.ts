@@ -2,10 +2,14 @@
  * The storage layer against a real MongoDB with vector search.
  *
  *   npm test                       uses MONGODB_URI from .env
- *   MONGODB_URI=… npm test         e.g. your Atlas cluster
+ *   MONGODB_URI=… npm test         another cluster
  *
- * Runs in its own database (understudy_test) and drops it afterwards, so it
- * never touches real data.
+ * Use local Community for this. A free Atlas cluster allows only 3 search
+ * indexes in total, so it can't hold the test database's 2 alongside a real
+ * Understudy database's 2 — check Atlas with `understudy doctor` instead.
+ *
+ * Runs in its own database (understudy_test) and empties it afterwards, so it
+ * never touches real data. Needs only the ordinary read/write role.
  */
 
 import { test, before, after } from 'node:test';
@@ -43,9 +47,30 @@ function flow(app: string, slug: string, kind: Flow['kind'], embedding: number[]
   };
 }
 
+/**
+ * Empty the test database by dropping each collection. Not dropDatabase: an
+ * Atlas user with the ordinary read/write role may not drop a database, and
+ * the tests shouldn't need more than the app itself does.
+ */
+async function wipe() {
+  const d = await connect();
+  for (const c of await d.listCollections({}, { nameOnly: true }).toArray()) {
+    await d.collection(c.name).drop();
+  }
+}
+
 before(async () => {
-  await (await connect()).dropDatabase();
-  await ensureSchema();
+  await wipe();
+  await ensureSchema().catch((err: Error) => {
+    if (/maximum number of FTS indexes/.test(err.message)) {
+      throw new Error(
+        'this cluster has no room for the test database\'s 2 vector indexes. A free Atlas cluster ' +
+          'allows 3 search indexes in total, and a real Understudy database already uses 2. ' +
+          'Run the tests against local Community instead, and check Atlas with `understudy doctor`.',
+      );
+    }
+    throw err;
+  });
   await ensureSchema(); // twice on purpose: it must be safe to run on every start
   await waitForVectorIndexes();
 
@@ -59,8 +84,13 @@ before(async () => {
 });
 
 after(async () => {
-  await (await connect()).dropDatabase();
-  await close();
+  // Always close, even if cleanup fails — an open connection keeps the test
+  // process alive forever instead of letting it report the failure.
+  try {
+    await wipe();
+  } finally {
+    await close();
+  }
 });
 
 /** mongot indexes asynchronously; a just-inserted doc can take a moment to appear. */

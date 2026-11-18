@@ -250,7 +250,7 @@ what it replaces.
 
 | Phase | Builds | Done when |
 |---|---|---|
-| **0. Spike** | Connect to local Community + your Atlas free cluster. Create both vector indexes, embed via Voyage, query with `app` filter. | Same test passes on both URIs. **Local: done 2026-11-18** (`npm test`, `understudy doctor`). Atlas and Voyage still to do. |
+| **0. Spike** | Connect to local Community + your Atlas free cluster. Create both vector indexes, embed via Voyage, query with `app` filter. | Same test passes on both URIs. **Done 2026-11-18.** Local: `npm test` + `doctor`. Atlas: `doctor` + a real Voyage search, same rankings and scores as local. See *What phase 0 taught us*. |
 | **1. Store** | `src/store/`: types for the six collections, connect from `MONGODB_URI`, create indexes on first run. Delete Cockroach + Bedrock + ONNX code. | `understudy doctor` reports a healthy connection on both URIs. |
 | **2. Record & replay, no AI** | Player, `save`, `replay`, `flows`. Live recorder + script import ported. | Record login on a test app, replay it, see drift and findings. No key, no agent. |
 | **3. Run by goal, no AI** | Recall on Voyage (name match without a key), `run` picks one flow, safety gate, run documents. | `understudy run myapp "log in"` binds and runs the login flow. |
@@ -258,6 +258,25 @@ what it replaces.
 | **5. Extension** | Chrome extension + localhost WebSocket. | Record a flow in your normal Chrome, replay it headless. |
 | **6. Clean up** | Copy the corpus across (one-off script). Rewrite README, write ARCHITECTURE.md, delete BUILDING/PLAN/STATUS/STATUS-HISTORY. | Fresh clone → working in under five minutes. |
 | **7. Hosted (later)** | Memory-only server: anyone points it at their own Mongo URI. No browsers. | Not scheduled. |
+
+## What phase 0 taught us (2026-11-18)
+
+- **A free Atlas cluster holds one Understudy database.** The 3-search-index
+  limit is per *cluster*, not per database, and each Understudy database uses
+  2. So the test suite runs against local Community; Atlas is checked with
+  `understudy doctor`. Someone wanting several Understudy databases on one
+  free cluster can't — that is a reason to keep it at 2 indexes, never more.
+- **New documents take seconds to become searchable on Atlas** (search is
+  eventually consistent; ~6s observed, near-instant locally). A recall right
+  after saving a flow can miss it. Anything that saves then searches must
+  either wait or not depend on the new document.
+- **The ordinary Atlas read/write role can't `dropDatabase`.** Understudy and
+  its tests drop collections, never databases.
+- **Voyage scores are compressed**: right matches ~0.76–0.81, runner-ups
+  ~0.65–0.78. The old 0.92 gap distance means nothing now; recall's
+  "I don't know this" cutoff gets calibrated on real flows in phase 3.
+- Atlas free runs MongoDB 8.0.37; local Community runs 9.0.8. No difference
+  seen for anything used so far.
 
 ## Decisions (2026-11-18)
 
