@@ -91,7 +91,7 @@ know", and what to write down.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — how it fits together, for changing the code
 - [REASONER.md](REASONER.md) — how an agent should use it
 - [extension/README.md](extension/README.md) — the Chrome recorder
-- [REWRITE.md](REWRITE.md) — the November 2026 move to MongoDB, and why
+- [ROADMAP.md](ROADMAP.md) — what's next
 
 The previous CockroachDB version is on the
 [`legacy-cockroach`](../../tree/legacy-cockroach) branch.

@@ -9,7 +9,7 @@
  *   runs      one attempt at a goal
  *
  * Steps live inside their flow, because you never want one without the other.
- * See REWRITE.md for the reasoning.
+ * See ARCHITECTURE.md for the reasoning.
  */
 
 import type { ObjectId } from 'mongodb';

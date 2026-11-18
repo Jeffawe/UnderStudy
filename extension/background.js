@@ -62,13 +62,16 @@ async function captureSession(tab) {
   return { cookies, origins: [{ origin, localStorage: entries.map(([name, value]) => ({ name, value })) }] };
 }
 
+// The tab's sign-in is always sent. Ticked "I'm signed in here": the flow starts
+// signed in, full stop. Unticked: Understudy works it out when you save (it
+// proves the recording without the sign-in first) and deletes it if unneeded.
 async function startRecording(tabId, { signedIn = false } = {}) {
   if (await current()) throw new Error('Already recording — stop that one first.');
   const { app, token, started } = await hello();
   if (started) throw new Error('That Understudy recording has already started. Run the command again for a new one.');
   const tab = await chrome.tabs.get(tabId);
-  const storageState = signedIn ? await captureSession(tab) : undefined;
-  await post('/start', { token, url: tab.url, ...(storageState ? { storageState } : {}) });
+  const storageState = await captureSession(tab);
+  await post('/start', { token, url: tab.url, storageState, signedIn });
   await chrome.storage.session.set({ rec: { tabId, token, app, origin: new URL(tab.url).origin } });
   await inject(tabId);
   await chrome.action.setBadgeText({ tabId, text: 'REC' });
@@ -110,7 +113,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   const handlers = {
     'understudy:status': async () => ({ rec: (await current()) ?? null, cli: await hello().catch((e) => ({ error: e.message })) }),
-    'understudy:start': () => startRecording(msg.tabId, { signedIn: msg.signedIn }),
+    'understudy:start': () => startRecording(msg.tabId, { signedIn: Boolean(msg.signedIn) }),
     'understudy:stop': () => stopRecording(),
   };
   const handler = handlers[msg.type];

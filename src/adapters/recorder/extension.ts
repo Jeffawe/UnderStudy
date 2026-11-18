@@ -16,9 +16,12 @@
  * but the browser won't let it READ /hello's answer (no CORS header for web
  * origins), so it can never learn the token, so it can't inject steps.
  *
- * If you start recording on a signed-in tab, the extension sends that site's
- * cookies and local storage, saved here as a session file (0600, gitignored,
- * same as --arm-manually sessions) so replay can start signed in too.
+ * SIGN-IN. When recording starts, the extension always sends that site's
+ * cookies and local storage; they're saved as a session file (0600,
+ * gitignored). If you ticked "I'm signed in here", the flow starts signed in.
+ * If you didn't, `save` works it out: it replays in an empty browser first and
+ * deletes the session if that passes; only if it fails is the session tried,
+ * and kept if that passes (flows/execute.ts: prove).
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -45,7 +48,7 @@ export interface ExtensionRecording {
   started: boolean;
   /** File uploads seen but not recordable — the page can't say which file. */
   droppedUploads: number;
-  /** Where the signed-in session was saved, if one was. */
+  /** Where the tab's session was saved for proving to try, if one was sent. */
   sessionPath?: string;
 }
 
@@ -103,7 +106,8 @@ export async function startExtensionRecorder(opts: { appSlug: string; port?: num
         if (b.storageState) {
           const id = `ext-${randomBytes(6).toString('hex')}`;
           sessionPath = await saveSessionById(opts.appSlug, id, b.storageState as StorageState);
-          entry = { requiresSession: true, session: id };
+          // Ticked: required. Unticked: available — proving decides.
+          entry = b.signedIn === true ? { requiresSession: true, session: id } : { session: id };
         }
         // Step 0: replay opens the page recording started on.
         events.push({ seq: 0, ts: 0, action: 'goto', value: startUrl, url: startUrl, resolution: 'script-literal' });

@@ -16,9 +16,11 @@ signed in or not — instead of a fresh browser that Understudy opens.
 3. Click the Understudy icon → **Record from this page**. The first time on a
    site, Chrome asks to let Understudy access it — that's the only site it
    gets.
-   - Already signed in? Tick **I'm signed in here** first, so replay starts
-     signed in too. That saves the site's cookies and local storage to a file on
-     your machine (`.understudy/sessions/`, readable only by you), never
+   - **I'm signed in here:** tick it if the flow starts signed in, and replay
+     will start signed in too. Not sure? Leave it: Understudy copies the tab's
+     sign-in anyway, then when you `save` it tries the flow without it first,
+     and deletes the copy if it wasn't needed. Either way it's a file on your
+     machine (`.understudy/sessions/`, readable only by you), never sent
      anywhere else.
 4. Use the page as normal. The icon shows **REC**.
 5. Click the icon → **Stop and save** (or press Ctrl+C in the terminal).

@@ -44,7 +44,7 @@ test/         node --test, against local MongoDB and a tiny local shop (fixture-
 
 1. **recall** (`memory/recall.ts`) — exact name, else vector search (else word
    match with no model). Verdict: *known* / *unsure* / *unknown*. Only *known*
-   acts. The cutoff (`MEANING`) is calibrated, not guessed — see REWRITE.md.
+   acts. The cutoff (`MEANING`) is calibrated, not guessed — see ROADMAP.md.
 2. **plan** (`plan/planner.ts`) — split the goal (or ask the agent), bind each
    part to a known flow, refuse destructive flows, bridge the seams between
    flows (`plan/seams.ts`: no bridge needed → the page map → a plain URL → ask).
@@ -74,6 +74,43 @@ it refuses a recording that doesn't pass.
   why the question tells it to answer `[]` unless it knows.
 - **Two vector indexes, never more** — a free Atlas cluster allows three.
 - **Drop collections, never databases** — the Atlas read/write role can't.
+
+## Why it's built this way
+
+Decisions that look arbitrary until you know what they avoid.
+
+- **Questions only while planning.** The old version paused *inside* a live
+  browser across tool calls, which needed sessions, run budgets and a
+  "record it yourself" handoff. Asking only before the browser opens means a
+  waiting run holds nothing open and survives a restart.
+- **Understudy embeds, not MongoDB.** MongoDB's automated embedding (`autoEmbed`)
+  is a Preview feature, and it embeds one query per search; calling the model
+  ourselves sends every sub-goal in one request. It would slot in as a second
+  mode without changing the collections.
+- **Any embedding model, one adapter.** Most providers speak the same
+  `/v1/embeddings` format, so it's four settings, not one adapter per vendor.
+  Voyage alone gets `input_type`; others reject unknown fields.
+- **Voyage's free tier** is 200M tokens per model, once — one person never
+  spends it — but without a card it's capped at 3 requests a minute. The
+  adapter batches up to 128 texts per request and retries on 429.
+- **The recall cutoff is calibrated, not guessed** (see ROADMAP.md for the
+  numbers and the plan to learn it). A score alone can't tell "the app does
+  this" from "the app does something nearby"; the lead over the runner-up can.
+- **Atlas, learned the hard way:** a free cluster allows 3 search indexes in
+  total (so: one Understudy database per free cluster, and tests run on local
+  Community); newly written documents take a few seconds to become searchable;
+  the ordinary read/write role can't drop a database.
+- **Destructive = a click or key press on a committing control**, or reaching a
+  payment site, or a fact marking the control. Typing into "Confirm password"
+  is not committing (the old version thought it was).
+- **The extension uses plain HTTP to 127.0.0.1**, not a WebSocket — Node has no
+  WebSocket server built in, and one POST per click is plenty. The token is
+  only readable by an extension origin, so pages can't inject steps.
+- **The extension always copies the tab's sign-in**; ticking "I'm signed in"
+  makes the flow require it, and leaving it unticked lets `save` decide by
+  proving without it first (and deleting it if unneeded).
+- **Segments copy their steps** rather than referencing the parent's. Simpler
+  to read and replay; fixing a selector everywhere is one `updateMany`.
 
 ## Checks
 

@@ -37,9 +37,9 @@ Without MCP, every tool has a CLI equivalent: `understudy --help`.
 
 ## Changing the code
 
-- `main` is mid-rewrite onto MongoDB: **read `REWRITE.md` first** — it is the
-  plan, the decisions and the progress. `BUILDING.md`, `PLAN.md` and
-  `STATUS*.md` describe the old CockroachDB version on `legacy-cockroach`.
+- **Read `ARCHITECTURE.md` first** — the ideas, the layout, and why it's built
+  the way it is. `ROADMAP.md` is what's next. The old CockroachDB version is on
+  the `legacy-cockroach` branch.
 - Keep it simple and readable: fewer concepts, plain names. Keep dependencies
   minimal unless the user approves a new one.
 - Write memory through `remember` / `saveDistilled`, never by hand: they

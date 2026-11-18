@@ -1,10 +1,7 @@
 #!/usr/bin/env node
 /**
- * understudy — command line.
- *
- * Mid-rewrite onto MongoDB (see REWRITE.md). These commands work today; the
- * rest — save, run, flows, findings, emit — come back in phases 2–4. The old
- * CockroachDB version is on the `legacy-cockroach` branch.
+ * understudy — command line. Agents use the MCP server (entry/mcp.ts) instead;
+ * both call the same functions underneath.
  *
  * Argument parsing is hand-rolled on purpose: the surface is small, and a
  * parser library would be more code than it saves.
@@ -17,7 +14,7 @@ import { listRecordings, loadRecording, saveRecording } from '../core/recording-
 import { loadSession, saveSession } from '../core/auth-cache.js';
 import { buildRecording, type RawRecording } from '../core/recording.js';
 import type { ReplayResult } from '../core/replay.js';
-import { execute } from '../flows/execute.js';
+import { execute, prove } from '../flows/execute.js';
 import { destructiveControls, remember } from '../memory/notes.js';
 import { start, answer, runPlan, type PlanState } from '../plan/planner.js';
 import { distillRequest, saveDistilled } from '../flows/distill.js';
@@ -335,7 +332,11 @@ async function cmdRecordExtension(slug: string, flags: Flags) {
     console.log(`\n${out.droppedUploads} file upload(s) NOT recorded — a page can't say which file was chosen.`);
     console.log('  write that part as a Playwright script and `understudy import` it instead.');
   }
-  if (out.sessionPath) console.log(`\nsigned-in session saved ${out.sessionPath}\n  replay restores it, so this recording starts signed in.`);
+  if (out.sessionPath) {
+    console.log(out.recording.entry?.requiresSession
+      ? '\nyou said you were signed in: replay starts from your sign-in (saved locally, 0600).'
+      : '\nthe tab\'s sign-in was copied; `save` keeps it only if the flow turns out to need it.');
+  }
   console.log(`\nhash  ${out.recording.hash}${existed ? '  (identical recording already existed)' : ''}`);
   console.log(`saved ${path}`);
   console.log(`\nnext: understudy save ${out.recording.hash} "<what this flow does>"`);
@@ -640,24 +641,33 @@ async function cmdSave(positional: string[], flags: Flags) {
   const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`, 'understudy recordings'));
 
   console.log(`proving ${hash} by replaying it…\n`);
-  // No lessons: what gets saved is what the recording does on its own.
-  const result = await executeWithReport(recording, flags, { useLessons: false });
+  const values = valuesFromFlags(flags);
+  // No lessons: what gets saved is what the recording does on its own. prove()
+  // also works out whether it needs to start signed in (see flows/execute.ts).
+  const proven = await prove(recording, { values, headed: flags.has('headed') }).catch((e: Error) => fail(e.message));
+  if (proven.missingValues.length) {
+    console.log(`this needs ${proven.missingValues.length} value(s) that are deliberately not stored:`);
+    for (const ref of proven.missingValues) console.log(`  --value ${ref}=…`);
+    console.log('');
+  }
+  const result = proven.result;
   printReplay(result);
+  if (recording.entry?.session && recording.entry.requiresSession) {
+    console.log('\nsign-in  used, as you said you were signed in when recording');
+  } else if (proven.signIn === 'needed' && recording.entry?.session) {
+    console.log('\nsign-in  needed — it failed in an empty browser and passed signed in, so it keeps your session');
+  } else if (recording.entry?.session) {
+    console.log('\nsign-in  not needed — the session copied when you started recording was deleted');
+  }
   if (!result.ok && !flags.has('force')) {
-    console.error('\nnot saved — the recording did not replay cleanly. Fix it, or re-record.');
-    // The usual reason an extension recording fails here: you were signed in
-    // in your Chrome, and replay's fresh browser isn't.
-    if (recording.origin === 'chrome-extension' && !recording.entry?.session) {
-      console.error('  were you signed in when you recorded? Record again with "I\'m signed in here" ticked,');
-      console.error('  so replay starts signed in too.');
-    }
+    console.error('\nnot saved — the recording did not replay cleanly' + (recording.entry?.session ? ', signed in or not' : '') + '. Fix it, or re-record.');
     process.exitCode = 3;
     return;
   }
 
   const slug = str(flags.get('slug'));
   const intent = str(flags.get('intent'));
-  const flow = await saveFlow(recording, result, { title, ...(slug ? { slug } : {}), ...(intent ? { intent } : {}) });
+  const flow = await saveFlow(proven.recording, result, { title, ...(slug ? { slug } : {}), ...(intent ? { intent } : {}) });
   const run = await recordRun({ app: flow.app, flow: flow.slug, result, steps: flow.steps });
 
   console.log(`\nsaved    ${flow.app}/${flow.slug}  (${flow.steps.length} steps${flow.embedding ? ', searchable by meaning' : ''})`);

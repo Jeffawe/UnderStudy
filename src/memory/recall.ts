@@ -51,7 +51,7 @@ export interface Recall {
 /**
  * When a match by MEANING is good enough to act on. Calibrated 2026-11-18 on
  * the providernow corpus with voyage-4-lite (15 known goals, 14 plausible
- * unknown ones — see REWRITE.md): no single score separates them, because a
+ * unknown ones — see ROADMAP.md): no single score separates them, because a
  * goal the app doesn't have still lands near something. What does separate
  * them is how far the top match is ahead of the runner-up. A different
  * embedding model needs recalibrating.

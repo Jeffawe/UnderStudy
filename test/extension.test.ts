@@ -21,7 +21,8 @@ process.env.UNDERSTUDY_SESSIONS_DIR = await mkdtemp(join(tmpdir(), 'understudy-s
 const { startExtensionRecorder } = await import('../src/adapters/recorder/extension.js');
 const { recordLive } = await import('../src/adapters/recorder/live.js');
 const { replay } = await import('../src/core/replay.js');
-const { execute } = await import('../src/flows/execute.js');
+const { execute, prove } = await import('../src/flows/execute.js');
+const { loadSessionById } = await import('../src/core/auth-cache.js');
 const { recorderSource } = await import('../scripts/build-extension.js');
 import { startFixtureApp, type FixtureApp } from './fixture-app.js';
 
@@ -107,9 +108,15 @@ test('record a flow in an open tab, then replay it headless', { timeout: 120_000
   assert.equal(JSON.stringify(out.recording).includes(values['SECRET.password']), false, 'the password never leaves the page');
   assert.equal(out.recording.origin, 'chrome-extension');
 
-  const result = await replay(out.recording, { values });
-  assert.equal(result.ok, true, JSON.stringify(result.steps.filter((s) => !s.ok)));
-  assert.ok(result.sigSequence.at(-1)?.startsWith('/cart'));
+  // The tab's sign-in was copied anyway; proving finds this flow doesn't need it, and deletes it.
+  const id = out.recording.entry?.session;
+  assert.ok(id, 'the session is always copied at the start');
+  const proven = await prove(out.recording, { values });
+  assert.equal(proven.result.ok, true, JSON.stringify(proven.result.steps.filter((s) => !s.ok)));
+  assert.ok(proven.result.sigSequence.at(-1)?.startsWith('/cart'));
+  assert.equal(proven.signIn, 'not needed');
+  assert.equal(proven.recording.entry, undefined, 'saved without a session');
+  assert.equal(await loadSessionById('shop', id!), undefined, 'the copied session was deleted');
 });
 
 test('the same actions record identically with the Playwright recorder', { timeout: 120_000 }, async () => {
@@ -131,7 +138,7 @@ test('the same actions record identically with the Playwright recorder', { timeo
   ]);
 });
 
-test('starting on a signed-in tab saves the session, so replay starts signed in', { timeout: 120_000 }, async () => {
+test('unticked on a signed-in tab: proving finds it needs the sign-in, and keeps it', { timeout: 120_000 }, async () => {
   // Sign in first, NOT recorded — the way you'd already be signed in to your own app.
   const login = await browser.newPage();
   await login.goto(shop.url);
@@ -141,7 +148,7 @@ test('starting on a signed-in tab saves the session, so replay starts signed in'
   await login.waitForURL(/\/shop$/);
   await login.close();
 
-  const { rec, page } = await startOn(`${shop.url}shop`, { signedIn: true });
+  const { rec, page } = await startOn(`${shop.url}shop`);
   await page.getByRole('link', { name: 'Profile' }).click();
   await page.waitForURL(/\/profile$/);
   await page.waitForTimeout(300);
@@ -150,15 +157,37 @@ test('starting on a signed-in tab saves the session, so replay starts signed in'
   await page.close();
 
   assert.deepEqual(brief(out.recording.events), [`goto ${shop.url}shop`, 'click link Profile']);
-  assert.equal(out.recording.entry?.requiresSession, true);
-  assert.ok(out.sessionPath, 'the session was saved');
+  assert.ok(out.sessionPath, 'the session was copied');
 
   // Without the session, /shop bounces to the login page and the step can't be found.
   const cold = await replay(out.recording, {});
   assert.equal(cold.ok, false, 'a cold browser is not signed in');
 
-  // execute() restores it, the way replay/save/run do.
-  const warm = await execute(out.recording);
-  assert.equal(warm.result.ok, true, JSON.stringify(warm.result.steps.filter((s) => !s.ok)));
-  assert.ok(warm.result.sigSequence.at(-1)?.startsWith('/profile'));
+  // prove() tries cold, fails, tries signed in, passes — and says so.
+  const proven = await prove(out.recording);
+  assert.equal(proven.result.ok, true, JSON.stringify(proven.result.steps.filter((s) => !s.ok)));
+  assert.equal(proven.signIn, 'needed');
+  assert.equal(proven.recording.entry?.requiresSession, true, 'saved as starting signed in');
+
+  // Every later replay restores it, the way replay/run/plans do.
+  const again = await execute(proven.recording);
+  assert.equal(again.result.ok, true);
+  assert.ok(again.result.sigSequence.at(-1)?.startsWith('/profile'));
+});
+
+test('ticked "I\'m signed in here": the flow starts signed in, no guessing', { timeout: 120_000 }, async () => {
+  // Still signed in from the previous test, in this same Chrome profile.
+  const { rec, page } = await startOn(`${shop.url}shop`, { signedIn: true });
+  await page.getByRole('link', { name: 'Cart' }).click();
+  await page.waitForURL(/\/cart$/);
+  await page.waitForTimeout(300);
+  await stop();
+  const out = await rec.done;
+  await page.close();
+
+  assert.equal(out.recording.entry?.requiresSession, true, 'required, because you said so');
+  const proven = await prove(out.recording);
+  assert.equal(proven.result.ok, true);
+  assert.equal(proven.signIn, 'needed');
+  assert.ok(await loadSessionById('shop', out.recording.entry!.session!), 'the session is kept');
 });

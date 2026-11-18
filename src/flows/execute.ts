@@ -87,3 +87,47 @@ export async function execute(recording: RawRecording, opts: ExecuteOptions = {}
   if (opts.useLessons) out.lessons = await foldLessons(app, result.steps, recording.events);
   return out;
 }
+
+export interface Proven extends Executed {
+  /** The recording as it should be saved: with `requiresSession` set, or its unneeded session dropped. */
+  recording: RawRecording;
+  /** What proving found out about signing in. */
+  signIn: 'not needed' | 'needed' | 'no session to try';
+}
+
+/**
+ * Prove a recording before saving it, and work out whether it needs to start
+ * signed in — so nobody has to be asked.
+ *
+ * A recording from the Chrome extension carries the tab's session as
+ * AVAILABLE (`entry.session`) but not required. Replay it in an empty browser
+ * first: if that passes, the flow doesn't need anyone signed in, and the
+ * session file is deleted. If it fails, try again with the session; if that
+ * passes, the flow starts signed in and keeps it. A session is kept on disk
+ * only when a flow actually needs one.
+ */
+export async function prove(recording: RawRecording, opts: ExecuteOptions = {}): Promise<Proven> {
+  const id = recording.entry?.session;
+  // Already known to need it (--arm-manually), or nothing to try: one replay.
+  if (!id || recording.entry?.requiresSession) {
+    return { ...(await execute(recording, opts)), recording, signIn: id || recording.entry?.requiresSession ? 'needed' : 'no session to try' };
+  }
+
+  // The same recording without the session: what an empty browser would do.
+  const { session: _dropped, ...rest } = recording.entry!;
+  const cold: RawRecording = { ...recording };
+  if (Object.keys(rest).length) cold.entry = rest;
+  else delete cold.entry;
+  const first = await execute(cold, opts);
+  if (first.result.ok) {
+    await forgetSessionById(recording.appSlug, id);
+    return { ...first, recording: cold, signIn: 'not needed' };
+  }
+
+  const warm = { ...recording, entry: { ...recording.entry, requiresSession: true } };
+  const second = await execute(warm, opts);
+  if (second.result.ok) return { ...second, recording: warm, signIn: 'needed' };
+  // Broken either way: report the cold attempt, and don't keep a session for a broken flow.
+  await forgetSessionById(recording.appSlug, id);
+  return { ...first, recording: cold, signIn: 'not needed' };
+}
