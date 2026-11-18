@@ -81,12 +81,22 @@ export function valueEnvName(ref: string): string {
   return `UNDERSTUDY_${ref.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_|_$/g, '').toUpperCase()}`;
 }
 
+/**
+ * Where a reference's value may be set, in the order they're tried.
+ * `ENV.X` came from a script that read `process.env.X`, so `X` itself works too.
+ */
+export function valueEnvNames(ref: string): string[] {
+  const names = [valueEnvName(ref)];
+  if (ref.startsWith('ENV.')) names.push(ref.slice(4));
+  return names;
+}
+
 /** Values for these references found in the environment. */
 export function valuesFromEnv(refs: Iterable<string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const ref of refs) {
-    const v = process.env[valueEnvName(ref)];
-    if (v !== undefined) out[ref] = v;
+    const name = valueEnvNames(ref).find((n) => process.env[n] !== undefined);
+    if (name) out[ref] = process.env[name]!;
   }
   return out;
 }

@@ -86,7 +86,7 @@ understudy config set EMBED_URL=http://localhost:11434/v1/embeddings EMBED_MODEL
 Two things to know: one database holds one model's vectors, so switching later
 means `understudy reembed`; and the line between "a flow I know" and "close,
 but not it" was calibrated on Voyage — other models score differently, so check
-a few goals with `understudy recall` first (see ROADMAP.md).
+a few goals with `understudy recall` first.
 
 ## Use it
 

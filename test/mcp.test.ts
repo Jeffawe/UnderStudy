@@ -26,6 +26,8 @@ before(async () => {
       UNDERSTUDY_RECORDINGS_DIR: recordings,
       // A login value from settings, the way a user would set it — never through the chat.
       UNDERSTUDY_SECRET_PASSWORD: 'not-a-real-password',
+      // An agent's own script reads its own variable; that works too.
+      AGENT_SHOP_PASSWORD: 'also-not-real',
     } as Record<string, string>,
   }));
 });
@@ -105,4 +107,42 @@ test('ask the user to record, then save it — the whole path over MCP', { timeo
 
   const recall = JSON.parse(text(await client.callTool({ name: 'understudy_recall', arguments: { app: 'shop', goal: 'open-the-cart' } })));
   assert.equal(recall.verdict, 'known');
+});
+
+test('an agent saves a flow it drove itself, as a script — proven, and marked as made by an agent', { timeout: 120_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'understudy-agent-script-'));
+  try {
+    const { writeFile } = await import('node:fs/promises');
+    const good = join(dir, 'profile.spec.ts');
+    await writeFile(good, `import { test } from '@playwright/test';
+test('view the profile', async ({ page }) => {
+  await page.goto('${shop.url}');
+  await page.getByRole('textbox', { name: 'Username' }).fill('demo');
+  await page.getByRole('textbox', { name: 'Password' }).fill(process.env.AGENT_SHOP_PASSWORD!);
+  await page.getByRole('button', { name: 'Log in' }).click();
+  await page.getByRole('link', { name: 'Profile' }).click();
+});`);
+    const saved = JSON.parse(text(await client.callTool({ name: 'understudy_save', arguments: { app: 'shop', name: 'View the profile', script: good } })));
+    assert.equal(saved.saved, true, JSON.stringify(saved));
+    assert.equal(saved.madeBy, 'agent');
+    assert.equal(saved.steps, 5);
+
+    const recall = JSON.parse(text(await client.callTool({ name: 'understudy_recall', arguments: { app: 'shop', goal: 'view-the-profile' } })));
+    assert.equal(recall.best.madeBy, 'agent');
+    assert.deepEqual(recall.needs, [{ placeholder: 'ENV.AGENT_SHOP_PASSWORD', readFrom: ['UNDERSTUDY_ENV_AGENT_SHOP_PASSWORD', 'AGENT_SHOP_PASSWORD'], set: true }]);
+
+    // A step that can't be replayed is refused outright, not saved with a hole in it.
+    const bad = join(dir, 'bad.spec.ts');
+    await writeFile(bad, `import { test } from '@playwright/test';
+test('x', async ({ page }) => {
+  await page.goto('${shop.url}');
+  await page.evaluate(() => localStorage.clear());
+  await page.getByRole('button', { name: 'Log in' }).click();
+});`);
+    const refused = await client.callTool({ name: 'understudy_save', arguments: { app: 'shop', name: 'Bad', script: bad } });
+    assert.equal(refused.isError, true);
+    assert.match(text(refused), /can't be replayed/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

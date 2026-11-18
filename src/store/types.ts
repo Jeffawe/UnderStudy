@@ -41,6 +41,12 @@ export interface Flow {
   intent: string;
   /** A recording is captured whole; a segment is cut from one so others can reuse it. */
   kind: 'recording' | 'segment';
+  /**
+   * Who made it: 'user' recorded it; 'agent' drove it itself and handed over
+   * the script. Both are proven by replay before they're kept. Missing = 'user'
+   * (flows saved before this field existed were all recordings).
+   */
+  madeBy?: 'user' | 'agent';
   /** Segments only: the flow it was cut from, and which of its steps ([start, end)). */
   from?: { flow: string; steps: [number, number] };
   preconditions: Precondition[];

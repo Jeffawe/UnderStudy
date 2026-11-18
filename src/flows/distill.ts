@@ -108,6 +108,7 @@ function segmentFrom(parent: Flow, s: Distilled['segments'][number]): Omit<Flow,
   const endState = steps.at(-1)?.expectedSig;
   return {
     app: parent.app, slug: s.slug, title: s.title, intent: s.intent, kind: 'segment',
+    madeBy: parent.madeBy ?? 'user',
     from: { flow: parent.slug, steps: [start, end] },
     preconditions: (s.preconditions ?? []) as Precondition[],
     outcome: s.outcome ?? '',

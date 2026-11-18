@@ -18,14 +18,41 @@
 import type { Flow, Note } from '../store/types.js';
 import { collections, vectorSearch } from '../store/db.js';
 import { embed, embedderConfig } from '../store/embed.js';
+import { valuesFromEnv, valueEnvNames } from '../store/settings.js';
 
 export interface FlowMatch {
   slug: string;
   title: string;
   kind: Flow['kind'];
+  madeBy: 'user' | 'agent';
   score: number;
   destructive: boolean;
   requiresSession: boolean;
+}
+
+/** One step of the flow to run, in a form an agent can drive from directly. */
+export interface BriefStep {
+  n: number;
+  action: string;
+  role?: string;
+  name?: string;
+  /** How to find it when there's no role + name. */
+  testId?: string;
+  css?: string;
+  /** Which of several matching elements (0-based). */
+  nth?: number;
+  /** A literal value to type or select, or the address for a goto. */
+  value?: string;
+  /** A login value that was never stored — see `needs` for where it is. */
+  placeholder?: string;
+}
+
+/** A login value the flow needs: where it's set, and whether it is — never the value. */
+export interface Need {
+  placeholder: string;
+  /** Environment variables Understudy reads it from, in order. */
+  readFrom: string[];
+  set: boolean;
 }
 
 export interface NoteMatch {
@@ -42,6 +69,10 @@ export interface Recall {
   verdict: Verdict;
   /** The flow to run, when the verdict is 'known'. */
   best?: FlowMatch;
+  /** When known: the best flow's steps, so an agent can drive it itself. */
+  steps?: BriefStep[];
+  /** When known: the login values those steps need. */
+  needs?: Need[];
   /** Why the verdict, in one line a person can read. */
   why: string;
   flows: FlowMatch[];
@@ -98,11 +129,39 @@ export function wordScore(goal: string, flow: Pick<Flow, 'slug' | 'title' | 'int
 }
 
 const toMatch = (f: Flow & { score?: number }, score: number): FlowMatch => ({
-  slug: f.slug, title: f.title, kind: f.kind, score,
+  slug: f.slug, title: f.title, kind: f.kind, madeBy: f.madeBy ?? 'user', score,
   destructive: f.destructive, requiresSession: f.requiresSession,
 });
 
-export async function recall(app: string, goal: string, opts: { limit?: number } = {}): Promise<Recall> {
+/** The best flow's steps and the login values they need, for an agent driving it itself. */
+async function plan(app: string, slug: string): Promise<Pick<Recall, 'steps' | 'needs'>> {
+  const { flows } = await collections();
+  const flow = await flows.findOne({ app, slug }, { projection: { steps: 1 } });
+  if (!flow) return {};
+  const steps: BriefStep[] = flow.steps.map((s, n) => {
+    const nth = typeof s.hints?.nth === 'number' ? (s.hints.nth as number) : undefined;
+    const addressed = Boolean(s.role && s.name);
+    return {
+      n, action: s.action,
+      ...(s.role ? { role: s.role } : {}), ...(s.name ? { name: s.name } : {}),
+      ...(!addressed && s.testId ? { testId: s.testId } : {}),
+      ...(!addressed && !s.testId && s.css ? { css: s.css } : {}),
+      ...(nth !== undefined ? { nth } : {}),
+      ...(s.valueRef ? { placeholder: s.valueRef } : s.value !== undefined ? { value: s.value } : s.action === 'goto' ? { value: s.url } : {}),
+    };
+  });
+  const refs = [...new Set(flow.steps.map((s) => s.valueRef).filter((r): r is string => Boolean(r)))];
+  const found = valuesFromEnv(refs);
+  const needs = refs.map((placeholder) => ({ placeholder, readFrom: valueEnvNames(placeholder), set: placeholder in found }));
+  return { steps, ...(needs.length ? { needs } : {}) };
+}
+
+/**
+ * `withSteps`: when the verdict is known, also return the best flow's steps and
+ * the login values it needs — what an agent driving the flow itself wants. Off
+ * for the planner, which only needs to know which flow.
+ */
+export async function recall(app: string, goal: string, opts: { limit?: number; withSteps?: boolean } = {}): Promise<Recall> {
   const limit = opts.limit ?? 5;
   const c = await collections();
   const needle = goal.trim().toLowerCase();
@@ -114,7 +173,7 @@ export async function recall(app: string, goal: string, opts: { limit?: number }
   );
   if (exact) {
     const best = toMatch(exact, 1);
-    return { goal, method: 'exact', verdict: 'known', best, why: `named exactly`, flows: [best], notes: [] };
+    return { goal, method: 'exact', verdict: 'known', best, why: `named exactly`, flows: [best], notes: [], ...(opts.withSteps ? await plan(app, best.slug) : {}) };
   }
 
   // 2. By meaning, if there's a model.
@@ -128,18 +187,21 @@ export async function recall(app: string, goal: string, opts: { limit?: number }
     const { verdict, why } = judge(matches.map((m) => m.score), MEANING);
     return {
       goal, method: 'meaning', verdict, why, flows: matches,
-      ...(verdict === 'known' ? { best: matches[0]! } : {}),
+      ...(verdict === 'known' ? { best: matches[0]!, ...(opts.withSteps ? await plan(app, matches[0]!.slug) : {}) } : {}),
       notes: notes.map((n) => ({ kind: n.kind, text: n.text, score: n.score })),
     };
   }
 
   // 3. By words, with no model. Corpora are small, so scoring every flow is fine.
-  const all = await c.flows.find({ app }, { projection: { slug: 1, title: 1, intent: 1, kind: 1, destructive: 1, requiresSession: 1 } }).toArray();
+  const all = await c.flows.find({ app }, { projection: { slug: 1, title: 1, intent: 1, kind: 1, madeBy: 1, destructive: 1, requiresSession: 1 } }).toArray();
   const matches = all
     .map((f) => toMatch(f as Flow, wordScore(goal, f as Flow)))
     .filter((m) => m.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
   const { verdict, why } = judge(matches.map((m) => m.score), WORDS);
-  return { goal, method: 'words', verdict, why, flows: matches, notes: [], ...(verdict === 'known' ? { best: matches[0]! } : {}) };
+  return {
+    goal, method: 'words', verdict, why, flows: matches, notes: [],
+    ...(verdict === 'known' ? { best: matches[0]!, ...(opts.withSteps ? await plan(app, matches[0]!.slug) : {}) } : {}),
+  };
 }

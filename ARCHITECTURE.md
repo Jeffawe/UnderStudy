@@ -126,6 +126,15 @@ Decisions that look arbitrary until you know what they avoid.
   agent's chat.
 - **The MCP server sends its own instructions** on connect (`entry/mcp.ts`): an
   npm-installed agent never sees REASONER.md, so it gets the essentials there.
+- **An agent's own flows go in the same way yours do.** `understudy_save` takes
+  a Playwright script of a flow the agent drove, replays it, and keeps it only
+  if every step passes — marked `madeBy: 'agent'`. A script with steps that
+  can't be replayed is refused, not saved with a hole in it.
+- **Recall hands over the plan.** For a known flow it returns the steps and the
+  login values they need (where they're set, never the values), so an agent
+  can drive it itself — memory is useful even when `run` isn't.
+- **Missing login values stop a run before a browser opens**: reaching the
+  password step without a password would spend a real login attempt.
 - **Segments copy their steps** rather than referencing the parent's. Simpler
   to read and replay; fixing a selector everywhere is one `updateMany`.
 

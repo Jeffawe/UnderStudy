@@ -110,3 +110,38 @@ test('emit: Playwright and Cypress, credentials from the environment, positions 
   assert.match(cy.code, /cy\.get\('div\.code input'\)\.eq\(1\)\.type\('5'\)/);
   assert.ok(cy.warnings.some((w) => /Cypress can't express/.test(w)), 'role + name loss is said out loud');
 });
+
+test('import: a script reading process.env becomes an ENV placeholder, found under that same variable', async () => {
+  const { parseScript } = await import('../src/adapters/recorder/script.js');
+  const { valueEnvNames } = await import('../src/store/settings.js');
+  const { writeFile, mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'understudy-import-'));
+  try {
+    const file = join(dir, 'login.spec.ts');
+    await writeFile(file, `import { test } from '@playwright/test';
+test('x', async ({ page }) => {
+  await page.goto('https://shop.test/');
+  await page.getByRole('textbox', { name: 'A' }).fill(process.env.SHOP_PASSWORD!);
+  await page.getByRole('textbox', { name: 'B' }).fill(process.env['SHOP_USER'] ?? '');
+  await page.getByRole('textbox', { name: 'C' }).fill(MEMBER.email);
+});`);
+    const { recording } = await parseScript(file, 'shop');
+    assert.deepEqual(recording.events.filter((e) => e.valueRef).map((e) => e.valueRef), ['ENV.SHOP_PASSWORD', 'ENV.SHOP_USER', 'MEMBER.email']);
+    assert.deepEqual(valueEnvNames('ENV.SHOP_PASSWORD'), ['UNDERSTUDY_ENV_SHOP_PASSWORD', 'SHOP_PASSWORD'], "the script's own variable works too");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a missing login value stops the run before any browser opens', async () => {
+  const { execute } = await import('../src/flows/execute.js');
+  const recording = buildRecording({ source: 'live', origin: 'test', appSlug: 'shop', startUrl: url }, [
+    { seq: 0, ts: 0, action: 'goto', url, resolution: 'synthesized' },
+    { seq: 1, ts: 1, action: 'fill', role: 'textbox', name: 'Password', valueRef: 'SECRET.nobody_sets_this', url, resolution: 'accname' },
+  ]);
+  const t0 = Date.now();
+  await assert.rejects(execute(recording), /nothing was run[\s\S]*UNDERSTUDY_SECRET_NOBODY_SETS_THIS/);
+  assert.ok(Date.now() - t0 < 1000, 'refused at once — no browser was launched');
+});

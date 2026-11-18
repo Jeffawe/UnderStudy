@@ -42,7 +42,7 @@ tools keep running the old code.
 
 | Tool | Use it to |
 |---|---|
-| `understudy_recall` | see what memory knows about a goal: closest flows, notes, a verdict |
+| `understudy_recall` | see what memory knows about a goal: closest flows, notes, a verdict — and for a known flow, its steps and the login values they need |
 | `understudy_run` | plan a goal and run it headless; may return a question first |
 | `understudy_answer` | answer a run's question; returns the next question or the result |
 | `understudy_distill` | get a saved flow's numbered steps to name and split |
@@ -50,7 +50,14 @@ tools keep running the old code.
 | `understudy_remember` | store facts, lessons, findings, and goals you reached yourself |
 | `understudy_findings` | list what looked broken; triage it |
 | `understudy_record` | wait for the user to record a flow in their Chrome |
-| `understudy_save` | prove a recording by replaying it, then keep it as a flow |
+| `understudy_save` | prove a recording — or a script of a flow you drove — by replaying it, then keep it as a flow |
+
+**Driving a flow yourself.** For a known flow, recall returns its steps (role
+and name to find each element, or a test id / CSS when there's none, and `nth`
+when several match) and `needs`: each login value the steps use, which
+variable holds it, and whether it's set. A step's `placeholder` (e.g.
+`SECRET.password`) is a login value that was never stored — fetch it yourself
+if you can, or let `understudy_run` use it from settings.
 
 **Recall verdicts:** *known* — one flow clearly does it. *unsure* — something is
 close but not clearly it; look before acting. *unknown* — nothing does it.
@@ -103,6 +110,11 @@ which is correct: it means "nobody knows how to get there".
 Optional. A saved flow runs as-is; distilling makes it better: what it's FOR,
 and reusable **segments** (e.g. "log in as a member" cut out of a checkout
 recording) — which is what lets one goal combine pieces of several recordings.
+
+**Ask the user before each distillation** — it rewrites how a flow is described
+and adds segments other goals will bind to. Any flow may be distilled, not just
+ones you saved; whether and when to offer is your call. What you learned while
+exploring is what makes a distillation good: you know what each part is for.
 
 You annotate and partition; you never author. Refer to steps by index only.
 `stepRange` is `[start, end)`. Easy to get wrong:
@@ -159,8 +171,16 @@ failed — usually its trigger is too broad, or its cause is gone.
 ## When memory doesn't know something
 
 Check with `understudy_recall` first — it's free. If it's a gap, reach the goal
-however works, then capture it so it isn't done twice:
+however works, then capture it so it isn't done twice. **Would the user want it
+tested again?** Then it should become a flow — a saved flow runs later without
+you, in one cheap call, and is how drift and regressions get noticed. A
+one-off is enough as facts and lessons.
 
+- **You drove it yourself:** save it with `understudy_save` and `script` — a
+  Playwright script of exactly what you did. Read passwords from `process.env`
+  in it; they become placeholders (`ENV.X`, read from `X` at replay), never
+  stored values. It's proven by replay before it's kept, and marked as made by
+  an agent. Saving needs no permission; distilling it does.
 - Something the user can click through: **ask them to record it.** Call
   `understudy_record` — it returns at once with what to tell them (start in
   Chrome with the extension, do the flow, stop). When they say they've

@@ -29,6 +29,7 @@ import { collections } from '../store/db.js';
 import { startExtensionRecorder, extensionDir, type ExtensionRecorder } from '../adapters/recorder/extension.js';
 import { saveRecording, loadRecording } from '../core/recording-store.js';
 import { proveAndSave } from '../flows/save.js';
+import { parseScript } from '../adapters/recorder/script.js';
 
 /**
  * Sent to the agent when it connects — its copy of the contract, since an
@@ -38,13 +39,14 @@ import { proveAndSave } from '../flows/save.js';
 const INSTRUCTIONS = `Understudy runs end-to-end tests against the user's web apps from flows it remembers. You supply judgement; it never calls a model.
 
 Rules:
-- Memory first: understudy_recall is free (nothing runs). Then reach the goal however works — understudy_run, or your own browser/Playwright. Say which you used; never imply Understudy ran something you drove.
+- Memory first: understudy_recall is free (nothing runs). For a known flow it returns the steps and the login values they need, so you can drive it yourself. Reach the goal however works — understudy_run, or your own browser/Playwright. Say which you used; never imply Understudy ran something you drove.
 - Runs plan before any browser opens and may ask two questions:
   · decompose → {"subGoals": [...]}: the things that must happen, IN THE ORDER the app does them, phrased in the words of the app's flows (listed with the question). Include implicit prerequisites (log in first). One sub-goal naming a whole recorded flow beats several naming its parts. Tell the user the sub-goals too.
   · seam → {"steps": [one click or goto]}, or {"steps": []} unless you actually KNOW — an answer is saved and reused forever.
 - Start with dryRun: true. Destructive flows (purchases, deletions) are refused unless allowPurchases.
 - Login values: recordings store references like SECRET.password. Understudy reads the value from settings (UNDERSTUDY_SECRET_PASSWORD) itself, or you pass it in "values" — e.g. one you fetched from a secrets store or test database. Never ask the user to paste a password into chat; if you can't get it, ask them to add it to their Understudy env file.
-- Memory doesn't have a flow? Ask the user to record it: understudy_record, then understudy_save when they've stopped. Save replays it first and keeps it only if every step passes.
+- Memory doesn't have a flow? Ask the user to record it (understudy_record, then understudy_save once they've stopped), or drive it yourself. If you drove it and the user would want it tested again, save it: understudy_save with "script" — a Playwright script of what you did, passwords read from process.env. Save replays it first and keeps it only if every step passes; yours are marked as made by an agent. A one-off? Just remember the facts and lessons.
+- Distilling names a saved flow and splits it into reusable segments. Ask the user before each distillation; any flow may be distilled.
 - Learned something (a fact that changes plans, a lesson that changes one step, a finding that the app is broken)? Gather them, put the list to the user at a natural pause, and write the approved ones in one understudy_remember. Reached a goal without understudy_run? Record it there too, as "reached".
 - understudy_findings lists what looked broken; triage each as issue, lesson or noise.`;
 
@@ -91,9 +93,9 @@ const values = z.record(z.string(), z.string()).optional()
   .describe('Login values, e.g. {"SECRET.password":"…"} — ones you fetched yourself. Otherwise Understudy reads UNDERSTUDY_<REF> from settings. Never stored.');
 
 server.registerTool('understudy_recall', {
-  description: 'What memory knows about a goal: closest flows and notes, and a verdict (known / unsure / unknown). A database query — free, no browser. Call it before acting.',
+  description: 'What memory knows about a goal: closest flows and notes, and a verdict (known / unsure / unknown). When known, also the flow\'s steps — enough to drive it yourself — and the login values it needs (where they\'re set, never the values). Free, no browser. Call it before acting.',
   inputSchema: { app: z.string(), goal: z.string(), limit: z.number().int().positive().optional() },
-}, ({ app, goal, limit }) => wrap(() => recall(app, goal, limit ? { limit } : {})));
+}, ({ app, goal, limit }) => wrap(() => recall(app, goal, { withSteps: true, ...(limit ? { limit } : {}) })));
 
 server.registerTool('understudy_run', {
   description: 'Plan a goal and run it headless. Returns a question (status "waiting": answer with understudy_answer), "blocked" with why, or the result. Pass subGoals to skip the decompose question. Destructive flows are refused unless allowPurchases.',
@@ -197,17 +199,34 @@ server.registerTool('understudy_record', {
 }));
 
 server.registerTool('understudy_save', {
-  description: 'Prove a recording by replaying it headless, then keep it as a flow — only if every step passes. Without a hash, saves the recording the user just finished via understudy_record. Login values come from UNDERSTUDY_<REF> settings; don\'t ask the user to paste passwords into chat.',
+  description: 'Prove a flow by replaying it headless, then keep it — only if every step passes. Either the recording the user just finished (understudy_record), a recording hash, or `script`: a Playwright script of a flow YOU drove, kept as made by an agent. Save what the user would want tested again.',
   inputSchema: {
     app: z.string(), name: z.string().describe('What the flow does, as someone would ask for it.'),
-    hash: z.string().optional(), intent: z.string().optional(), slug: z.string().optional(), values,
+    hash: z.string().optional(),
+    script: z.string().optional().describe('Path to a Playwright script (.ts/.js) of a flow you drove yourself. Read passwords from process.env in it; they become placeholders.'),
+    intent: z.string().optional(), slug: z.string().optional(), values,
   },
 }, (a) => wrap(async () => {
-  if (!a.hash && recording?.app === a.app) throw new Error('the user is still recording — ask them to click "Stop and save" in the extension first');
-  const hash = a.hash ?? finished.get(a.app)?.hash;
-  if (!hash) throw new Error(`no finished recording for "${a.app}" — start one with understudy_record, or pass a hash`);
-  const rec = await loadRecording(hash);
-  const out = await proveAndSave(rec, { title: a.name, ...(a.values ? { values: a.values } : {}), ...(a.intent ? { intent: a.intent } : {}), ...(a.slug ? { slug: a.slug } : {}) });
+  let rec;
+  let madeBy: 'user' | 'agent' = 'user';
+  if (a.script) {
+    // A flow the agent drove: read its script into steps, exactly like `understudy import`.
+    const { apps } = await collections();
+    const base = (await apps.findOne({ slug: a.app }))?.urls.default;
+    const parsed = await parseScript(a.script, a.app, base);
+    if (!parsed.recording.events.length) throw new Error(`no Playwright actions found in ${a.script} — expected calls like page.getByRole(...).click()`);
+    if (parsed.warnings.length) throw new Error(`these calls in the script can't be replayed, so it wasn't kept — rewrite them as plain Playwright actions:\n- ${parsed.warnings.slice(0, 10).join('\n- ')}`);
+    rec = parsed.recording;
+    await saveRecording(rec);
+    madeBy = 'agent';
+  } else {
+    if (!a.hash && recording?.app === a.app) throw new Error('the user is still recording — ask them to click "Stop and save" in the extension first');
+    const hash = a.hash ?? finished.get(a.app)?.hash;
+    if (!hash) throw new Error(`no finished recording for "${a.app}" — start one with understudy_record, pass a hash, or pass a script`);
+    rec = await loadRecording(hash);
+  }
+  const hash = rec.hash;
+  const out = await proveAndSave(rec, { title: a.name, madeBy, ...(a.values ? { values: a.values } : {}), ...(a.intent ? { intent: a.intent } : {}), ...(a.slug ? { slug: a.slug } : {}) });
   const r = out.proven.result;
   const base = {
     recording: hash,
@@ -219,7 +238,7 @@ server.registerTool('understudy_save', {
   };
   if (!out.saved) return { saved: false, ...base, why: 'it did not replay cleanly, so it was not kept' };
   return {
-    saved: true, flow: out.flow.slug, steps: out.flow.steps.length, ...base,
+    saved: true, flow: out.flow.slug, steps: out.flow.steps.length, madeBy, ...base,
     ...(out.flow.destructive ? { destructive: out.flow.destructiveBecause } : {}),
     findings: out.run.findings.map((f) => f.statement),
   };

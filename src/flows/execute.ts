@@ -14,7 +14,7 @@ import { loadSession, forgetSession, loadSessionById, forgetSessionById } from '
 import type { RawRecording } from '../core/recording.js';
 import { replay, type ReplayResult } from '../core/replay.js';
 import { foldLessons, lessonsFor } from '../memory/notes.js';
-import { valuesFromEnv } from '../store/settings.js';
+import { valuesFromEnv, valueEnvNames } from '../store/settings.js';
 
 export interface ExecuteOptions {
   /** Values for steps that deliberately don't store theirs, e.g. { 'SECRET.password': '…' }. */
@@ -47,7 +47,16 @@ export async function execute(recording: RawRecording, opts: ExecuteOptions = {}
   // Login values: given explicitly, else from UNDERSTUDY_<REF> in the environment.
   const refs = new Set(recording.events.map((e) => e.valueRef).filter((r): r is string => Boolean(r)));
   const values = { ...valuesFromEnv(refs), ...(opts.values ?? {}) };
-  const missingValues = [...new Set(recording.events.filter((e) => e.valueRef && !(e.valueRef in values)).map((e) => e.valueRef!))];
+  const missingValues = [...refs].filter((r) => !(r in values));
+  // Checked BEFORE a browser opens: a run that reached the password step
+  // without a password would spend a real login attempt — and some apps lock
+  // the account after a few.
+  if (missingValues.length) {
+    throw new Error(
+      `missing login value(s) — nothing was run:\n` +
+        missingValues.map((r) => `- ${r}: set ${valueEnvNames(r).join(' or ')}, or pass it for this run`).join('\n'),
+    );
+  }
 
   // A late-armed recording starts signed in; a cold browser would land on a
   // login page and fail somewhere confusing.

@@ -101,6 +101,7 @@ DISTILL
 
 RECALL
   --limit <n>           how many flows and notes to show (default 5)
+  --steps               list the known flow's steps
 
 SETTINGS — from the environment, --env-file <path>, the file saved with
 "understudy config", or ./.env (first wins)
@@ -156,17 +157,6 @@ function valuesFromFlags(flags: Flags): Record<string, string> {
     values[v.slice(0, eq)] = v.slice(eq + 1);
   }
   return values;
-}
-
-/** Say which login values a recording needs that nobody supplied — and where they can come from. */
-function printNeededValues(recording: RawRecording, given: Record<string, string>) {
-  const refs = [...new Set(recording.events.map((e) => e.valueRef).filter((r): r is string => Boolean(r)))];
-  const fromEnv = valuesFromEnv(refs);
-  const missing = refs.filter((r) => !(r in given) && !(r in fromEnv));
-  if (!missing.length) return;
-  console.log(`this needs ${missing.length} value(s) that are deliberately not stored:`);
-  for (const ref of missing) console.log(`  ${valueEnvName(ref)}=…   (in your env file or environment — or --value ${ref}=…)`);
-  console.log('');
 }
 
 // --- apps --------------------------------------------------------------------
@@ -525,7 +515,6 @@ async function cmdImport(positional: string[], flags: Flags) {
  */
 async function executeWithReport(recording: RawRecording, flags: Flags, opts: { useLessons: boolean }): Promise<ReplayResult> {
   const values = valuesFromFlags(flags);
-  printNeededValues(recording, values);
   const x = await execute(recording, { values, headed: flags.has('headed'), useLessons: opts.useLessons }).catch((e: Error) => fail(e.message));
   if (x.sessionRestoredFrom) console.log(`session: restored (saved ${x.sessionRestoredFrom})`);
   if (x.staleSession) {
@@ -581,7 +570,7 @@ async function runSavedFlow(app: string, slug: string, flags: Flags, how: { mode
 
 // --- recall / run ------------------------------------------------------------
 
-function printRecall(r: Recall) {
+function printRecall(r: Recall, showSteps = false) {
   const verdict = { known: 'KNOWN', unsure: 'UNSURE', unknown: "DON'T KNOW" }[r.verdict];
   console.log(`${verdict} — ${r.why}  (matched by ${r.method})\n`);
   if (r.flows.length) {
@@ -595,13 +584,26 @@ function printRecall(r: Recall) {
     console.log('\nnotes');
     for (const n of r.notes) console.log(`  ${n.score.toFixed(3)}  ${n.kind.padEnd(6)} ${n.text.slice(0, 100)}`);
   }
+  if (r.best && r.steps) {
+    console.log(`\n${r.best.slug}: ${r.steps.length} steps${showSteps ? '' : '  (--steps to list them)'}`);
+    if (showSteps) {
+      for (const s of r.steps) {
+        const target = s.role && s.name ? `${s.role} "${s.name}"` : s.testId ? `[test id ${s.testId}]` : s.css ? `[${s.css}]` : '';
+        const what = s.placeholder ? `= <${s.placeholder}>` : s.value !== undefined ? `= "${s.value}"` : '';
+        console.log(`  ${String(s.n).padStart(3)}  ${s.action.padEnd(7)} ${target}${s.nth !== undefined ? ` (#${s.nth})` : ''} ${what}`.trimEnd());
+      }
+    }
+  }
+  for (const need of r.needs ?? []) {
+    console.log(`needs    ${need.placeholder} — from ${need.readFrom.join(' or ')}: ${need.set ? 'set' : 'NOT SET'}`);
+  }
 }
 
 /** What memory knows about a goal. A database query: no browser, nothing runs. */
 async function cmdRecall(positional: string[], flags: Flags) {
   const [app, ...goalWords] = positional;
   if (!app || !goalWords.length) fail('recall needs an app and a goal', 'understudy recall myapp "log in"');
-  printRecall(await recall(app, goalWords.join(' '), { limit: Number(str(flags.get('limit')) ?? 5) }));
+  printRecall(await recall(app, goalWords.join(' '), { withSteps: true, limit: Number(str(flags.get('limit')) ?? 5) }), flags.has('steps'));
 }
 
 /**
@@ -778,7 +780,6 @@ async function cmdSave(positional: string[], flags: Flags) {
 
   console.log(`proving ${hash} by replaying it…\n`);
   const values = valuesFromFlags(flags);
-  printNeededValues(recording, values);
   const slug = str(flags.get('slug'));
   const intent = str(flags.get('intent'));
   // No lessons: what gets saved is what the recording does on its own. Proving
@@ -813,7 +814,7 @@ async function cmdFlows(positional: string[]) {
   for (const f of rows) {
     const last = await runs.find({ app, plan: [f.slug] }).sort({ startedAt: -1 }).limit(1).next();
     const status = last ? `${last.status} ${last.startedAt.toISOString().slice(0, 16).replace('T', ' ')}` : 'never run';
-    const marks = [f.destructive && 'DESTRUCTIVE', f.requiresSession && 'needs session', f.kind === 'segment' && 'segment']
+    const marks = [f.destructive && 'DESTRUCTIVE', f.requiresSession && 'needs session', f.kind === 'segment' && 'segment', f.madeBy === 'agent' && 'made by an agent']
       .filter(Boolean).join(', ');
     console.log(`  ${f.slug.padEnd(32)} ${status.padEnd(24)} ${f.title}${marks ? `  [${marks}]` : ''}`);
   }

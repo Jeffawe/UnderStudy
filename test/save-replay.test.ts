@@ -115,10 +115,15 @@ test('recall finds the saved flow by name and by words, and refuses to guess', a
   assert.equal(exact.method, 'exact');
   assert.equal(exact.best?.slug, 'open-the-cart');
 
-  const byWords = await recall('shop', 'open my cart');
+  const byWords = await recall('shop', 'open my cart', { withSteps: true });
   assert.equal(byWords.method, 'words', 'no model configured in this test');
   assert.equal(byWords.verdict, 'known');
   assert.equal(byWords.best?.slug, 'open-the-cart');
+  // Enough to drive it yourself: the steps, and where the password comes from — never the password.
+  assert.equal(byWords.steps?.length, 5);
+  assert.deepEqual(byWords.steps?.[2], { n: 2, action: 'fill', role: 'textbox', name: 'Password', placeholder: 'SECRET.password' });
+  assert.deepEqual(byWords.needs, [{ placeholder: 'SECRET.password', readFrom: ['UNDERSTUDY_SECRET_PASSWORD'], set: false }]);
+  assert.equal(JSON.stringify(byWords).includes(values['SECRET.password']), false);
 
   const nope = await recall('shop', 'change my password');
   assert.equal(nope.verdict, 'unknown');

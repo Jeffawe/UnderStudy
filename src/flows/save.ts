@@ -58,6 +58,8 @@ export interface SaveOptions {
   slug?: string;
   /** What the flow is for, if different from the title. */
   intent?: string;
+  /** 'agent' when an agent drove it and handed over the script. Default 'user'. */
+  madeBy?: 'user' | 'agent';
 }
 
 export async function saveFlow(recording: RawRecording, result: ReplayResult, opts: SaveOptions): Promise<Flow> {
@@ -80,6 +82,7 @@ export async function saveFlow(recording: RawRecording, result: ReplayResult, op
     title: opts.title,
     intent,
     kind: 'recording',
+    madeBy: opts.madeBy ?? 'user',
     preconditions: recording.entry?.requiresSession ? ['authenticated'] : [],
     outcome: '',
     destructive: Boolean(why),

@@ -307,19 +307,40 @@ function locatorBit(method: string, args: readonly ts.Expression[]): LocatorBit 
 /**
  * Read an action's argument as either a literal value or a reference.
  *
- * `fill('standard_user')`   → value
- * `fill(MEMBER.email)`      → valueRef 'MEMBER.email'  ← already the IR shape
+ * `fill('standard_user')`             → value
+ * `fill(MEMBER.email)`                → valueRef 'MEMBER.email'  ← already the IR shape
+ * `fill(process.env.SHOP_PASSWORD!)`  → valueRef 'ENV.SHOP_PASSWORD'
  */
 function readArgument(arg: ts.Expression | undefined): { value?: string; valueRef?: string } {
   if (!arg) return {};
   const literal = text(arg);
   if (literal !== undefined) return { value: literal };
 
+  // A script reading its own environment — what an agent's script usually
+  // does for a password. Every spelling of it becomes ENV.<NAME>, whose value
+  // is then found under that same variable at replay (store/settings.ts).
+  const env = envVariable(arg);
+  if (env) return { valueRef: `ENV.${env}` };
+
   if (ts.isPropertyAccessExpression(arg) || ts.isIdentifier(arg)) {
     return { valueRef: arg.getText() };
   }
   if (ts.isTemplateExpression(arg)) return { valueRef: arg.getText() };
   return { valueRef: arg.getText().slice(0, 80) };
+}
+
+/** `process.env.X`, `process.env.X!`, `process.env['X']`, `process.env.X ?? ''` → 'X'. */
+function envVariable(arg: ts.Expression): string | undefined {
+  let e: ts.Expression = arg;
+  while (true) {
+    if (ts.isNonNullExpression(e) || ts.isParenthesizedExpression(e) || ts.isAsExpression(e)) e = e.expression;
+    else if (ts.isBinaryExpression(e) && (e.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken || e.operatorToken.kind === ts.SyntaxKind.BarBarToken)) e = e.left;
+    else break;
+  }
+  const isProcessEnv = (x: ts.Expression) => ts.isPropertyAccessExpression(x) && x.name.text === 'env' && ts.isIdentifier(x.expression) && x.expression.text === 'process';
+  if (ts.isPropertyAccessExpression(e) && isProcessEnv(e.expression)) return e.name.text;
+  if (ts.isElementAccessExpression(e) && isProcessEnv(e.expression) && ts.isStringLiteralLike(e.argumentExpression)) return e.argumentExpression.text;
+  return undefined;
 }
 
 export async function parseScript(

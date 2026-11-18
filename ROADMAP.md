@@ -28,23 +28,19 @@ embedding model.
   new flow.
 - Re-fit when the corpus changes a lot, or the embedding model changes.
 
-## To discuss: how an agent's own work feeds memory
+## Which typed values become placeholders
 
-Today an agent can read memory, run flows, ask the user to record
-(`understudy_record` → `understudy_save`), and write facts, lessons and
-findings (`understudy_remember`). What it can't do over MCP is turn a flow it
-drove *itself* (exploring, or reaching a goal with its own browser) into a
-saved flow — so that work only lands as notes, or not at all. Ideas raised:
-distilling as the way in (with the user's permission), and exploration as
-input to distillation. Not designed yet.
+Today a value becomes a placeholder (never stored) only for password-type
+fields, fields named like password/secret/token/otp/cvv/ssn/api key, and
+script values read from variables. Everything else — usernames, emails — is
+stored as typed. In the real corpus that includes a real email address. Worth
+deciding: let a user mark more fields as placeholders (e.g. every email field,
+per app), so a username or test account can be swapped per run too.
 
 ## Small things noticed during the rewrite
 
 - **One unexpected page raises two findings** (the step's unexpected page, and
   the path drift). Fold them into one.
-- **`import` names a value reference after the code it read**: a script that
-  types `process.env.SHOP_PASSWORD!` gets a reference literally called
-  `process.env.SHOP_PASSWORD!`. It works, but should become `ENV.SHOP_PASSWORD`.
 - **A replay that lands on an unexpected page still passes** (on purpose: a
   cookie banner shouldn't fail a test), so that path joins the history and stops
   drifting next time. Triage is where it gets called a bug — worth making that
