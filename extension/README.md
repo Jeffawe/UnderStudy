@@ -11,7 +11,7 @@ signed in or not — instead of a fresh browser that Understudy opens.
 
 ## Record
 
-1. In a terminal: `understudy record <app> --extension`. It waits for the extension.
+1. In a terminal: `understudy record <app>`. It waits for the extension.
 2. In Chrome, go to the page where the flow starts.
 3. Click the Understudy icon → **Record from this page**. The first time on a
    site, Chrome asks to let Understudy access it — that's the only site it

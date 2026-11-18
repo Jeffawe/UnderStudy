@@ -21,7 +21,7 @@
  */
 
 import { build } from 'esbuild';
-import { writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 
 const ENTRY = `
 import { computeAccessibleName, getRole, isInaccessible } from 'dom-accessibility-api';
@@ -41,14 +41,22 @@ const result = await build({
   legalComments: 'none',
 });
 
-const code = result.outputFiles[0].text;
+// The MIT license lets us bundle this library, on one condition: its copyright
+// and permission notice travel with every copy. So the notice goes INSIDE the
+// bundle — it then rides along into extension/recorder.js and into every page
+// the recorder runs in, not just into this file.
+const license = (await readFile('node_modules/dom-accessibility-api/LICENSE.md', 'utf8')).trim();
+const { version } = JSON.parse(await readFile('node_modules/dom-accessibility-api/package.json', 'utf8'));
+const notice = `/*! dom-accessibility-api ${version} — bundled by Understudy.\n${license.replace(/\*\//g, '* /')}\n*/\n`;
+const code = notice + result.outputFiles[0].text;
 
 // JSON.stringify, not a template literal: the minified bundle contains
 // backticks and ${ sequences that would terminate or interpolate one.
 const file = `/**
  * GENERATED — do not edit. Regenerate with \`npm run vendor:accname\`.
  *
- * dom-accessibility-api bundled as a browser IIFE. Installs
+ * dom-accessibility-api (MIT, Copyright (c) 2020 Sebastian Silbermann) bundled
+ * as a browser IIFE; its full license notice is at the top of the bundle. Installs
  * window.__understudyA11y = { computeAccessibleName, getRole, isInaccessible }.
  *
  * Injected ahead of the recorder's listener so role and accessible name can be

@@ -149,12 +149,12 @@ failed — usually its trigger is too broad, or its cause is gone.
 Check with `understudy_recall` first — it's free. If it's a gap, reach the goal
 however works, then capture it so it isn't done twice:
 
-- Something the user can click through: `understudy record <app> --extension`
-  records in their own Chrome, on the tab they're on (signed in or not — see
-  `extension/README.md`). Plain `understudy record <app>` opens a fresh
-  browser instead (`--arm-manually` skips recording the login). Then
+- Something the user can click through: ask them to run `understudy record
+  <app>`, which records in their own Chrome with the extension, on the tab
+  they're on (signed in or not — see `extension/README.md`). Then
   `understudy save <hash> "<name>"`, which replays it to prove it before
-  storing.
+  storing. (`--new-browser` records in a fresh browser instead; it needs the
+  full Chromium installed.)
 - **Anything with a file upload: never `record`.** Neither recorder can say
   which file was picked. Write a Playwright script, then `understudy import <app>
   <file>`. Read the import warnings: a dropped step is not a clean import.

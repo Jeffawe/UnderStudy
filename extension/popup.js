@@ -1,4 +1,4 @@
-// Understudy recorder — popup. Shows whether `understudy record --extension`
+// Understudy recorder — popup. Shows whether `understudy record <app>`
 // is waiting, and starts or stops recording on the current tab.
 
 const $ = (id) => document.getElementById(id);
@@ -26,7 +26,7 @@ async function refresh() {
   } else if (s.cli?.error) {
     show(s.cli.error, 'err');
   } else if (s.cli?.started) {
-    show('That recording already ran. Run `understudy record <app> --extension` again.', 'err');
+    show('That recording already ran. Run `understudy record <app>` again.', 'err');
   } else {
     show(`Ready to record "${s.cli.app}".`);
     $('startPane').hidden = false;

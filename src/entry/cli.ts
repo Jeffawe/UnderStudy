@@ -19,6 +19,8 @@ import { destructiveControls, remember } from '../memory/notes.js';
 import { start, answer, runPlan, type PlanState } from '../plan/planner.js';
 import { distillRequest, saveDistilled } from '../flows/distill.js';
 import { readFile, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { chromium } from 'playwright';
 import { emitFlow, type Framework } from '../flows/emit.js';
 import { saveFlow, recordingFrom } from '../flows/save.js';
 import { recordRun, type RecordedRun } from '../flows/runs.js';
@@ -33,7 +35,7 @@ USAGE
 COMMANDS
   doctor                check the MongoDB connection, vector search and embedder
   reembed               rebuild every vector with the model in .env
-  record <app>          capture a flow: in a new browser, or --extension in yours
+  record <app>          capture a flow in your own Chrome, with the extension
   import <app> <file>   read an existing Playwright script into a recording
   recordings [app]      list captured recordings
   save <hash> "<name>"  prove a recording by replaying it, then save it as a flow
@@ -50,10 +52,11 @@ COMMANDS
 
   MCP server for agents: understudy-mcp (see REASONER.md).
 
-RECORD
-  --extension           record in your own Chrome with the Understudy extension
-                        (load extension/ unpacked once — see extension/README.md)
+RECORD (in your own Chrome — load extension/ unpacked once, see extension/README.md)
   --port <n>            port the extension talks to (default 7397)
+
+RECORD --new-browser (opt-in: a fresh browser Understudy opens; needs
+                      "npx playwright install chromium", ~350 MB)
   --url <baseUrl>       required the first time you use an app; remembered after
   --max-minutes <n>     stop recording after n minutes (default 30)
   --arm-manually        drive to the starting point yourself, unrecorded, then
@@ -242,8 +245,17 @@ function printEvents(recording: RawRecording) {
 }
 
 async function cmdRecord(positional: string[], flags: Flags) {
-  const slug = positional[0] ?? fail('record needs an app name', 'understudy record myapp --url https://…');
-  if (flags.has('extension')) return cmdRecordExtension(slug, flags);
+  const slug = positional[0] ?? fail('record needs an app name', 'understudy record myapp');
+  // The extension is the recorder. The fresh-browser one is opt-in, because it
+  // needs Playwright's full Chromium (~350 MB), which isn't installed by default
+  // — replay only needs the headless build.
+  if (!flags.has('new-browser')) return cmdRecordExtension(slug, flags);
+  if (!existsSync(chromium.executablePath())) {
+    fail(
+      "--new-browser needs Playwright's full Chromium (~350 MB), which isn't installed",
+      'install it with: npx playwright install chromium   — or record in your own Chrome with the extension (the default)',
+    );
+  }
   const baseUrl = await resolveBaseUrl(slug, str(flags.get('url')));
   const values = valuesFromFlags(flags);
   const armManually = flags.has('arm-manually');

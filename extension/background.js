@@ -2,7 +2,7 @@
 //
 // Holds the one recording in progress (which tab, which token), injects the
 // recorder into that tab after every page load, and forwards each action to
-// the `understudy record --extension` process on this machine, in order.
+// the `understudy record <app>` process on this machine, in order.
 // The extension stores nothing about the page itself.
 
 const DEFAULT_PORT = 7397;
@@ -12,13 +12,13 @@ async function cliUrl() {
   return `http://127.0.0.1:${port}`;
 }
 
-/** Is `understudy record <app> --extension` running, and for which app? */
+/** Is `understudy record <app>` running, and for which app? */
 async function hello() {
   let res;
   try {
     res = await fetch(`${await cliUrl()}/hello`);
   } catch {
-    throw new Error('Understudy is not waiting. In a terminal, run: understudy record <app> --extension');
+    throw new Error('Understudy is not waiting. In a terminal, run: understudy record <app>');
   }
   if (!res.ok) throw new Error(`Understudy answered ${res.status}`);
   return res.json();

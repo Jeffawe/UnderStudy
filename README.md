@@ -15,8 +15,7 @@ Understudy never calls a model itself — the agent is the model.
 record  →  save  →  replay / run  →  findings
 ```
 
-- **record** — click through a flow in your own Chrome (with the extension) or
-  in a fresh browser. Passwords are never stored: a password field is kept as
+- **record** — click through a flow in your own Chrome, with the extension. Passwords are never stored: a password field is kept as
   a reference like `SECRET.password`, and you supply the value when replaying.
 - **save** — the recording is replayed headless first. It is kept only if every
   step passes, so memory only holds flows known to work.
@@ -42,7 +41,7 @@ with `mongot` running locally.
 ```bash
 git clone https://github.com/Jeffawe/UnderStudy.git && cd UnderStudy
 npm install
-npx playwright install chromium
+npx playwright install --only-shell chromium   # the headless browser replay uses, ~200 MB
 cp .env.example .env          # then set MONGODB_URI
 npx tsx src/entry/cli.ts doctor
 ```
@@ -58,8 +57,7 @@ default, and Ollama works offline for free. Without one, goals match flow names.
 ## Use it
 
 ```bash
-understudy record myapp --extension         # record in your own Chrome (see extension/README.md)
-understudy record myapp --url https://…     # or in a fresh browser
+understudy record myapp                     # record in your own Chrome (see extension/README.md)
 understudy save <hash> "log in as a member" # prove it by replaying, then keep it
 understudy flows myapp                      # what it knows how to do
 understudy replay myapp log-in-as-a-member  # run one flow
@@ -69,7 +67,9 @@ understudy emit myapp log-in-as-a-member    # print it as a Playwright (or Cypre
 ```
 
 (`understudy` is `npx tsx src/entry/cli.ts` until you `npm run build && npm link`.)
-`understudy --help` lists everything. A flow that commits something real — a
+`understudy --help` lists everything. Prefer a fresh browser over your own
+Chrome? `understudy record myapp --new-browser --url https://…`, after
+`npx playwright install chromium` (the full browser, ~350 MB). A flow that commits something real — a
 purchase, a deletion — is marked destructive and refused unless you pass
 `--allow-purchases`.
 

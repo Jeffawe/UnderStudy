@@ -29,7 +29,8 @@ src/
               distill.ts (the distill contract)  auth-cache.ts (saved sessions)
   adapters/recorder/
               injected.ts (the in-page recorder)  wire.ts (its events → steps)
-              live.ts (Playwright recorder)  extension.ts (Chrome extension's server)
+              extension.ts (the Chrome extension's local server — the default recorder)
+              live.ts (opt-in fresh-browser recorder: --new-browser, needs full Chromium)
               script.ts (import a Playwright script)
   flows/      save.ts  execute.ts  runs.ts  drift.ts  findings.ts  destructive.ts
               distill.ts  emit.ts
@@ -109,6 +110,14 @@ Decisions that look arbitrary until you know what they avoid.
 - **The extension always copies the tab's sign-in**; ticking "I'm signed in"
   makes the flow require it, and leaving it unticked lets `save` decide by
   proving without it first (and deleting it if unneeded).
+- **Only the headless browser is installed by default** (~200 MB): replay is
+  all that needs it. Recording happens in the user's own Chrome via the
+  extension; the fresh-browser recorder and `--headed` need Playwright's full
+  Chromium (~350 MB more), installed only by those who want them.
+- **Bundled third-party code keeps its license notice.** dom-accessibility-api
+  (MIT) is the one library copied into our files (it must run in the page); its
+  notice is inside the bundle, so it travels into `extension/recorder.js` too.
+  Everything else is an ordinary npm dependency, not copied.
 - **Segments copy their steps** rather than referencing the parent's. Simpler
   to read and replay; fixing a selector everywhere is one `updateMany`.
 

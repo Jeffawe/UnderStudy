@@ -2,7 +2,7 @@
  * Recording from the Chrome extension: record in the browser you already have
  * open, on the tab you're already on.
  *
- * `understudy record <app> --extension` starts this tiny local server; the
+ * `understudy record <app>` starts this tiny local server; the
  * extension (extension/ in the repo) finds it, and while you record, sends
  * each action here. Nothing about the page is stored by the extension itself.
  *
