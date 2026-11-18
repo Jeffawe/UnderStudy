@@ -12,7 +12,8 @@
     "understudy-mcp": "./dist/entry/mcp.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "extension"
   ],
   "scripts": {
     "build": "tsc",
@@ -21,7 +22,8 @@
     "vendor:accname": "node scripts/vendor-accname.mjs",
     "hair-loss:book": "tsx .understudy/explorations/hair-loss-book.ts",
     "test": "node --import tsx --test test/*.test.ts",
-    "mcp": "tsx src/entry/mcp.ts"
+    "mcp": "tsx src/entry/mcp.ts",
+    "extension:build": "tsx scripts/build-extension.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

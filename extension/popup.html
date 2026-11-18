@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font: 13px/1.4 system-ui, sans-serif; width: 300px; margin: 12px; color: #222; }
+    h1 { font-size: 14px; margin: 0 0 8px; }
+    .status { padding: 8px; border-radius: 6px; background: #f2f2f2; margin-bottom: 10px; }
+    .status.rec { background: #fdecea; color: #b71c1c; }
+    .status.err { background: #fff4e5; color: #8a4b00; }
+    label { display: flex; gap: 6px; align-items: flex-start; margin: 8px 0; }
+    button { width: 100%; padding: 8px; font-size: 13px; border: 0; border-radius: 6px; cursor: pointer; }
+    #start { background: #1565c0; color: #fff; }
+    #stop { background: #c62828; color: #fff; }
+    button:disabled { opacity: .5; cursor: default; }
+    .small { color: #666; font-size: 11px; }
+    details { margin-top: 10px; }
+    input[type=number] { width: 80px; }
+  </style>
+</head>
+<body>
+  <h1>Understudy recorder</h1>
+  <div id="status" class="status">Checking…</div>
+  <div id="startPane" hidden>
+    <label><input type="checkbox" id="signedIn">
+      <span>I'm signed in here — let replay start signed in too
+      <span class="small">(saves this site's cookies to a local file on this machine)</span></span>
+    </label>
+    <button id="start">Record from this page</button>
+  </div>
+  <div id="stopPane" hidden>
+    <button id="stop">Stop and save</button>
+  </div>
+  <details>
+    <summary class="small">Settings</summary>
+    <label>Port <input type="number" id="port" min="1" max="65535"></label>
+  </details>
+  <script src="popup.js"></script>
+</body>
+</html>

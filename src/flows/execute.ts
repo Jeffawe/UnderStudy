@@ -10,7 +10,7 @@
  * caller decides how to show it.
  */
 
-import { loadSession, forgetSession } from '../core/auth-cache.js';
+import { loadSession, forgetSession, loadSessionById, forgetSessionById } from '../core/auth-cache.js';
 import type { RawRecording } from '../core/recording.js';
 import { replay, type ReplayResult } from '../core/replay.js';
 import { foldLessons, lessonsFor } from '../memory/notes.js';
@@ -50,12 +50,16 @@ export async function execute(recording: RawRecording, opts: ExecuteOptions = {}
   // login page and fail somewhere confusing.
   let storageState;
   let sessionRestoredFrom: string | undefined;
+  const sessionId = recording.entry?.session;
   if (recording.entry?.requiresSession) {
-    const cached = await loadSession(recording.appSlug, values);
+    const cached = sessionId ? await loadSessionById(recording.appSlug, sessionId) : await loadSession(recording.appSlug, values);
     if (!cached) {
       throw new Error(
-        'this starts from a signed-in browser, and no saved session matches these credentials — pass the same ' +
-          '--value credentials it was recorded with, re-record with --arm-manually, or start the plan with a flow that logs in',
+        sessionId
+          ? `this starts from the signed-in tab it was recorded in, and that saved session (${sessionId}) is gone or older ` +
+              'than 12 hours — record it again from the extension, or start the plan with a flow that logs in'
+          : 'this starts from a signed-in browser, and no saved session matches these credentials — pass the same ' +
+              '--value credentials it was recorded with, re-record with --arm-manually, or start the plan with a flow that logs in',
       );
     }
     storageState = cached.storageState;
@@ -76,7 +80,8 @@ export async function execute(recording: RawRecording, opts: ExecuteOptions = {}
   // armed; landing elsewhere means the session expired.
   const entry = result.steps.find((s) => s.seq === 0);
   if (recording.entry?.requiresSession && entry?.unexpectedPage) {
-    await forgetSession(app, values);
+    if (sessionId) await forgetSessionById(app, sessionId);
+    else await forgetSession(app, values);
     out.staleSession = entry.unexpectedPage;
   }
   if (opts.useLessons) out.lessons = await foldLessons(app, result.steps, recording.events);

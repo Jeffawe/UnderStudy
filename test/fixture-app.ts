@@ -1,6 +1,7 @@
 /**
  * A tiny shop to test against, served locally so tests never depend on a
- * public site. Log in → shop → cart, or shop → profile. Switches let a test change the app
+ * public site. Log in → shop → cart, or shop → profile. Logging in sets a
+ * cookie, and /shop sends you back to sign in without it. Switches let a test change the app
  * between runs, the way a real app changes between deploys:
  *
  *   promo   the Cart link goes through a new /promo page first  (→ drift)
@@ -36,7 +37,10 @@ export async function startFixtureApp(): Promise<FixtureApp> {
           <button type="submit">Log in</button>
         </form>`));
     }
-    if (path === '/login') return res.writeHead(303, { location: '/shop' }).end();
+    // Signing in sets a cookie; the shop sends you back to sign in without it.
+    if (path === '/login') return res.writeHead(303, { location: '/shop', 'set-cookie': 'sid=demo; Path=/; HttpOnly' }).end();
+    const signedIn = /(^|;\s*)sid=demo(;|$)/.test(req.headers.cookie ?? '');
+    if (path === '/shop' && !signedIn) return res.writeHead(303, { location: '/' }).end();
     if (path === '/shop') {
       return html(page('Shop', `
         <h1>Shop</h1>

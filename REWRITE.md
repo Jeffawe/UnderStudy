@@ -255,7 +255,7 @@ what it replaces.
 | **2. Record & replay, no AI** | Player, `save`, `replay`, `flows`. Live recorder + script import ported. | Record login on a test app, replay it, see drift and findings. No key, no agent. **Done 2026-11-18** — see *Phase 2 notes*. |
 | **3. Run by goal, no AI** | Recall on Voyage (name match without a key), `run` picks one flow, safety gate, run documents. | `understudy run myapp "log in"` binds and runs the login flow. **Done 2026-11-18** — see *Phase 3 notes*. |
 | **4. Agent layer** | The seven MCP tools: distill/segments, decompose, three-rung seams, remember, findings. Lessons applied during replay (moved here from phase 3, so lessons are written and read in the same phase), and the 3 remaining destructive signals that need notes. Rewrite `REASONER.md` to match. | A goal spanning two recordings binds two segments and runs. **Done 2026-11-18** — see *Phase 4 notes*. |
-| **5. Extension** | Chrome extension + localhost WebSocket. | Record a flow in your normal Chrome, replay it headless. |
+| **5. Extension** | Chrome extension + localhost WebSocket. | Record a flow in your normal Chrome, replay it headless. **Done 2026-11-18** — see *Phase 5 notes*. |
 | **6. Clean up** | Copy the corpus across (one-off script). Rewrite README, write ARCHITECTURE.md, delete BUILDING/PLAN/STATUS/STATUS-HISTORY. | Fresh clone → working in under five minutes. |
 | **7. Hosted (later)** | Memory-only server: anyone points it at their own Mongo URI. No browsers. | Not scheduled. |
 
@@ -396,6 +396,37 @@ what it replaces.
   recordings → distilled into segments (one merged by slug) → a goal planned
   from segments of both, decompose and seams included → run in one browser.
   `test/mcp.test.ts` talks to the real server over stdio.
+
+## Phase 5 notes (2026-11-18)
+
+- **`understudy record <app> --extension`** waits for the extension
+  (`extension/`, loaded unpacked — `extension/README.md`), which records the
+  tab you start it on, in the Chrome you already use.
+- **Same recorder, both ways:** `extension/recorder.js` is generated from the
+  exact strings the Playwright recorder injects (`npm run extension:build`),
+  and the Node-side conversion moved to `src/adapters/recorder/wire.ts`, shared
+  by both. A test records the same actions both ways and gets identical steps.
+- **Plain HTTP, not a WebSocket** (the plan said WebSocket): Node has no
+  WebSocket server built in, and one POST per action is plenty fast for a
+  human clicking. No new dependency.
+- **Safety:** the server listens on 127.0.0.1, every request needs a random
+  per-recording token, and only a `chrome-extension://` origin can read
+  `/hello` (where the token is) — a web page can send requests to localhost
+  but can't read the answer, so it can't add steps.
+- **Permissions:** site access is asked per site when you first record there,
+  not "read all your data on all websites" at install.
+- **Signed-in tabs (not in the plan, needed in practice):** recording in your
+  real Chrome usually means you're already signed in, and a headless replay
+  isn't. Ticking "I'm signed in here" saves the tab's cookies (including
+  HttpOnly ones) and local storage as a session file; the recording points at
+  it by id (`entry.session`), and every replay, save, run and plan restores
+  it. The test proves it: the same recording fails cold and passes with the
+  session.
+- **Not recordable:** file uploads (dropped, and the CLI says so), pages on
+  sites you haven't allowed mid-flow, `chrome://` pages.
+- **Not automated:** clicking the toolbar button itself — Playwright can't. The
+  test drives the extension's background worker, which is what the popup
+  messages. Worth one manual try in your Chrome.
 
 ## After the rewrite
 

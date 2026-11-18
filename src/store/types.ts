@@ -55,8 +55,10 @@ export interface Flow {
   recording: string;
   /** Where replay starts. */
   startUrl: string;
-  /** True if the first step needs a signed-in browser (recorded with --arm-manually). */
+  /** True if the first step needs a signed-in browser (recorded with --arm-manually, or from a signed-in tab). */
   requiresSession: boolean;
+  /** The saved session to restore, by id (recorded from a signed-in tab by the Chrome extension). */
+  session?: string;
   /** Page fingerprint before the first step / after the last — how flows join up. */
   startState?: string;
   endState?: string;

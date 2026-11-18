@@ -243,3 +243,44 @@ export async function loadHandoffSession(path: string): Promise<HandoffSession |
 export async function forgetHandoffSession(runId: string): Promise<void> {
   await unlink(handoffPath(runId)).catch(() => {});
 }
+
+/**
+ * A session named by id rather than by credentials — the Chrome extension
+ * captures the signed-in tab it records from, with no --value to key it on.
+ * Same file format and the same 0600 file as every other saved session.
+ */
+export async function saveSessionById(
+  appSlug: string,
+  id: string,
+  storageState: StorageState,
+  expectedSig?: string,
+): Promise<string> {
+  await mkdir(SESSIONS_DIR, { recursive: true, mode: 0o700 });
+  const path = sessionPath(appSlug, id);
+  const entry: CachedSession = {
+    version: 1, appSlug, key: id, savedAt: new Date().toISOString(),
+    ...(expectedSig ? { expectedSig } : {}),
+    storageState,
+  };
+  await writeFile(path, JSON.stringify(entry, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await chmod(path, 0o600).catch(() => {});
+  return path;
+}
+
+/** Load a session saved by id, if it exists and is young enough to be worth trying. */
+export async function loadSessionById(appSlug: string, id: string): Promise<CachedSession | undefined> {
+  const path = sessionPath(appSlug, id);
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(await readFile(path, 'utf8')) as CachedSession;
+    if (parsed.version !== 1 || Date.now() - Date.parse(parsed.savedAt) > MAX_AGE_MS) return undefined;
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Drop a session saved by id. */
+export async function forgetSessionById(appSlug: string, id: string): Promise<void> {
+  await unlink(sessionPath(appSlug, id)).catch(() => {});
+}

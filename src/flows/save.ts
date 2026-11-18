@@ -43,7 +43,9 @@ export function recordingFrom(flow: Flow): RawRecording {
     startUrl: flow.startUrl,
     createdAt: flow.updatedAt.toISOString(),
     hash: flow.recording,
-    ...(flow.requiresSession ? { entry: { requiresSession: true, ...(flow.startState ? { startState: flow.startState } : {}) } } : {}),
+    ...(flow.requiresSession
+      ? { entry: { requiresSession: true, ...(flow.startState ? { startState: flow.startState } : {}), ...(flow.session ? { session: flow.session } : {}) } }
+      : {}),
     events: flow.steps.map((s, i) => ({ ...s, seq: i, ts: i })),
   };
 }
@@ -84,6 +86,7 @@ export async function saveFlow(recording: RawRecording, result: ReplayResult, op
     recording: recording.hash,
     startUrl: recording.startUrl,
     requiresSession: Boolean(recording.entry?.requiresSession),
+    ...(recording.entry?.session ? { session: recording.entry.session } : {}),
     ...(result.sigSequence[0] ? { startState: recording.entry?.startState ?? result.sigSequence[0] } : {}),
     ...(result.sigSequence.length ? { endState: result.sigSequence.at(-1)! } : {}),
     steps,
@@ -97,6 +100,7 @@ export async function saveFlow(recording: RawRecording, result: ReplayResult, op
   const unset: Record<string, ''> = {};
   if (!embedding) unset.embedding = '';
   if (!why) unset.destructiveBecause = '';
+  if (!recording.entry?.session) unset.session = '';
   await flows.updateOne(
     { app, slug },
     { $set: flow, $setOnInsert: { createdAt: now }, ...(Object.keys(unset).length ? { $unset: unset } : {}) },

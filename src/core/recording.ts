@@ -160,6 +160,12 @@ export interface RecordingEntry {
    * segment once fixes every recording built on top of it.
    */
   prelude?: string[];
+  /**
+   * The saved session to restore, by id — set when the Chrome extension
+   * captured the signed-in tab it recorded from. Unlike --arm-manually
+   * sessions it is tied to no typed credentials, so it is named explicitly.
+   */
+  session?: string;
 }
 
 export interface RawRecording {

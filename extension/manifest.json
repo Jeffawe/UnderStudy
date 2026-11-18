@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Understudy recorder",
+  "version": "0.2.0",
+  "description": "Record a flow in the tab you already have open, for Understudy to replay as a test.",
+  "action": { "default_popup": "popup.html", "default_title": "Understudy recorder" },
+  "background": { "service_worker": "background.js" },
+  "permissions": ["scripting", "storage", "cookies", "webNavigation"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"]
+}

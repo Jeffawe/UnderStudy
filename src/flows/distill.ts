@@ -117,6 +117,7 @@ function segmentFrom(parent: Flow, s: Distilled['segments'][number]): Omit<Flow,
     // Only the very first segment can use the parent's saved session; a later
     // one starts mid-flow and needs the flows before it in the same plan.
     requiresSession: start === 0 && parent.requiresSession,
+    ...(start === 0 && parent.session ? { session: parent.session } : {}),
     ...(startState ? { startState } : {}), ...(endState ? { endState } : {}),
     steps, searchText: searchTextOf(s.title, s.intent, s.outcome),
   };

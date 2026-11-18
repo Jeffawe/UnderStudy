@@ -149,12 +149,14 @@ failed — usually its trigger is too broad, or its cause is gone.
 Check with `understudy_recall` first — it's free. If it's a gap, reach the goal
 however works, then capture it so it isn't done twice:
 
-- Something the user can click through: `understudy record <app>` (opens a
-  browser; `--arm-manually` skips recording the login), then
+- Something the user can click through: `understudy record <app> --extension`
+  records in their own Chrome, on the tab they're on (signed in or not — see
+  `extension/README.md`). Plain `understudy record <app>` opens a fresh
+  browser instead (`--arm-manually` skips recording the login). Then
   `understudy save <hash> "<name>"`, which replays it to prove it before
   storing.
-- **Anything with a file upload: never `record`.** The live recorder can't
-  capture the file. Write a Playwright script, then `understudy import <app>
+- **Anything with a file upload: never `record`.** Neither recorder can say
+  which file was picked. Write a Playwright script, then `understudy import <app>
   <file>`. Read the import warnings: a dropped step is not a clean import.
 - **Anything irreversible** (a real order, a submission): don't save it as a
   flow — saving replays it, and so does every run. Stop before that step

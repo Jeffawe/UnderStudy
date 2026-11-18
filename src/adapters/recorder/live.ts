@@ -29,36 +29,14 @@ import { computeSig, parseAria } from '../../core/sig.js';
 import type { StorageState } from '../../core/auth-cache.js';
 import {
   buildRecording,
-  redactValue,
   type RawEvent,
   type RawRecording,
-  type RecordedAction,
   type RecordingEntry,
-  type Resolution,
 } from '../../core/recording.js';
 import { INJECTED_LISTENER, STAMP_ATTR } from './injected.js';
 import { ACCNAME_BUNDLE } from './accname-bundle.js';
+import { toRawEvent, type WireEvent } from './wire.js';
 
-/** What the in-page script sends us. */
-interface WireEvent {
-  seq: number;
-  action: RecordedAction;
-  stamp: number;
-  url: string;
-  hintRole: string;
-  hintName: string;
-  /** Which path produced hintRole/hintName in the page. */
-  resolvedBy?: 'accname' | 'heuristic';
-  css?: string;
-  testId?: string;
-  testIdAttr?: string;
-  inputType?: string;
-  frameHint?: string;
-  value?: string;
-  label?: string;
-  /** Files on a file input. The page can count them; it cannot name them. */
-  fileCount?: number;
-}
 
 export interface LiveRecordOptions {
   appSlug: string;
@@ -290,65 +268,27 @@ export async function recordLive(opts: LiveRecordOptions): Promise<RawRecording>
     // stamping elements throughout, so arming costs nothing and cannot half-work.
     if (!armed) return;
 
-    // The page now computes role and name with a spec-compliant accname
+    // The page computes role and name with a spec-compliant accname
     // implementation, synchronously, while the element still exists. That is
     // authoritative — Playwright's own answer is only consulted when the page
     // had to fall back to its heuristic.
-    const inPageIsAuthoritative = wire.resolvedBy === 'accname';
-    const resolved = inPageIsAuthoritative
-      ? undefined
-      : await resolveStamped(page, wire.stamp);
+    const resolved = wire.resolvedBy === 'accname' ? undefined : await resolveStamped(page, wire.stamp);
 
-    const role = inPageIsAuthoritative ? wire.hintRole : resolved?.role ?? wire.hintRole;
-    const name = inPageIsAuthoritative ? wire.hintName : resolved?.name ?? wire.hintName;
-    const resolution: Resolution =
-      inPageIsAuthoritative || resolved ? 'accname' : 'unresolved';
-
-    // Detection looks at every addressing hint, but the REF SLUG comes from the
-    // name alone — joining all three produced `SECRET.password_password_password`
-    // from a field named "Password" with id "#password".
-    const fieldHint = name || wire.testId || wire.css || 'field';
-    const secretSignal = [name, wire.css, wire.testId].filter(Boolean).join(' ');
-    // A press event's value is a KEY NAME ('Enter'), not something the user
-    // typed — redacting it turns pressing Enter in a password field into
-    // `valueRef: SECRET.password`, and replay then tries to press a key called
-    // by the password itself. Only typed input can be a credential.
-    // AN UPLOAD'S VALUE IS A PATH, NOT A CREDENTIAL, so it must never reach
-    // redactValue — a file input labelled "Upload your ID photo" trips
-    // SECRET_HINTS on the word 'id' and would be stored as a valueRef, leaving
-    // replay hunting for a password that was never a password.
+    // AN UPLOAD'S VALUE IS A PATH, read from the live input and stashed as a
+    // fixture. Nothing resolvable: drop the step — recording an upload we
+    // cannot point at is exactly the silent corruption this exists to end.
     let uploaded: string | undefined;
     if (wire.action === 'upload') {
       const paths = await uploadedPaths(page, wire.stamp);
-      // Nothing resolvable: drop the step. Recording an upload we cannot point
-      // at is exactly the silent-corruption failure this branch exists to end.
       if (!paths.length) return;
       uploaded = (await Promise.all(paths.map(stashFixture))).join('\n');
     }
 
-    const valued =
-      uploaded !== undefined
-        ? { value: uploaded }
-        : wire.value !== undefined
-          ? wire.action === 'press'
-            ? { value: wire.value }
-            : redactValue(fieldHint, wire.value, wire.inputType, secretSignal)
-          : {};
-
-    events.push({
-      seq: events.length,
-      ts: Date.now() - startedAt,
-      action: wire.action,
-      ...(role ? { role } : {}),
-      ...(name ? { name } : {}),
-      ...valued,
-      ...(wire.css ? { css: wire.css } : {}),
-      ...(wire.testId ? { testId: wire.testId } : {}),
-      ...(wire.testIdAttr ? { testIdAttr: wire.testIdAttr } : {}),
-      ...(wire.frameHint ? { frameHint: wire.frameHint } : {}),
-      url: wire.url,
-      resolution,
+    const event = toRawEvent(wire, Date.now() - startedAt, {
+      ...(resolved ? { resolved } : {}),
+      ...(uploaded !== undefined ? { value: uploaded } : {}),
     });
+    events.push({ ...event, seq: events.length });
   });
 
   // Order matters: the accname bundle must exist before the listener runs, or

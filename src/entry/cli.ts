@@ -12,6 +12,7 @@
 
 import { recordLive } from '../adapters/recorder/live.js';
 import { parseScript } from '../adapters/recorder/script.js';
+import { startExtensionRecorder, DEFAULT_PORT } from '../adapters/recorder/extension.js';
 import { listRecordings, loadRecording, saveRecording } from '../core/recording-store.js';
 import { loadSession, saveSession } from '../core/auth-cache.js';
 import { buildRecording, type RawRecording } from '../core/recording.js';
@@ -34,7 +35,7 @@ USAGE
 COMMANDS
   doctor                check the MongoDB connection, vector search and embedder
   reembed               rebuild every vector with the model in .env
-  record <app>          capture a flow in a headed browser
+  record <app>          capture a flow: in a new browser, or --extension in yours
   import <app> <file>   read an existing Playwright script into a recording
   recordings [app]      list captured recordings
   save <hash> "<name>"  prove a recording by replaying it, then save it as a flow
@@ -51,6 +52,9 @@ COMMANDS
   MCP server for agents: understudy-mcp (see REASONER.md). Coming back: emit.
 
 RECORD
+  --extension           record in your own Chrome with the Understudy extension
+                        (load extension/ unpacked once — see extension/README.md)
+  --port <n>            port the extension talks to (default 7397)
   --url <baseUrl>       required the first time you use an app; remembered after
   --max-minutes <n>     stop recording after n minutes (default 30)
   --arm-manually        drive to the starting point yourself, unrecorded, then
@@ -236,6 +240,7 @@ function printEvents(recording: RawRecording) {
 
 async function cmdRecord(positional: string[], flags: Flags) {
   const slug = positional[0] ?? fail('record needs an app name', 'understudy record myapp --url https://…');
+  if (flags.has('extension')) return cmdRecordExtension(slug, flags);
   const baseUrl = await resolveBaseUrl(slug, str(flags.get('url')));
   const values = valuesFromFlags(flags);
   const armManually = flags.has('arm-manually');
@@ -292,6 +297,42 @@ async function cmdRecord(positional: string[], flags: Flags) {
   }
   console.log(`\nhash  ${recording.hash}${existed ? '  (identical recording already existed)' : ''}`);
   console.log(`saved ${path}`);
+}
+
+/**
+ * Record in the Chrome you already have open: this waits for the Understudy
+ * extension, which records the tab you start it on (see extension/README.md).
+ */
+async function cmdRecordExtension(slug: string, flags: Flags) {
+  const port = Number(str(flags.get('port')) ?? DEFAULT_PORT);
+  const rec = await startExtensionRecorder({ appSlug: slug, port }).catch((e: Error) =>
+    fail(`couldn't listen on port ${port}: ${e.message}`, 'another recording may be waiting — or pass --port and set the same port in the extension'),
+  );
+  console.log(`waiting for the Understudy extension (${rec.url})`);
+  console.log(`  in Chrome: go to where the flow starts, click the Understudy icon, then "Record from this page".`);
+  console.log(`  stop from the extension when you're done (or press Ctrl+C here to stop and keep what was recorded).\n`);
+
+  const onSigint = () => rec.stop();
+  process.once('SIGINT', onSigint);
+  const out = await rec.done;
+  process.off('SIGINT', onSigint);
+
+  if (!out.started || !out.recording.events.some((e) => e.action !== 'goto')) {
+    console.error('nothing was recorded — no actions beyond opening the page. Not saved.');
+    process.exitCode = 2;
+    return;
+  }
+  const { path, existed } = await saveRecording(out.recording);
+  console.log(`captured ${out.recording.events.length} events`);
+  printEvents(out.recording);
+  if (out.droppedUploads) {
+    console.log(`\n${out.droppedUploads} file upload(s) NOT recorded — a page can't say which file was chosen.`);
+    console.log('  write that part as a Playwright script and `understudy import` it instead.');
+  }
+  if (out.sessionPath) console.log(`\nsigned-in session saved ${out.sessionPath}\n  replay restores it, so this recording starts signed in.`);
+  console.log(`\nhash  ${out.recording.hash}${existed ? '  (identical recording already existed)' : ''}`);
+  console.log(`saved ${path}`);
+  console.log(`\nnext: understudy save ${out.recording.hash} "<what this flow does>"`);
 }
 
 // --- import ------------------------------------------------------------------

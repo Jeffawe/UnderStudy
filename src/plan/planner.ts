@@ -208,7 +208,9 @@ export async function recordingForPlan(runId: string): Promise<{ run: Run; recor
   const recording: RawRecording = {
     version: 1, source: 'import', origin: `plan:${run.plan.join('+')}`, appSlug: run.app,
     startUrl: first.startUrl, createdAt: new Date().toISOString(), hash: `plan-${runId}`,
-    ...(first.requiresSession ? { entry: { requiresSession: true, ...(first.startState ? { startState: first.startState } : {}) } } : {}),
+    ...(first.requiresSession
+      ? { entry: { requiresSession: true, ...(first.startState ? { startState: first.startState } : {}), ...(first.session ? { session: first.session } : {}) } }
+      : {}),
     events: steps.map((s, seq) => ({ ...s, seq, ts: seq })),
   };
   return { run, recording, steps };
