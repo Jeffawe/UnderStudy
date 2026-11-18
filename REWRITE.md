@@ -254,7 +254,7 @@ what it replaces.
 | **1. Store** | `src/store/`: types for the six collections, connect from `MONGODB_URI`, create indexes on first run. Delete Cockroach + Bedrock + ONNX code. | `understudy doctor` reports a healthy connection on both URIs. **Done 2026-11-18** — see *Phase 1 notes*. |
 | **2. Record & replay, no AI** | Player, `save`, `replay`, `flows`. Live recorder + script import ported. | Record login on a test app, replay it, see drift and findings. No key, no agent. **Done 2026-11-18** — see *Phase 2 notes*. |
 | **3. Run by goal, no AI** | Recall on Voyage (name match without a key), `run` picks one flow, safety gate, run documents. | `understudy run myapp "log in"` binds and runs the login flow. **Done 2026-11-18** — see *Phase 3 notes*. |
-| **4. Agent layer** | The seven MCP tools: distill/segments, decompose, three-rung seams, remember, findings. Lessons applied during replay (moved here from phase 3, so lessons are written and read in the same phase), and the 3 remaining destructive signals that need notes. Rewrite `REASONER.md` to match. | A goal spanning two recordings binds two segments and runs. |
+| **4. Agent layer** | The seven MCP tools: distill/segments, decompose, three-rung seams, remember, findings. Lessons applied during replay (moved here from phase 3, so lessons are written and read in the same phase), and the 3 remaining destructive signals that need notes. Rewrite `REASONER.md` to match. | A goal spanning two recordings binds two segments and runs. **Done 2026-11-18** — see *Phase 4 notes*. |
 | **5. Extension** | Chrome extension + localhost WebSocket. | Record a flow in your normal Chrome, replay it headless. |
 | **6. Clean up** | Copy the corpus across (one-off script). Rewrite README, write ARCHITECTURE.md, delete BUILDING/PLAN/STATUS/STATUS-HISTORY. | Fresh clone → working in under five minutes. |
 | **7. Hosted (later)** | Memory-only server: anyone points it at their own Mongo URI. No browsers. | Not scheduled. |
@@ -355,6 +355,57 @@ what it replaces.
 - **`replay.ts` not split:** `run` just calls it, so there was no shared piece
   to extract. Still a candidate for simplifying, not a blocker.
 - **Drift history is per flow**, whether it was started by `replay` or `run`.
+
+## Phase 4 notes (2026-11-18)
+
+- **Decision: the agent is only asked questions while planning, before any
+  browser opens** — `decompose` and `seam`. Once a plan is complete it runs to
+  the end; an unexpected page or a 500 becomes a finding, not a question. The
+  old version paused *inside* a live browser across tool calls, which needed
+  `session.ts`, run budgets and the record-it-yourself handoff. Now a waiting
+  run holds nothing open: its progress is the `planning` field on its run
+  document, and `answer()` picks it up — across a server restart if need be.
+  Dropped with it: the `unexpected_page`, `visual_diff` and `needs_capture`
+  questions.
+- **MCP server back** (`src/entry/mcp.ts`, `understudy-mcp`, registered in
+  `.mcp.json`): `recall`, `run`, `answer`, `distill`, `save_distilled`,
+  `remember`, `findings`. All seven tool definitions together cost ~1.4k
+  tokens per session (a test keeps them under 9k chars).
+- **Planner** (`src/plan/planner.ts`): decompose → bind each sub-goal (only a
+  *known* recall binds) → safety (destructive flows, and facts that mark a
+  control destructive) → the first flow must start from a cold browser or a
+  saved session → seams → planned. Then one recording for the whole plan,
+  run with lessons. `run --sub-goal …` in the CLI uses it too, and
+  `understudy answer <runId> '<json>'` answers its questions without an agent.
+- **Seams** (`src/plan/seams.ts`): no bridge needed → the page map → a plain
+  URL → ask. A one-click answer is saved to the page map, so the next plan
+  bridges that seam without asking.
+- **Distill works on a saved flow**, not a recording, so it never replays —
+  the old version cost a login per distill. Preconditions must now be exactly
+  `authenticated` / `not authenticated` (the validator enforces what
+  REASONER.md only warned about). Reusing a segment slug replaces it.
+- **Notes** (`src/memory/notes.ts`): `remember` takes facts, lessons,
+  findings and `reached` (goals an agent reached by other means, stored as
+  `attributed`) in one validated batch. Lessons fire during every saved-flow
+  replay and planned run; proving a new recording runs without them.
+  `timesHelped` only counts a firing on a step whose fingerprint has failed
+  before, so run steps now record their fingerprint.
+- **`REASONER.md` rewritten** for `main`: 5,646 → 1,484 words (~7.5k → ~2k
+  tokens per session). `AGENTS.md` rewritten to match.
+- **Tests:** 32, ~36s. `test/agent.test.ts` plays the agent end to end: two
+  recordings → distilled into segments (one merged by slug) → a goal planned
+  from segments of both, decompose and seams included → run in one browser.
+  `test/mcp.test.ts` talks to the real server over stdio.
+
+## After the rewrite
+
+- **Learn the "known" cutoff instead of hand-setting it.** The `MEANING`
+  constants were set by hand from one calibration run. Instead, learn them
+  from data the app already has: every flow gives known goals (its title,
+  intent, and the goals `run` was asked for that bound to it and passed), and
+  unknown goals come from `run` calls that ended *unknown* and were later
+  recorded as new flows. Re-fit when the corpus changes or the embedding
+  model does. Decided 2026-11-18: after the rewrite, not during.
 
 ## Decisions (2026-11-18)
 

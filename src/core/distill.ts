@@ -1,31 +1,20 @@
 /**
- * Distillation — the pause-and-ask handshake, and what comes back.
+ * Distillation — an agent annotates a saved flow and splits it into segments.
  *
- * Deterministic code cannot call into a Claude Code session, so it never calls:
- * it pauses and returns. Distillation has NO live state (no open browser), so
- * the pause is a clean stateless split across two calls, resumable across a
- * process restart:
+ * Optional. A flow is stored and runnable without it; distilling adds what a
+ * person would say the flow is FOR (intent, preconditions, outcome), cuts it
+ * into reusable segments (e.g. "log in as a member" out of a checkout
+ * recording, so other goals can reuse it), and may suggest lessons.
  *
- *     promote(hash)        → needs_distillation + request payload
- *        ← the agent (or Bedrock) distills →
- *     save(hash, json)     → validate → ingest → done
- *
- * THE MODEL ANNOTATES; IT DOES NOT AUTHOR STEPS.
- *
- * The steps are already captured by the recorder and PROVEN by replay. Asking a
- * model to re-emit them would let it silently rewrite a verified selector or
- * invent an action that never happened, and nothing downstream could tell. So
- * the request hands over numbered, verified steps and the response may only
- * reference them BY INDEX. A distillation can partition and name; it cannot
- * fabricate. `DistilledSegment.stepRange` was always this shape — "segments are
- * boundaries, not copies".
- *
+ * THE AGENT ANNOTATES; IT DOES NOT AUTHOR STEPS. The steps were captured by
+ * the recorder and proven by replay; the request numbers them and the answer
+ * may only refer to them BY INDEX. It can partition and name, never fabricate.
  * That constraint is what makes it safe to let an agent do this at all.
+ *
+ * This file is the contract: the request, the answer's schema, and the
+ * validator. src/flows/distill.ts builds requests from MongoDB and saves answers.
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
 import { triggerProblems } from './trigger.js';
 import type { RawRecording } from './recording.js';
 import type { ReplayResult } from './replay.js';
@@ -48,9 +37,6 @@ export interface Vocabulary {
   /** What is known to be true about the app, phrased as the corpus phrases it. */
   facts: string[];
 }
-
-export const DISTILLED_DIR =
-  process.env.UNDERSTUDY_DISTILLED_DIR ?? resolve('.understudy/distilled');
 
 /** One verified step, as handed to the distiller. */
 export interface DistillStep {
@@ -107,7 +93,7 @@ const SCHEMA: Record<string, unknown> = {
   required: ['intent', 'preconditions', 'outcome', 'segments'],
   properties: {
     intent: { type: 'string', description: 'What this whole flow is FOR, in the user\'s language. Not a list of steps.' },
-    preconditions: { type: 'array', items: { type: 'string' }, description: 'What must already be true, e.g. "authenticated as a standard user".' },
+    preconditions: { type: 'array', items: { type: 'string', enum: ['authenticated', 'not authenticated'] }, description: 'Exactly "authenticated" or "not authenticated" — nothing else. Empty if neither matters.' },
     outcome: { type: 'string', description: 'The state the app is in afterwards.' },
     segments: {
       type: 'array',
@@ -120,7 +106,7 @@ const SCHEMA: Record<string, unknown> = {
           title: { type: 'string' },
           intent: { type: 'string', description: 'What this segment achieves, phrased as a goal someone would ask for.' },
           stepRange: { type: 'array', items: { type: 'integer' }, minItems: 2, maxItems: 2, description: '[start, end) indices into the steps given. Never invent steps.' },
-          preconditions: { type: 'array', items: { type: 'string' } },
+          preconditions: { type: 'array', items: { type: 'string', enum: ['authenticated', 'not authenticated'] } },
           outcome: { type: 'string' },
         },
       },
@@ -156,8 +142,9 @@ What matters most:
   · segments — a segment belongs to the APP, not to this recording. A login
     block cut out of a checkout recording must be reusable by every future
     flow, so name and scope it accordingly.
-  · preconditions — what must already be true. This is what lets a planner
-    reject a segment that cannot run from where it currently is.
+  · preconditions — EXACTLY "authenticated" or "not authenticated", or empty.
+    Not "authenticated as a member": the planner checks whole strings, so any
+    other wording silently never matches.
 
 USE THE APP'S EXISTING VOCABULARY.
 The request includes every segment this app already has. If a block of steps
@@ -233,8 +220,14 @@ export function validateDistilled(input: unknown, stepCount: number): Validation
 
   if (typeof d.intent !== 'string' || !d.intent.trim()) push('intent is required and must be a non-empty string');
   if (typeof d.outcome !== 'string' || !d.outcome.trim()) push('outcome is required and must be a non-empty string');
-  if (!Array.isArray(d.preconditions)) push('preconditions must be an array of strings');
-  else if (d.preconditions.some((p) => typeof p !== 'string')) push('preconditions must contain only strings');
+  const preconditionProblem = (at: string, v: unknown) => {
+    if (v === undefined) return;
+    if (!Array.isArray(v) || v.some((p) => p !== 'authenticated' && p !== 'not authenticated')) {
+      push(`${at} must be an array of exactly "authenticated" or "not authenticated" (got ${JSON.stringify(v)})`);
+    }
+  };
+  if (!Array.isArray(d.preconditions)) push('preconditions must be an array');
+  else preconditionProblem('preconditions', d.preconditions);
 
   if (!Array.isArray(d.segments)) {
     push('segments must be an array');
@@ -258,6 +251,7 @@ export function validateDistilled(input: unknown, stepCount: number): Validation
     // The index arithmetic is the part that actually keeps a distillation
     // honest: a range outside the verified steps would let the model reference
     // something that was never recorded or never replayed.
+    preconditionProblem(`${at}.preconditions`, s.preconditions);
     const range = s.stepRange;
     if (!Array.isArray(range) || range.length !== 2 || !range.every((n) => Number.isInteger(n))) {
       push(`${at}.stepRange must be [start, end) integers`);
@@ -283,23 +277,4 @@ export function validateDistilled(input: unknown, stepCount: number): Validation
   }
 
   return errors.length ? { ok: false, errors } : { ok: true, errors: [], value: d as unknown as Distilled };
-}
-
-// ---- cache -----------------------------------------------------------------
-// Keyed by recording hash, so a recording distilled once is never distilled
-// again. BUILDING.md's day-one guard: distillation is the expensive call.
-
-export const distilledPath = (hash: string): string => join(DISTILLED_DIR, `${hash}.json`);
-
-export async function saveDistilled(hash: string, distilled: Distilled): Promise<string> {
-  await mkdir(DISTILLED_DIR, { recursive: true });
-  const path = distilledPath(hash);
-  await writeFile(path, JSON.stringify(distilled, null, 2), 'utf8');
-  return path;
-}
-
-export async function loadDistilled(hash: string): Promise<Distilled | undefined> {
-  const path = distilledPath(hash);
-  if (!existsSync(path)) return undefined;
-  return JSON.parse(await readFile(path, 'utf8')) as Distilled;
 }

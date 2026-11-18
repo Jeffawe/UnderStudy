@@ -1,6 +1,6 @@
 /**
  * A tiny shop to test against, served locally so tests never depend on a
- * public site. Log in → shop → cart. Switches let a test change the app
+ * public site. Log in → shop → cart, or shop → profile. Switches let a test change the app
  * between runs, the way a real app changes between deploys:
  *
  *   promo   the Cart link goes through a new /promo page first  (→ drift)
@@ -40,7 +40,10 @@ export async function startFixtureApp(): Promise<FixtureApp> {
     if (path === '/shop') {
       return html(page('Shop', `
         <h1>Shop</h1>
-        <nav><a href="${promo ? '/promo' : '/cart'}">Cart</a></nav>`));
+        <nav><a href="${promo ? '/promo' : '/cart'}">Cart</a> <a href="/profile">Profile</a></nav>`));
+    }
+    if (path === '/profile') {
+      return html(page('Shop — profile', `<h1>Your profile</h1><p>demo</p>`));
     }
     if (path === '/promo') {
       return html(page('Shop — offer', `<h1>Special offer</h1><a href="/cart">Continue to cart</a>`));

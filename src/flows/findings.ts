@@ -122,3 +122,31 @@ export async function saveFindings(coll: Collection<Finding>, app: string, draft
     })),
   );
 }
+
+export type Verdict = 'issue' | 'lesson' | 'noise';
+
+/**
+ * Route open findings. issue: the app is wrong and someone should fix it.
+ * lesson: accepted — the agent works around it (pass the lesson to store).
+ * noise: not a problem (third-party telemetry, framework warnings).
+ * Returns what couldn't be routed instead of throwing, so one bad item
+ * doesn't lose the rest.
+ */
+export async function triage(
+  coll: Collection<Finding>,
+  app: string,
+  items: { fingerprint: string; verdict: Verdict }[],
+): Promise<{ routed: number; problems: string[] }> {
+  const problems: string[] = [];
+  let routed = 0;
+  for (const [i, item] of items.entries()) {
+    if (!['issue', 'lesson', 'noise'].includes(item?.verdict)) {
+      problems.push(`triage[${i}].verdict must be issue, lesson or noise`);
+      continue;
+    }
+    const { matchedCount } = await coll.updateOne({ app, fingerprint: item.fingerprint }, { $set: { status: item.verdict } });
+    if (matchedCount) routed++;
+    else problems.push(`triage[${i}]: no finding with fingerprint ${item.fingerprint}`);
+  }
+  return { routed, problems };
+}

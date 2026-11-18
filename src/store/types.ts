@@ -41,8 +41,8 @@ export interface Flow {
   intent: string;
   /** A recording is captured whole; a segment is cut from one so others can reuse it. */
   kind: 'recording' | 'segment';
-  /** Segments only: which recording, and which steps (inclusive). */
-  from?: { recording: string; steps: [number, number] };
+  /** Segments only: the flow it was cut from, and which of its steps ([start, end)). */
+  from?: { flow: string; steps: [number, number] };
   preconditions: Precondition[];
   outcome: string;
   /** True if running it commits something real (a purchase, a submission). */
@@ -81,9 +81,13 @@ export interface Page {
   lastSeen: Date;
 }
 
-/** When a lesson fires: every present field must match the step exactly. */
+/**
+ * When a lesson fires: every field present must equal the step's exactly, and
+ * an absent field matches anything. Never empty — that would match every step.
+ */
 export interface Trigger {
-  url?: string;
+  /** The page the step is on, as a URL pattern like `/login` or `/orders/:id`. */
+  url_pattern?: string;
   action?: string;
   role?: string;
   name?: string;
@@ -95,8 +99,14 @@ export interface Note {
   /** fact: changes what you plan. lesson: has a trigger and changes one step. */
   kind: 'fact' | 'lesson';
   text: string;
-  /** Lessons only. Never empty — an empty trigger would match every step. */
+  /** Lessons only: a short name, unique per app (re-adding one doesn't duplicate it). */
+  title?: string;
+  /** Lessons only: what kind of fix — `wait`/`timing` make replay settle the page first. */
+  lessonKind?: string;
+  /** Lessons only. */
   trigger?: Trigger;
+  /** Facts only: a control whose click commits something real — flows clicking it are destructive. */
+  marksDestructive?: string;
   timesApplied: number;
   /** Fired on a step whose fingerprint has failed before, and the step passed. */
   timesHelped: number;
@@ -142,11 +152,16 @@ export interface Run {
    * attributed: an agent reached the goal by other means and reported it.
    */
   mode: 'run' | 'replay' | 'attributed';
-  status: 'running' | 'waiting' | 'passed' | 'failed' | 'blocked';
+  /**
+   * waiting: planning paused on a question for the agent (`question` says what).
+   * planned: a dry run — the plan is complete, nothing ran.
+   * blocked: the plan can't be completed (a sub-goal with no flow, a gap between flows).
+   */
+  status: 'waiting' | 'planned' | 'passed' | 'failed' | 'blocked';
   /** The flow slugs bound, in order. */
   plan: string[];
-  /** One line per step: what it did and where it ended up. */
-  steps: { seq: number; action: string; ok: boolean; sig?: string; error?: string }[];
+  /** One line per step: what it did and where it ended up. `fingerprint` identifies the step across runs. */
+  steps: { seq: number; action: string; ok: boolean; sig?: string; error?: string; fingerprint?: string }[];
   /** The page fingerprints actually passed through — compared across runs for drift. */
   sigSequence: string[];
   /** Console errors, failed requests, non-2xx responses (first 200). */
@@ -156,6 +171,18 @@ export interface Run {
   durationMs: number;
   /** Set while status is 'waiting': the question the agent must answer. */
   question?: Record<string, unknown>;
+  /** Why the run is blocked, in one line. */
+  blockedBecause?: string;
+  /** Planning progress, so a run can pause for a question and pick up where it left off. */
+  planning?: {
+    subGoals?: string[];
+    /** Flow slug bound to each sub-goal, in order. */
+    bound?: string[];
+    /** Steps to insert BEFORE plan[i], for i ≥ 1. Missing entry = not resolved yet. */
+    seams?: Record<string, { steps: Step[]; how: string }>;
+    dryRun?: boolean;
+    allowPurchases?: boolean;
+  };
   startedAt: Date;
   endedAt?: Date;
 }

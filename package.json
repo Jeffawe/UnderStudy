@@ -8,7 +8,8 @@
     "node": ">=22"
   },
   "bin": {
-    "understudy": "./dist/entry/cli.js"
+    "understudy": "./dist/entry/cli.js",
+    "understudy-mcp": "./dist/entry/mcp.js"
   },
   "files": [
     "dist"
@@ -19,16 +20,19 @@
     "understudy": "tsx src/entry/cli.ts",
     "vendor:accname": "node scripts/vendor-accname.mjs",
     "hair-loss:book": "tsx .understudy/explorations/hair-loss-book.ts",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "mcp": "tsx src/entry/mcp.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "dom-accessibility-api": "^0.7.1",
     "dotenv": "^17.2.3",
     "mongodb": "^7.9.0",
     "pixelmatch": "^7.2.0",
     "playwright": "^1.62.1",
     "pngjs": "^7.0.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^22.18.9",

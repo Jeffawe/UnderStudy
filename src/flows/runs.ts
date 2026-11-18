@@ -15,6 +15,7 @@ import type { Run, Step } from '../store/types.js';
 import { collections } from '../store/db.js';
 import { compareToHistory, driftFinding, type Drift } from './drift.js';
 import { extractFindings, saveFindings, type FindingDraft } from './findings.js';
+import { stepFingerprint } from '../core/fingerprint.js';
 
 /** `/inventory.html#bf3dd322` → `/inventory.html` */
 const pageOf = (sig: string) => sig.slice(0, sig.lastIndexOf('#')) || sig;
@@ -38,16 +39,21 @@ export async function recordRun(opts: {
   mode?: 'replay' | 'run';
   /** What was asked for. Defaults to the flow's slug. */
   goal?: string;
+  /** The flows run, in order, when it was more than one. Defaults to [flow]. */
+  plan?: string[];
+  /** Fill in this existing run (one that was planned first) instead of adding a new one. */
+  runId?: ObjectId;
   startedAt?: Date;
 }): Promise<RecordedRun> {
   const { app, flow, result, steps } = opts;
+  const plan = opts.plan ?? [flow];
   const c = await collections();
   const now = new Date();
 
   // 1. Drift, against the most recent passed runs of this flow — however it
   // was started, it walked the same steps.
   const history = await c.runs
-    .find({ app, plan: [flow], mode: { $in: ['replay', 'run'] }, status: 'passed' }, { projection: { sigSequence: 1 } })
+    .find({ app, plan, mode: { $in: ['replay', 'run'] }, status: 'passed', ...(opts.runId ? { _id: { $ne: opts.runId } } : {}) }, { projection: { sigSequence: 1 } })
     .sort({ startedAt: -1 })
     .limit(LOOKBACK)
     .toArray();
@@ -58,8 +64,9 @@ export async function recordRun(opts: {
     : compareToHistory([], []);
 
   // 2. Findings.
-  const drafts = extractFindings(result, flow);
-  const fromDrift = driftFinding(flow, drift);
+  const name = plan.join(' + ');
+  const drafts = extractFindings(result, name);
+  const fromDrift = driftFinding(name, drift);
   if (fromDrift) drafts.push(fromDrift);
   await saveFindings(c.findings, app, drafts, now);
 
@@ -88,12 +95,17 @@ export async function recordRun(opts: {
     goal: opts.goal ?? flow,
     mode: opts.mode ?? 'replay',
     status: result.ok ? 'passed' : 'failed',
-    plan: [flow],
-    steps: result.steps.map((s) => ({
-      seq: s.seq, action: s.action, ok: s.ok,
-      ...(s.sig ? { sig: s.sig } : {}),
-      ...(s.error ? { error: s.error } : {}),
-    })),
+    plan,
+    steps: result.steps.map((s) => {
+      const step = steps[s.seq];
+      return {
+        seq: s.seq, action: s.action, ok: s.ok,
+        ...(s.sig ? { sig: s.sig } : {}),
+        ...(s.error ? { error: s.error } : {}),
+        // Identifies "this kind of step" across runs — how a lesson knows a step like it has failed before.
+        ...(step ? { fingerprint: stepFingerprint({ ...step, seq: s.seq, ts: 0 }) } : {}),
+      };
+    }),
     sigSequence: result.sigSequence,
     events: result.signals.slice(0, 200).map((s) => ({ ...s })),
     findings: drafts.map((d) => d.fingerprint),
@@ -101,6 +113,11 @@ export async function recordRun(opts: {
     startedAt: opts.startedAt ?? new Date(now.getTime() - result.durationMs),
     endedAt: now,
   };
+  if (opts.runId) {
+    // A planned run: keep its question history and planning, add what happened.
+    await c.runs.updateOne({ _id: opts.runId }, { $set: run, $unset: { question: '' } });
+    return { runId: opts.runId, drift, findings: drafts };
+  }
   const { insertedId } = await c.runs.insertOne(run);
   return { runId: insertedId, drift, findings: drafts };
 }

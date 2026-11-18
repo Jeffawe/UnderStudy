@@ -1,9 +1,9 @@
 # Understudy
 
-> **Being rewritten on MongoDB (November 2026).** `main` is mid-rewrite: today
-> it records, imports and replays flows, and `understudy doctor` checks a
-> MongoDB connection. Memory, planning and the MCP tools come back in the next
-> phases — see [REWRITE.md](REWRITE.md). The previous CockroachDB version,
+> **Being rewritten on MongoDB (November 2026).** `main` records, saves and
+> replays flows, runs goals by meaning, and serves the MCP tools on MongoDB;
+> the docs below are rewritten last — see [REWRITE.md](REWRITE.md) and
+> [REASONER.md](REASONER.md), which are current. The previous CockroachDB version,
 > which the rest of this README describes, is on the
 > [`legacy-cockroach`](../../tree/legacy-cockroach) branch.
 

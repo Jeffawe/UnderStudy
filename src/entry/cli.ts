@@ -13,9 +13,14 @@
 import { recordLive } from '../adapters/recorder/live.js';
 import { parseScript } from '../adapters/recorder/script.js';
 import { listRecordings, loadRecording, saveRecording } from '../core/recording-store.js';
-import { loadSession, saveSession, forgetSession, type StorageState } from '../core/auth-cache.js';
+import { loadSession, saveSession } from '../core/auth-cache.js';
 import { buildRecording, type RawRecording } from '../core/recording.js';
-import { replay, type ReplayResult } from '../core/replay.js';
+import type { ReplayResult } from '../core/replay.js';
+import { execute } from '../flows/execute.js';
+import { destructiveControls, remember } from '../memory/notes.js';
+import { start, answer, runPlan, type PlanState } from '../plan/planner.js';
+import { distillRequest, saveDistilled } from '../flows/distill.js';
+import { readFile } from 'node:fs/promises';
 import { saveFlow, recordingFrom } from '../flows/save.js';
 import { recordRun, type RecordedRun } from '../flows/runs.js';
 import { recall, type Recall } from '../memory/recall.js';
@@ -39,8 +44,11 @@ COMMANDS
   findings <app>        what looked broken, most frequent first
   recall <app> "<goal>" what memory knows about a goal — nothing runs
   run <app> "<goal>"    find the flow that does the goal, and run it
+  answer <runId> <json> answer a question a planned run stopped on
+  distill <app> <flow>  print a saved flow's steps for an agent to name and split
+  remember <app> <file> store facts, lessons and findings from a JSON batch
 
-  Coming back in the rewrite: emit, MCP tools (see REWRITE.md).
+  MCP server for agents: understudy-mcp (see REASONER.md). Coming back: emit.
 
 RECORD
   --url <baseUrl>       required the first time you use an app; remembered after
@@ -69,9 +77,13 @@ FINDINGS
   --all                 include findings already triaged
 
 RUN
+  --sub-goal <text>     plan across several flows, in this order (repeatable)
   --flow <slug>         skip matching and run this flow (for an UNSURE match)
   --dry-run             say which flow would run, and run nothing
   plus --value, --headed, --allow-purchases as for replay
+
+DISTILL
+  --save <file>         store the agent's answer (validated first)
 
 RECALL
   --limit <n>           how many flows and notes to show (default 5)
@@ -326,58 +338,27 @@ async function cmdImport(positional: string[], flags: Flags) {
 
 // --- replay ------------------------------------------------------------------
 
-/** The saved session a late-armed recording needs, or a clear failure. */
-async function sessionForRecording(recording: RawRecording, values: Record<string, string>): Promise<StorageState | undefined> {
-  if (!recording.entry?.requiresSession) return undefined;
-  const cached = await loadSession(recording.appSlug, values);
-  if (!cached) {
-    fail(
-      'this recording starts from a signed-in browser, and no saved session matches these credentials',
-      'pass the same --value credentials you recorded with, or re-record with --arm-manually',
-    );
-  }
-  console.log(`session: restored (saved ${cached.savedAt})`);
-  return cached.storageState;
-}
-
 /**
- * Replay a recording, with everything around it: say which values are missing,
- * restore a saved session if it needs one, and drop that session if it turned
- * out to be stale. Shared by `replay` and `save`.
+ * Run a recording with everything around it (saved session, lessons, stale
+ * sessions) via flows/execute.ts, and say what's worth knowing as it goes.
  */
-async function replayWithSession(recording: RawRecording, flags: Flags): Promise<ReplayResult> {
-  if (recording.entry?.prelude?.length) {
-    fail(
-      `this recording starts after other flows (${recording.entry.prelude.join(' -> ')}), and preludes are parked in the rewrite`,
-      'replay it from the legacy-cockroach branch, or re-record it with --arm-manually',
-    );
-  }
-
+async function executeWithReport(recording: RawRecording, flags: Flags, opts: { useLessons: boolean }): Promise<ReplayResult> {
   const values = valuesFromFlags(flags);
-  const needed = recording.events.filter((e) => e.valueRef && !(e.valueRef in values));
+  const needed = [...new Set(recording.events.filter((e) => e.valueRef && !(e.valueRef in values)).map((e) => e.valueRef!))];
   if (needed.length) {
     console.log(`this needs ${needed.length} value(s) that are deliberately not stored:`);
-    for (const e of needed) console.log(`  --value ${e.valueRef}=…`);
+    for (const ref of needed) console.log(`  --value ${ref}=…`);
     console.log('');
   }
-
-  const storageState = await sessionForRecording(recording, values);
-  const result = await replay(recording, {
-    values,
-    ...(storageState ? { storageState } : {}),
-    ...(flags.has('headed') ? { headless: false } : {}),
-  });
-
-  // A restored session that didn't land where it was saved is dead: step 0
-  // carries the arming fingerprint, so replay has already compared it.
-  const entry = result.steps.find((s) => s.seq === 0);
-  if (recording.entry?.requiresSession && entry?.unexpectedPage) {
-    await forgetSession(recording.appSlug, values);
+  const x = await execute(recording, { values, headed: flags.has('headed'), useLessons: opts.useLessons }).catch((e: Error) => fail(e.message));
+  if (x.sessionRestoredFrom) console.log(`session: restored (saved ${x.sessionRestoredFrom})`);
+  if (x.staleSession) {
     console.log('the restored session did not land where it was recorded, and has been discarded.');
-    console.log(`  expected ${entry.unexpectedPage.expected}, saw ${entry.unexpectedPage.observed}`);
+    console.log(`  expected ${x.staleSession.expected}, saw ${x.staleSession.observed}`);
     console.log('  re-record with --arm-manually to refresh it.\n');
   }
-  return result;
+  if (x.lessons?.fired) console.log(`lessons  ${x.lessons.fired} fired, ${x.lessons.helped} on steps that have failed before\n`);
+  return x.result;
 }
 
 /** `replay <hash>` runs a recording file; `replay <app> <flow>` runs a saved flow and records the run. */
@@ -386,7 +367,7 @@ async function cmdReplay(positional: string[], flags: Flags) {
 
   const hash = positional[0] ?? fail('replay needs a recording hash, or an app and a flow', 'understudy recordings · understudy flows <app>');
   const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`, 'understudy recordings'));
-  const result = await replayWithSession(recording, flags);
+  const result = await executeWithReport(recording, flags, { useLessons: false });
   printReplay(result);
   if (!result.ok) process.exitCode = 3;
 }
@@ -405,15 +386,17 @@ async function runSavedFlow(app: string, slug: string, flags: Flags, how: { mode
   if (!flow) fail(`no flow '${slug}' for app '${app}'`, `understudy flows ${app}`);
 
   // The safety gate: a destructive flow does something real every time it runs.
-  if (flow.destructive && !flags.has('allow-purchases')) {
-    fail(
-      `'${slug}' is marked destructive (${flow.destructiveBecause}) — running it may place a real order`,
-      'pass --allow-purchases if that is genuinely fine',
-    );
+  if (!flags.has('allow-purchases')) {
+    if (flow.destructive) {
+      fail(`'${slug}' is marked destructive (${flow.destructiveBecause}) — running it may place a real order`, 'pass --allow-purchases if that is genuinely fine');
+    }
+    const controls = await destructiveControls(app);
+    const hit = flow.steps.find((s) => s.name && ['click', 'press', 'dispatch_click'].includes(s.action) && controls.has(s.name.toLowerCase()));
+    if (hit) fail(`'${slug}' clicks "${hit.name}", which a fact says commits something real: ${controls.get(hit.name!.toLowerCase())}`, 'pass --allow-purchases if that is genuinely fine');
   }
 
   console.log(`running ${app}/${slug} — ${flow.title}\n`);
-  const result = await replayWithSession(recordingFrom(flow), flags);
+  const result = await executeWithReport(recordingFrom(flow), flags, { useLessons: true });
   printReplay(result);
   const run = await recordRun({ app, flow: slug, result, steps: flow.steps, mode: how.mode, ...(how.goal ? { goal: how.goal } : {}) });
   printRunReport(run);
@@ -458,6 +441,17 @@ async function cmdRun(positional: string[], flags: Flags) {
   const picked = str(flags.get('flow'));
   if (picked) return runSavedFlow(app, picked, flags, { mode: 'run', goal });
 
+  // Several sub-goals: plan across flows, bridging the seams between them.
+  const subGoals = all(flags, 'sub-goal');
+  if (subGoals.length) {
+    const state = await start({
+      app, goal, subGoals,
+      ...(flags.has('dry-run') ? { dryRun: true } : {}),
+      ...(flags.has('allow-purchases') ? { allowPurchases: true } : {}),
+    });
+    return reportPlan(state, flags);
+  }
+
   const r = await recall(app, goal);
   printRecall(r);
 
@@ -478,6 +472,74 @@ async function cmdRun(positional: string[], flags: Flags) {
   }
   console.log();
   await runSavedFlow(app, r.best.slug, flags, { mode: 'run', goal });
+}
+
+/** Show where planning got to, and run it if it's complete. */
+async function reportPlan(state: PlanState, flags: Flags) {
+  if (state.status === 'waiting') {
+    console.log(`run ${state.runId} is waiting for an answer:\n`);
+    console.log(JSON.stringify(state.question, null, 1));
+    console.log(`\nanswer it:  understudy answer ${state.runId} '<json>'`);
+    process.exitCode = 5;
+    return;
+  }
+  if (state.status === 'blocked') {
+    console.log(`BLOCKED — ${state.why}`);
+    if (state.detail) console.log(JSON.stringify(state.detail, null, 1));
+    process.exitCode = 4;
+    return;
+  }
+  console.log(`plan     ${state.plan.join('  →  ')}`);
+  for (const s of state.seams) console.log(`seam     before ${s.before}: ${s.how}`);
+  if (state.dryRun) {
+    console.log('\ndry run — nothing ran');
+    return;
+  }
+  console.log();
+  const values = valuesFromFlags(flags);
+  const { executed, recorded } = await runPlan(state.runId, { values, headed: flags.has('headed') }).catch((e: Error) => fail(e.message));
+  if (executed.lessons?.fired) console.log(`lessons  ${executed.lessons.fired} fired, ${executed.lessons.helped} on steps that have failed before\n`);
+  printReplay(executed.result);
+  printRunReport(recorded);
+  if (!executed.result.ok) process.exitCode = 3;
+}
+
+/** Answer a planning question: understudy answer <runId> '{"steps":[…]}' */
+async function cmdAnswer(positional: string[], flags: Flags) {
+  const [runId, json] = positional;
+  if (!runId || !json) fail('answer needs a run id and a JSON answer', `understudy answer <runId> '{"subGoals":["…"]}'`);
+  let reply: unknown;
+  try { reply = JSON.parse(json); } catch { fail('the answer must be JSON'); }
+  await reportPlan(await answer(runId, reply).catch((e: Error) => fail(e.message)), flags);
+}
+
+/**
+ * distill <app> <flow>                   print the request for an agent to answer
+ * distill <app> <flow> --save <file>     store the agent's answer from a JSON file
+ */
+async function cmdDistill(positional: string[], flags: Flags) {
+  const [app, flow] = positional;
+  if (!app || !flow) fail('distill needs an app and a saved flow', 'understudy distill myapp checkout');
+  const file = str(flags.get('save'));
+  if (!file) {
+    console.log(JSON.stringify(await distillRequest(app, flow).catch((e: Error) => fail(e.message)), null, 1));
+    return;
+  }
+  const saved = await saveDistilled(app, flow, JSON.parse(await readFile(file, 'utf8'))).catch((e: Error) => fail(e.message));
+  console.log(`distilled ${app}/${saved.flow}`);
+  for (const s of saved.segments) console.log(`  segment ${s.slug.padEnd(32)} ${s.steps} steps${s.replaced ? '  (replaced the existing one)' : ''}`);
+  if (saved.lessons.written || saved.lessons.alreadyKnown) console.log(`  lessons ${saved.lessons.written} new, ${saved.lessons.alreadyKnown} already known`);
+}
+
+/** remember <app> <file.json> — a batch of { facts, lessons, findings, reached }. */
+async function cmdRemember(positional: string[]) {
+  const [app, file] = positional;
+  if (!app || !file) fail('remember needs an app and a JSON file', 'understudy remember myapp learned.json');
+  const r = await remember(app, JSON.parse(await readFile(file, 'utf8'))).catch((e: Error) => fail(e.message));
+  console.log(`facts    ${r.facts.written} new, ${r.facts.alreadyKnown} already known`);
+  console.log(`lessons  ${r.lessons.written} new, ${r.lessons.alreadyKnown} already known`);
+  console.log(`findings ${r.findings}`);
+  console.log(`reached  ${r.reached}`);
 }
 
 function printReplay(result: ReplayResult) {
@@ -531,7 +593,8 @@ async function cmdSave(positional: string[], flags: Flags) {
   const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`, 'understudy recordings'));
 
   console.log(`proving ${hash} by replaying it…\n`);
-  const result = await replayWithSession(recording, flags);
+  // No lessons: what gets saved is what the recording does on its own.
+  const result = await executeWithReport(recording, flags, { useLessons: false });
   printReplay(result);
   if (!result.ok && !flags.has('force')) {
     console.error('\nnot saved — the recording did not replay cleanly. Fix it, or re-record.');
@@ -613,6 +676,9 @@ async function main() {
     case 'findings': return cmdFindings(rest, flags);
     case 'recall': return cmdRecall(rest, flags);
     case 'run': return cmdRun(rest, flags);
+    case 'answer': return cmdAnswer(rest, flags);
+    case 'distill': return cmdDistill(rest, flags);
+    case 'remember': return cmdRemember(rest);
     default: fail(`unknown command '${command}'`, 'understudy --help');
   }
 }
