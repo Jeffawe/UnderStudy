@@ -46,8 +46,7 @@
     "understudy": "tsx src/entry/cli.ts",
     "mcp": "tsx src/entry/mcp.ts",
     "extension:build": "tsx scripts/build-extension.ts",
-    "vendor:accname": "node scripts/vendor-accname.mjs",
-    "hair-loss:book": "tsx .understudy/explorations/hair-loss-book.ts"
+    "vendor:accname": "node scripts/vendor-accname.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
