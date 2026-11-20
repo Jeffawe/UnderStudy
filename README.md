@@ -103,9 +103,20 @@ understudy app myapp --placeholder email    # keep email addresses out of memory
 
 `understudy --help` lists everything. A flow that commits something real — a
 purchase, a deletion — is marked destructive and refused unless you pass
-`--allow-purchases`. Prefer a fresh browser over your own (or on Firefox or Safari, which the extension doesn't support yet)?
-`understudy record myapp --new-browser --url https://…`, after
-`npx playwright install chromium` (the full browser, ~350 MB).
+`--allow-purchases`.
+
+**On Safari, or prefer a fresh browser over your own?** Record in a browser
+Understudy opens instead. It needs one extra download, the full Chromium
+browser (about 350 MB, once):
+
+```bash
+npx playwright install chromium
+understudy record myapp --new-browser --url https://your-app.example
+```
+
+Click through the flow in the window that opens, then close it to stop. Firefox
+users can also load the extension's Firefox build — see
+[extension/README.md](extension/README.md).
 
 ## With an agent
 

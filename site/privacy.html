@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Understudy recorder — privacy</title>
+<meta name="description" content="What the Understudy recorder extension accesses, and where it goes: nowhere but your own machine.">
+<style>
+  :root { --bg: #fbfbfa; --fg: #1c1c1a; --muted: #5d5d58; --line: #e4e3de; --code: #f3f2ee; --accent: #3d5afe; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121211; --fg: #ecebe6; --muted: #a3a29c; --line: #2a2a27; --code: #222220; --accent: #8c9eff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 700px; margin: 0 auto; padding: 48px 20px 64px; }
+  h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 8px; letter-spacing: -0.015em; }
+  h2 { font-size: 1.1rem; margin: 36px 0 8px; }
+  p, li { color: var(--fg); }
+  .meta { color: var(--muted); margin: 0 0 28px; }
+  ul { padding-left: 20px; }
+  li { margin: 0 0 8px; }
+  code { font: .92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code); padding: 1px 5px; border-radius: 4px; }
+  a { color: var(--accent); }
+  footer { margin-top: 48px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Understudy recorder — privacy</h1>
+  <p class="meta">Applies to the Understudy recorder browser extension. Last updated 20 November 2026.</p>
+
+  <p><strong>In short: nothing the extension records leaves your computer.</strong> It talks only to the Understudy program running on your own machine, at <code>127.0.0.1</code>. There's no Understudy server, no account, no analytics, and no tracking.</p>
+
+  <h2>What it records, and when</h2>
+  <p>Only while you're recording — after you click <em>Record from this page</em>, on that tab, until you click <em>Stop and save</em>:</p>
+  <ul>
+    <li>Your clicks, key presses and selections, and the page address each happens on.</li>
+    <li>What you type into fields. <strong>Passwords are never recorded</strong>: a password field is stored as a name like <code>SECRET.password</code>, and you supply the value when replaying.</li>
+    <li>The name and type of each element you interact with (e.g. the button "Log in"), so the step can be replayed.</li>
+  </ul>
+  <p>Outside a recording, it does nothing.</p>
+
+  <h2>Your sign-in</h2>
+  <p>When you start recording, the extension copies that site's cookies and local storage, so a replay can start signed in the way you were. They're saved as a file on your computer that only your user account can read. If the flow turns out not to need them, Understudy deletes the copy when you save the flow.</p>
+
+  <h2>Where it all goes</h2>
+  <p>Each recorded action is sent to the <code>understudy</code> program on your machine (<code>127.0.0.1</code>), using a one-time code that web pages can't read. The program saves the recording to a folder on your computer. If you then save it as a flow, it goes into the MongoDB database <em>you</em> configured — your own Atlas cluster or your own server. The extension's authors never receive any of it.</p>
+
+  <h2>Permissions, and why</h2>
+  <ul>
+    <li><strong>Access to a site</strong> — asked for one site at a time, when you first record there, so the recorder can run on that page.</li>
+    <li><strong>Cookies</strong> — to copy your sign-in for replay, as above.</li>
+    <li><strong>Scripting</strong> — to run the recorder on the tab you're recording.</li>
+    <li><strong>Navigation</strong> — to keep recording when a click opens a new page.</li>
+    <li><strong>Storage</strong> — to remember which tab is being recorded, and your port setting.</li>
+  </ul>
+
+  <h2>Questions</h2>
+  <p>Open an issue on <a href="https://github.com/Jeffawe/UnderStudy/issues">GitHub</a>. The extension is open source; you can read exactly what it does in the <a href="https://github.com/Jeffawe/UnderStudy/tree/main/extension">extension folder</a>.</p>
+
+  <footer><a href="/">Understudy</a></footer>
+</main>
+</body>
+</html>

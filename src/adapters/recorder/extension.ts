@@ -53,7 +53,9 @@ export interface ExtensionRecording {
   sessionPath?: string;
 }
 
-const isExtensionOrigin = (origin: string | undefined) => !!origin && /^chrome-extension:\/\/[a-p]{32}$/.test(origin);
+/** Chrome, Edge, Brave… use chrome-extension://<32 letters>; Firefox uses moz-extension://<uuid>. */
+const isExtensionOrigin = (origin: string | undefined) =>
+  !!origin && (/^chrome-extension:\/\/[a-p]{32}$/.test(origin) || /^moz-extension:\/\/[0-9a-f-]{36}$/.test(origin));
 
 async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
   let s = '';
@@ -161,4 +163,9 @@ export async function startExtensionRecorder(opts: { appSlug: string; port?: num
 /** The extension's folder: it ships inside the package, beside dist/ and src/. */
 export function extensionDir(): string {
   return fileURLToPath(new URL('../../../extension/', import.meta.url));
+}
+
+/** The Firefox build of it (npm run extension:package), also shipped in the package. */
+export function firefoxExtensionDir(): string {
+  return fileURLToPath(new URL('../../../build/extension/firefox/', import.meta.url));
 }

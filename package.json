@@ -1,7 +1,7 @@
 {
   "name": "@jeffawe/understudy",
   "version": "0.2.0",
-  "description": "End-to-end tests for your own web apps: record a flow once, and Understudy remembers it, replays it, notices when the app changes, and runs goals you describe in words — on its own or as an MCP server for AI agents.",
+  "description": "End-to-end tests for your own web apps: record a flow once, and Understudy remembers it, replays it, notices when the app changes, and runs goals you describe in words \u2014 on its own or as an MCP server for AI agents.",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {
@@ -32,6 +32,7 @@
   "files": [
     "dist",
     "extension",
+    "build/extension/firefox",
     "REASONER.md"
   ],
   "publishConfig": {
@@ -42,12 +43,13 @@
     "build": "npm run clean && tsc",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
-    "prepack": "npm run extension:build && npm run build",
+    "prepack": "npm run extension:package && npm run build",
     "understudy": "tsx src/entry/cli.ts",
     "mcp": "tsx src/entry/mcp.ts",
     "extension:build": "tsx scripts/build-extension.ts",
     "vendor:accname": "node scripts/vendor-accname.mjs",
-    "prepublishOnly": "npm run typecheck"
+    "prepublishOnly": "npm run typecheck",
+    "extension:package": "npm run extension:build && node scripts/package-extension.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

@@ -9,7 +9,7 @@
 
 import { recordLive } from '../adapters/recorder/live.js';
 import { parseScript } from '../adapters/recorder/script.js';
-import { startExtensionRecorder, DEFAULT_PORT, extensionDir } from '../adapters/recorder/extension.js';
+import { startExtensionRecorder, DEFAULT_PORT, extensionDir, firefoxExtensionDir } from '../adapters/recorder/extension.js';
 import { listRecordings, loadRecording, saveRecording } from '../core/recording-store.js';
 import { loadSession, saveSession } from '../core/auth-cache.js';
 import { buildRecording, type RawRecording } from '../core/recording.js';
@@ -453,12 +453,17 @@ async function cmdApp(positional: string[], flags: Flags) {
 
 /** Where the Chrome extension is, and how to load it — it ships inside the package. */
 function cmdExtension() {
-  const dir = extensionDir();
-  console.log(`the Understudy recorder extension is in:\n  ${dir}\n`);
-  console.log('load it once:');
-  console.log('  1. open chrome://extensions and turn on Developer mode (top right)');
+  console.log(`Chrome, Edge, Brave and other Chromium browsers:\n  ${extensionDir()}\n`);
+  console.log('  1. open the extensions page (chrome://extensions, edge://extensions, …) and turn on Developer mode');
   console.log('  2. click "Load unpacked" and choose the folder above');
   console.log('  3. pin it (puzzle-piece icon) so it is one click away');
+  const firefox = firefoxExtensionDir();
+  if (existsSync(join(firefox, 'manifest.json'))) {
+    console.log(`\nFirefox:\n  ${firefox}\n`);
+    console.log('  open about:debugging#/runtime/this-firefox → "Load Temporary Add-on…" → choose manifest.json in that folder');
+    console.log('  (Firefox removes temporary add-ons when it restarts)');
+  }
+  console.log('\nSafari: use `understudy record <app> --new-browser` instead (needs: npx playwright install chromium)');
   console.log('\nthen record with: understudy record <app>');
 }
 

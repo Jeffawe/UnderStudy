@@ -79,6 +79,11 @@ test('the local server only talks to extensions, and only with the token', async
   const rec = await startExtensionRecorder({ appSlug: 'shop', port: 0 });
   const fromSite = await fetch(`${rec.url}/hello`, { headers: { origin: 'https://evil.example' } });
   assert.equal(fromSite.status, 403, 'a web page is refused');
+  for (const origin of ['chrome-extension://abcdefghijklmnopabcdefghijklmnop', 'moz-extension://0b6f5c2e-1f3a-4c8e-9d2b-7a1e5f3c9b4d']) {
+    const ext = await fetch(`${rec.url}/hello`, { headers: { origin } });
+    assert.equal(ext.status, 200, `${origin.split(':')[0]} is let in`);
+    assert.equal(ext.headers.get('access-control-allow-origin'), origin, 'and may read the token');
+  }
   const noToken = await fetch(`${rec.url}/start`, { method: 'POST', body: JSON.stringify({ url: 'x' }) });
   assert.equal(noToken.status, 401);
   rec.stop();

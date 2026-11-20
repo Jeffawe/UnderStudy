@@ -20,10 +20,26 @@ signed in or not — instead of a fresh browser that Understudy opens.
 Tested in Chrome and Chromium. Other Chromium-based browsers load Chrome
 extensions the same way and should work.
 
-**Firefox and Safari aren't supported yet** — they need their own build of the
-extension. Record with a fresh browser instead:
-`understudy record <app> --new-browser --url https://…`, after
-`npx playwright install chromium`.
+**Firefox:** until it's listed on Firefox Add-ons, load the Firefox build
+yourself — it ships with Understudy, and `understudy extension` prints where.
+In Firefox open `about:debugging#/runtime/this-firefox` → **Load Temporary
+Add-on…** → choose `manifest.json` in that folder. Firefox removes temporary
+add-ons when it restarts.
+
+**Safari (and anywhere else the extension won't run):** record in a fresh
+browser that Understudy opens instead. It's a one-time extra download — the
+full Chromium browser, about 350 MB:
+
+```bash
+npx playwright install chromium
+understudy record <app> --new-browser --url https://your-app.example
+```
+
+A Chromium window opens on that address. Click through the flow, then close
+the window to stop; the terminal prints the recording's hash for `understudy
+save`. The address is remembered, so next time `--new-browser` alone is
+enough. Signed-in flows: add `--arm-manually`, sign in first, then press Enter
+in the terminal to start recording from there.
 
 ## Record
 
