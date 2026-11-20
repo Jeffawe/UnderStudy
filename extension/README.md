@@ -1,21 +1,37 @@
-# Understudy recorder (Chrome extension)
+# Understudy recorder (browser extension)
 
-Record a flow in the Chrome you already use — on the tab you're already on,
+Record a flow in the browser you already use — on the tab you're already on,
 signed in or not — instead of a fresh browser that Understudy opens.
 
 ## Install (once)
 
-1. Open `chrome://extensions` and turn on **Developer mode** (top right).
+`understudy extension` prints where this folder is.
+
+1. Open your browser's extensions page and turn on **Developer mode**:
+   | Browser | Extensions page |
+   |---|---|
+   | Chrome | `chrome://extensions` |
+   | Edge | `edge://extensions` |
+   | Brave | `brave://extensions` |
+   | Arc, Opera, Vivaldi | their extensions page (all accept Chrome extensions) |
 2. Click **Load unpacked** and choose this `extension/` folder.
 3. Pin it (puzzle-piece icon → pin **Understudy recorder**) so it's one click away.
+
+Tested in Chrome and Chromium. Other Chromium-based browsers load Chrome
+extensions the same way and should work.
+
+**Firefox and Safari aren't supported yet** — they need their own build of the
+extension. Record with a fresh browser instead:
+`understudy record <app> --new-browser --url https://…`, after
+`npx playwright install chromium`.
 
 ## Record
 
 1. In a terminal: `understudy record <app>`. It waits for the extension.
-2. In Chrome, go to the page where the flow starts.
+2. In your browser, go to the page where the flow starts.
 3. Click the Understudy icon → **Record from this page**. The first time on a
-   site, Chrome asks to let Understudy access it — that's the only site it
-   gets.
+   site, the browser asks to let Understudy access it — that's the only site
+   it gets.
    - **I'm signed in here:** tick it if the flow starts signed in, and replay
      will start signed in too. Not sure? Leave it: Understudy copies the tab's
      sign-in anyway, then when you `save` it tries the flow without it first,
@@ -34,15 +50,7 @@ signed in or not — instead of a fresh browser that Understudy opens.
   `understudy import` it.
 - **Other sites mid-flow** (a payment provider's page, say) unless you've
   allowed them too. Steps there aren't recorded.
-- **`chrome://` pages and the Chrome Web Store.** Chrome doesn't allow it.
+- **The browser's own pages** (`chrome://`, `edge://`…) **and its extension store.** Browsers don't allow it.
 
 Passwords are never recorded: a password field is stored as a reference like
 `SECRET.password`, and you supply the value when replaying.
-
-## How it works
-
-`recorder.js` is the same in-page recorder the Playwright recorder injects
-(generated from it: `npm run extension:build`). It runs in the tab and sends
-each action to the extension, which forwards it to the `understudy` process on
-`127.0.0.1` with a one-time token. Web pages can't read that token, so they
-can't add steps to your recording.

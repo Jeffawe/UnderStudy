@@ -15,7 +15,7 @@ Understudy never calls a model itself — the agent is the model.
 record  →  save  →  replay / run  →  findings
 ```
 
-- **record** — click through a flow in your own Chrome, with the extension. Passwords are never stored: a password field is kept as
+- **record** — click through a flow in your own browser, with the extension (Chrome, Edge, Brave and other Chromium browsers). Passwords are never stored: a password field is kept as
   a reference like `SECRET.password`, and you supply the value when replaying.
 - **save** — the recording is replayed headless first. It is kept only if every
   step passes, so memory only holds flows known to work.
@@ -91,7 +91,7 @@ a few goals with `understudy recall` first.
 ## Use it
 
 ```bash
-understudy record myapp                     # record in your own Chrome, with the extension
+understudy record myapp                     # record in your own browser, with the extension
 understudy save <hash> "log in as a member" # prove it by replaying, then keep it
 understudy flows myapp                      # what it knows how to do
 understudy replay myapp log-in-as-a-member  # run one flow
@@ -103,7 +103,7 @@ understudy app myapp --placeholder email    # keep email addresses out of memory
 
 `understudy --help` lists everything. A flow that commits something real — a
 purchase, a deletion — is marked destructive and refused unless you pass
-`--allow-purchases`. Prefer a fresh browser over your own Chrome?
+`--allow-purchases`. Prefer a fresh browser over your own (or on Firefox or Safari, which the extension doesn't support yet)?
 `understudy record myapp --new-browser --url https://…`, after
 `npx playwright install chromium` (the full browser, ~350 MB).
 
