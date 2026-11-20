@@ -72,7 +72,7 @@
   </div>
 
   <h2 id="install">Install</h2>
-  <p>You need Node 22+ and a MongoDB with vector search — a free <a href="https://www.mongodb.com/atlas">Atlas</a> cluster works. A <a href="https://www.voyageai.com">Voyage</a> key is optional, to match goals by meaning.</p>
+  <p>You need Node 22+ and a MongoDB with vector search — a free <a href="https://www.mongodb.com/atlas">Atlas</a> cluster works, and so does self-hosted <a href="https://www.mongodb.com/products/self-managed/community-edition">MongoDB Community Edition</a> with its search engine (<code>mongot</code>). A <a href="https://www.voyageai.com">Voyage</a> key is optional, to match goals by meaning.</p>
   <div class="code"><div class="bar"><span>Terminal</span><button type="button">Copy</button></div><pre>npm install -g @jeffawe/understudy
 npx playwright install --only-shell chromium
 understudy config set MONGODB_URI="mongodb+srv://…" EMBED_KEY="…"</pre></div>
