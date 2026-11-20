@@ -136,6 +136,8 @@ telemetry.
   local files only you can read.
 - **Your agent**, if you use one, sees what Understudy's tools return to it.
 
+The recorder extension's privacy policy: [understudy.jeffawe.dev/privacy.html](https://understudy.jeffawe.dev/privacy.html).
+
 ## With an agent
 
 Add the MCP server to your agent. It starts and stops with the agent's session;
@@ -153,14 +155,15 @@ claude mcp add understudy -- npx -y -p @jeffawe/understudy understudy-mcp --env-
 } } }
 ```
 
-Nine tools: `recall`, `run`, `answer`, `record`, `save`, `distill`,
-`save_distilled`, `remember`, `findings`. The server tells the agent how to use
+Ten tools: `recall`, `run`, `answer`, `record`, `save`, `distill`,
+`save_distilled`, `remember`, `findings`, `app`. The server tells the agent how to use
 them when it connects; [REASONER.md](REASONER.md) is the full version — how to
 split a goal, when to answer a question and when to say "I don't know", and
 what to write down.
 
 ## Learn more
 
+- [understudy.jeffawe.dev](https://understudy.jeffawe.dev) — the one-page overview
 - [REASONER.md](REASONER.md) — how an agent should use it
 - [extension/README.md](extension/README.md) — the Chrome recorder
 
