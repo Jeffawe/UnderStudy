@@ -196,3 +196,50 @@ test('ticked "I\'m signed in here": the flow starts signed in, no guessing', { t
   assert.equal(proven.signIn, 'needed');
   assert.ok(await loadSessionById('shop', out.recording.entry!.session!), 'the session is kept');
 });
+
+test('allowing a site starts the recording by itself — the popup closing no longer loses the click', { timeout: 120_000 }, async () => {
+  const rec = await startExtensionRecorder({ appSlug: 'shop', port: 0 });
+  await worker.evaluate((p) => chrome.storage.local.set({ port: p }), Number(new URL(rec.url).port));
+  const page = await browser.newPage();
+  await page.goto(shop.url);
+  const tabId = await worker.evaluate(async (u) => (await chrome.tabs.query({ url: `${u}*` }))[0]!.id!, shop.url);
+  const origin = new URL(shop.url).origin;
+
+  // What the popup leaves behind before Chrome shows its dialog (and closes the popup).
+  await worker.evaluate(([id, o]) => chrome.storage.session.set({ pending: { tabId: id, origin: o, signedIn: false, at: Date.now() } }), [tabId, origin] as const);
+
+  // Some OTHER site being allowed must not start anything.
+  await worker.evaluate(() => (self as unknown as { understudy: { onPermissionAdded: Function } }).understudy.onPermissionAdded({ origins: ['https://elsewhere.example/*'] }));
+  assert.equal(await worker.evaluate(() => (self as unknown as { understudy: { current: Function } }).understudy.current()), undefined, 'a different site does not start it');
+
+  // The site that was asked about being allowed does.
+  await worker.evaluate((o) => (self as unknown as { understudy: { onPermissionAdded: Function } }).understudy.onPermissionAdded({ origins: [`${o}/*`] }), origin);
+  const now = await worker.evaluate(() => (self as unknown as { understudy: { current: Function } }).understudy.current());
+  assert.equal((now as { app: string }).app, 'shop', 'recording started with no further click');
+  assert.equal(await worker.evaluate((id) => chrome.action.getBadgeText({ tabId: id }), tabId), 'REC');
+  assert.equal((await worker.evaluate(() => chrome.storage.session.get('pending'))).pending, undefined, 'the note is used up');
+
+  await page.getByRole('textbox', { name: 'Username' }).fill('demo');
+  await page.waitForTimeout(300);
+  await stop();
+  const out = await rec.done;
+  await page.close();
+  assert.ok(out.recording.events.some((e) => e.name === 'Username'), 'and it recorded');
+});
+
+test('a start that fails after the popup closed shows up as a red ! and a message next time', { timeout: 60_000 }, async () => {
+  // Nothing is listening on this port, so starting fails.
+  await worker.evaluate(() => chrome.storage.local.set({ port: 1 }));
+  const page = await browser.newPage();
+  await page.goto(shop.url);
+  const tabId = await worker.evaluate(async (u) => (await chrome.tabs.query({ url: `${u}*` }))[0]!.id!, shop.url);
+  const origin = new URL(shop.url).origin;
+  await worker.evaluate(([id, o]) => chrome.storage.session.set({ pending: { tabId: id, origin: o, signedIn: false, at: Date.now() } }), [tabId, origin] as const);
+  await worker.evaluate((o) => (self as unknown as { understudy: { onPermissionAdded: Function } }).understudy.onPermissionAdded({ origins: [`${o}/*`] }), origin);
+
+  assert.equal(await worker.evaluate((id) => chrome.action.getBadgeText({ tabId: id }), tabId), '!');
+  const { lastError } = await worker.evaluate(() => chrome.storage.session.get('lastError'));
+  assert.match(lastError, /Understudy is not waiting/);
+  await page.close();
+  await worker.evaluate(() => chrome.storage.session.remove('lastError'));
+});

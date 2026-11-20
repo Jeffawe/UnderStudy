@@ -65,7 +65,14 @@ async function captureSession(tab) {
 // The tab's sign-in is always sent. Ticked "I'm signed in here": the flow starts
 // signed in, full stop. Unticked: Understudy works it out when you save (it
 // proves the recording without the sign-in first) and deletes it if unneeded.
-async function startRecording(tabId, { signedIn = false } = {}) {
+let starting = null;
+function startRecording(tabId, opts = {}) {
+  // One start at a time: the popup and the permission-granted handler below can
+  // both ask, and the second must wait for, not repeat, the first.
+  return (starting ??= doStart(tabId, opts).finally(() => { starting = null; }));
+}
+
+async function doStart(tabId, { signedIn = false } = {}) {
   if (await current()) throw new Error('Already recording — stop that one first.');
   const { app, token, started } = await hello();
   if (started) throw new Error('That Understudy recording has already started. Run the command again for a new one.');
@@ -78,6 +85,35 @@ async function startRecording(tabId, { signedIn = false } = {}) {
   await chrome.action.setBadgeBackgroundColor({ tabId, color: '#c62828' });
   return { app };
 }
+
+// --- starting right after the user allows a site -----------------------------
+//
+// Chrome closes the popup when its "allow this site?" dialog appears, so the
+// click on "Record from this page" would be lost and nothing would start. The
+// popup leaves a note first; once the permission is granted, this worker —
+// which outlives the popup — starts the recording itself.
+
+const PENDING_MS = 2 * 60 * 1000;
+
+async function noteFailure(tabId, message) {
+  await chrome.storage.session.set({ lastError: message });
+  await chrome.action.setBadgeText({ tabId, text: '!' }).catch(() => {});
+  await chrome.action.setBadgeBackgroundColor({ tabId, color: '#ef6c00' }).catch(() => {});
+}
+
+async function onPermissionAdded({ origins = [] }) {
+  const { pending } = await chrome.storage.session.get('pending');
+  if (!pending || Date.now() - pending.at > PENDING_MS) return;
+  // Only for the site that was asked about (the pattern is `<origin>/*`).
+  if (!origins.some((o) => o.replace(/\/\*$/, '') === pending.origin)) return;
+  await chrome.storage.session.remove('pending');
+  try {
+    await startRecording(pending.tabId, { signedIn: pending.signedIn });
+  } catch (e) {
+    if (!/Already recording/.test(e.message)) await noteFailure(pending.tabId, e.message);
+  }
+}
+chrome.permissions.onAdded.addListener(onPermissionAdded);
 
 async function stopRecording() {
   const rec = await current();
@@ -112,7 +148,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   const handlers = {
-    'understudy:status': async () => ({ rec: (await current()) ?? null, cli: await hello().catch((e) => ({ error: e.message })) }),
+    'understudy:status': async () => {
+      // A start that failed after the popup closed: say so once, then forget it.
+      const { lastError } = await chrome.storage.session.get('lastError');
+      await chrome.storage.session.remove('lastError');
+      return { rec: (await current()) ?? null, lastError: lastError ?? null, cli: await hello().catch((e) => ({ error: e.message })) };
+    },
     'understudy:start': () => startRecording(msg.tabId, { signedIn: Boolean(msg.signedIn) }),
     'understudy:stop': () => stopRecording(),
   };
@@ -135,4 +176,4 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 });
 
 // For tests and the console: drive it without the popup.
-self.understudy = { startRecording, stopRecording, current };
+self.understudy = { startRecording, stopRecording, current, onPermissionAdded };

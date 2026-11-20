@@ -23,6 +23,9 @@ async function refresh() {
   if (s.rec) {
     show(`Recording "${s.rec.app}". Use the page as normal, then stop here.`, 'rec');
     $('stopPane').hidden = false;
+  } else if (s.lastError) {
+    show(`Couldn't start recording: ${s.lastError}`, 'err');
+    if (!s.cli?.error && !s.cli?.started) $('startPane').hidden = false;
   } else if (s.cli?.error) {
     show(s.cli.error, 'err');
   } else if (s.cli?.started) {
@@ -39,14 +42,27 @@ $('start').addEventListener('click', async () => {
   // see this tab's address — Chrome hides it from extensions otherwise.
   if (!tab?.url) return show('Couldn\'t read this tab\'s address — close this popup and click the Understudy icon again.', 'err');
   if (!/^https?:/.test(tab.url)) return show('This page can\'t be recorded (only http and https pages).', 'err');
-  // Per-site access, asked for now — while you're clicking — rather than for every site at install.
-  const origin = `${new URL(tab.url).origin}/*`;
-  const allowed = await chrome.permissions.request({ origins: [origin] }).catch(() => false);
-  if (!allowed) return show('Understudy needs access to this site to record it.', 'err');
+  const site = new URL(tab.url).origin;
+  const signedIn = $('signedIn').checked;
   $('start').disabled = true;
-  const r = await send({ type: 'understudy:start', tabId: tab.id, signedIn: $('signedIn').checked });
+
+  // Per-site access, asked for now — while you're clicking — rather than for every site at install.
+  // If it has to be asked, Chrome closes this popup, so leave a note first: the
+  // background worker starts recording the moment you allow it.
+  if (!(await chrome.permissions.contains({ origins: [`${site}/*`] }))) {
+    await chrome.storage.session.set({ pending: { tabId: tab.id, origin: site, signedIn, at: Date.now() } });
+    const allowed = await chrome.permissions.request({ origins: [`${site}/*`] }).catch(() => false);
+    if (!allowed) {
+      await chrome.storage.session.remove('pending');
+      $('start').disabled = false;
+      return show('Understudy needs access to this site to record it.', 'err');
+    }
+    // The popup usually doesn't survive the dialog; if it did, the worker is already starting.
+  }
+
+  const r = await send({ type: 'understudy:start', tabId: tab.id, signedIn });
   $('start').disabled = false;
-  if (!r.ok) return show(r.error, 'err');
+  if (!r.ok && !/Already recording/.test(r.error)) return show(r.error, 'err');
   window.close();
 });
 
