@@ -148,7 +148,7 @@ export function rank(matches: FlowMatch[]): FlowMatch[] {
 
 /** The verdict's reason, plus a warning when the flow it picked may not work. */
 const withProven = (why: string, best: FlowMatch | undefined) =>
-  best && !best.proven ? `${why} — but '${best.slug}' is unproven (${best.unprovenBecause ?? 'no passing run yet'}), so it may not work` : why;
+  best && !best.proven ? `${why} — but '${best.slug}' is unproven (${best.unprovenBecause ?? 'no passing run yet'}), so it may not work; a passing run proves it` : why;
 
 /** The best flow's steps and the login values they need, for an agent driving it itself. */
 async function plan(app: string, slug: string): Promise<Pick<Recall, 'steps' | 'needs'>> {

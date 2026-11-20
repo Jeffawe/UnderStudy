@@ -172,7 +172,7 @@ test('saving without a replay: kept as unproven; the first passing run proves it
   const { recall } = await import('../src/memory/recall.js');
   const r = await recall('shop', 'cart-unverified');
   assert.equal(r.best?.proven, false, 'recall says so');
-  assert.match(r.why, /unproven \(saved without a replay\), so it may not work/);
+  assert.match(r.why, /unproven \(saved without a replay\), so it may not work; a passing run proves it/);
   const { distillRequest } = await import('../src/flows/distill.js');
   await assert.rejects(distillRequest('shop', 'cart-unverified'), /is unproven .* run it once/, 'not distilled until proven');
 

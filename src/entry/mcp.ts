@@ -268,7 +268,10 @@ server.registerTool('understudy_save', {
   if (!out.saved) return { saved: false, ...base, why: 'it did not replay cleanly, so it was not kept. Fix the step, or pass verify: false to keep it unproven.' };
   return {
     saved: true, flow: out.flow.slug, steps: out.flow.steps.length, madeBy, ...base,
-    ...(out.flow.proven === false ? { unproven: out.flow.unprovenBecause } : {}),
+    ...(out.flow.proven === false ? {
+      unproven: out.flow.unprovenBecause,
+      proveIt: `when it should pass: understudy_run with subGoals ["${out.flow.slug}"] — a passing run proves it`,
+    } : {}),
     ...(out.flow.destructive ? { destructive: out.flow.destructiveBecause } : {}),
     ...(out.run ? { findings: out.run.findings.map((f) => f.statement) } : {}),
     ...(out.placeholders.converted.length ? { placeholders: out.placeholders.converted } : {}),

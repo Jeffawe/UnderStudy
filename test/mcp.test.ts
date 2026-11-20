@@ -236,3 +236,29 @@ test('log in late', async ({ page }) => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('an agent proves an unproven flow by running it: understudy_run with the flow as the one sub-goal', { timeout: 120_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'understudy-agent-prove-'));
+  try {
+    const { writeFile } = await import('node:fs/promises');
+    const script = join(dir, 'cart.spec.ts');
+    await writeFile(script, `import { test } from '@playwright/test';
+test('see the cart', async ({ page }) => {
+  await page.goto('${shop.url}');
+  await page.getByRole('textbox', { name: 'Username' }).fill('demo');
+  await page.getByRole('textbox', { name: 'Password' }).fill(process.env.AGENT_SHOP_PASSWORD!);
+  await page.getByRole('button', { name: 'Log in' }).click();
+  await page.getByRole('link', { name: 'Cart' }).click();
+});`);
+    const saved = JSON.parse(text(await client.callTool({ name: 'understudy_save', arguments: { app: 'shop', name: 'See the cart', script, verify: false } })));
+    assert.ok(saved.unproven);
+    assert.match(saved.proveIt, /subGoals \["see-the-cart"\]/, 'the answer says how to prove it');
+    const ran = JSON.parse(text(await client.callTool({ name: 'understudy_run', arguments: { app: 'shop', goal: 'see the cart', subGoals: ['see-the-cart'] } })));
+    assert.equal(ran.status, 'passed', JSON.stringify(ran));
+    assert.deepEqual(ran.nowProven, ['see-the-cart']);
+    const recall = JSON.parse(text(await client.callTool({ name: 'understudy_recall', arguments: { app: 'shop', goal: 'see-the-cart' } })));
+    assert.equal(recall.best.proven, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
