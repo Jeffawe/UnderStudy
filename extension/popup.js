@@ -35,7 +35,10 @@ async function refresh() {
 
 $('start').addEventListener('click', async () => {
   const tab = await activeTab();
-  if (!tab?.url || !/^https?:/.test(tab.url)) return show('This page can\'t be recorded (only http and https pages).', 'err');
+  // Clicking the toolbar icon grants activeTab, which is what lets the popup
+  // see this tab's address — Chrome hides it from extensions otherwise.
+  if (!tab?.url) return show('Couldn\'t read this tab\'s address — close this popup and click the Understudy icon again.', 'err');
+  if (!/^https?:/.test(tab.url)) return show('This page can\'t be recorded (only http and https pages).', 'err');
   // Per-site access, asked for now — while you're clicking — rather than for every site at install.
   const origin = `${new URL(tab.url).origin}/*`;
   const allowed = await chrome.permissions.request({ origins: [origin] }).catch(() => false);
