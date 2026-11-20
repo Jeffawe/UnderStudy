@@ -44,7 +44,7 @@
   <p>When you start recording, the extension copies that site's cookies and local storage, so a replay can start signed in the way you were. They're saved as a file on your computer that only your user account can read. If the flow turns out not to need them, Understudy deletes the copy when you save the flow.</p>
 
   <h2>Where it all goes</h2>
-  <p>Each recorded action is sent to the <code>understudy</code> program on your machine (<code>127.0.0.1</code>), using a one-time code that web pages can't read. The program saves the recording to a folder on your computer. If you then save it as a flow, it goes into the MongoDB database <em>you</em> configured — your own Atlas cluster or your own server. The extension's authors never receive any of it.</p>
+  <p>Each recorded action is sent to the <code>understudy</code> program on your machine (<code>127.0.0.1</code>), using a one-time code that web pages can't read. The program saves the recording to a folder on your computer. If you then save it as a flow, it goes into the MongoDB database <em>you</em> configured — your own Atlas cluster or your own server. If you also configured an embedding model (Voyage, by default) so goals can be matched by meaning, Understudy sends it only the short texts it searches by — a flow's name and description, facts and lessons, the goals you ask for — never the recorded steps, anything typed, or your cookies. The extension's authors never receive any of it.</p>
 
   <h2>Permissions, and why</h2>
   <ul>

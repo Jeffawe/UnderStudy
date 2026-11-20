@@ -118,6 +118,21 @@ Click through the flow in the window that opens, then close it to stop. Firefox
 users can also load the extension's Firefox build — see
 [extension/README.md](extension/README.md).
 
+## Where your data goes
+
+Everything stays with you. Understudy has no server, no account and no
+telemetry.
+
+- **Recordings** are files on your machine. The Chrome extension sends what it
+  records only to Understudy on `127.0.0.1`.
+- **Saved flows, notes and findings** go to the MongoDB you configured.
+- **Your embedding model** (Voyage by default, if you set a key) receives only
+  the short texts used for search — flow names and descriptions, facts and
+  lessons, the goals you ask for — never steps, typed values or cookies.
+- **Passwords** are never stored; signed-in sessions and your env file are
+  local files only you can read.
+- **Your agent**, if you use one, sees what Understudy's tools return to it.
+
 ## With an agent
 
 Add the MCP server to your agent. It starts and stops with the agent's session;
