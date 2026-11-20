@@ -25,11 +25,16 @@ async function hello() {
 }
 
 async function post(path, body) {
-  const res = await fetch(`${await cliUrl()}${path}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  let res;
+  try {
+    res = await fetch(`${await cliUrl()}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new Error('Understudy is no longer running in the terminal. Run: understudy record <app>');
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `Understudy answered ${res.status}`);
   return data;

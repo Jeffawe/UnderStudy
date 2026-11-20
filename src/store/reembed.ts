@@ -1,5 +1,5 @@
 /**
- * Rebuild every vector with the model currently in .env.
+ * Rebuild every vector with the model now configured.
  *
  * Needed after changing EMBED_MODEL or EMBED_DIMS, because vectors from two
  * models can't be compared. Also fills in vectors for anything stored while no

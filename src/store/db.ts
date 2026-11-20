@@ -21,7 +21,8 @@ export function mongoUri(): string {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
     throw new Error(
-      'MONGODB_URI is not set. Put it in .env — e.g. ' +
+      'MONGODB_URI is not set. Run: understudy config set MONGODB_URI="…" ' +
+        '(or set it in the env block of your MCP config) — e.g. ' +
         'mongodb://localhost:27017/?directConnection=true for local Community, ' +
         'or your Atlas mongodb+srv://… string.',
     );
@@ -104,7 +105,7 @@ function vectorDefinition(dims: number) {
 
 /**
  * One embedding model per database. The first time a model is configured it is
- * recorded; after that, a different model in .env stops everything with a clear
+ * recorded; after that, a different configured model stops everything with a clear
  * message instead of silently mixing two incomparable kinds of vector.
  * Returns the vector length the indexes should use.
  */

@@ -38,7 +38,7 @@ USAGE
 COMMANDS
   config                where settings come from; set them, or point at an env file
   doctor                check the MongoDB connection, vector search and embedder
-  reembed               rebuild every vector with the model in .env
+  reembed               rebuild every vector with the model now configured
   record <app>          capture a flow in your own Chrome, with the extension
   extension             where the Chrome extension is, and how to load it
   app <app>             an app's settings, e.g. --placeholder email

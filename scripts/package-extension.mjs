@@ -35,11 +35,13 @@ const builds = {
     browser_specific_settings: {
       gecko: {
         id: FIREFOX_ID,
-        strict_min_version: '128.0',
+        // 140 is the first Firefox that knows data_collection_permissions (and an ESR).
+        strict_min_version: '140.0',
         // Firefox asks every add-on to declare what it collects: nothing leaves
         // the machine (the extension talks only to understudy on 127.0.0.1).
         data_collection_permissions: { required: ['none'] },
       },
+      gecko_android: { strict_min_version: '142.0' },
     },
   },
 };
