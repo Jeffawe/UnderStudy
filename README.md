@@ -68,7 +68,7 @@ Settings come from, highest first: real environment variables, `--env-file
 |---|---|
 | `MONGODB_URI` | your Atlas `mongodb+srv://…` string, or local Community |
 | `EMBED_KEY` | optional: a Voyage key, to match goals by meaning (`voyage-4-lite`). Using another model? See below. |
-| `UNDERSTUDY_<REF>` | login values. A recording never stores a password: the field is kept as a name like `SECRET.password`, and at replay Understudy reads the value from `UNDERSTUDY_SECRET_PASSWORD`. Or pass it per run (`--value SECRET.password=…`, or `values` from an agent). Exported tests read the same variable. |
+| `UNDERSTUDY_<REF>` | login values. A recording never stores a password: the field is kept as a name like `SECRET.password`, and at replay Understudy reads the value from `UNDERSTUDY_SECRET_PASSWORD`. Or pass it per run (`--value SECRET.password=…`, or `values` from an agent). Not set? The terminal asks for it (hidden) and offers to save it; an agent is told which line to add to your env file. Exported tests read the same variable. |
 
 ### Using a different embedding model
 

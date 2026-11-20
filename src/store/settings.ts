@@ -7,6 +7,7 @@
  *   1. real environment variables       (e.g. the `env` block of an MCP config)
  *   2. --env-file <path>                 on the command line, CLI or MCP server
  *   3. the env file saved with           `understudy config --env-file <path>`
+ *                                        (none saved: ~/.understudy/understudy.env)
  *   4. .env in the current folder        (handy when developing in the repo)
  *
  * Files never override what's already set, so (1) always wins. Loaded once, on
@@ -61,7 +62,8 @@ export const loadedFrom: string[] = [];
 
 function load() {
   const saved = readConfig().envFile;
-  const candidates = [envFileFlag(), saved && expandHome(saved), resolve('.env')].filter((p): p is string => Boolean(p));
+  // No env file saved yet: the default one, which is where we tell people to put things.
+  const candidates = [envFileFlag(), saved ? expandHome(saved) : join(HOME, 'understudy.env'), resolve('.env')].filter((p): p is string => Boolean(p));
   for (const path of candidates) {
     if (!existsSync(path)) continue;
     loadEnvFile({ path, override: false, quiet: true });
@@ -70,6 +72,16 @@ function load() {
 }
 
 load();
+
+/**
+ * Read the env files again, filling in only what isn't set yet — so a login
+ * value the user just added to their env file is seen without a restart (the
+ * MCP server runs for a whole session).
+ */
+export function reloadEnvFiles(): void {
+  loadedFrom.length = 0;
+  load();
+}
 
 /**
  * The environment variable that holds a login value. A recording never stores

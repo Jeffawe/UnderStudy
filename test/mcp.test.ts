@@ -205,3 +205,34 @@ test('open help', async ({ page }) => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('a missing login value: nothing runs, the agent is told which line goes in which file, and a retry after the user adds it works', { timeout: 120_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'understudy-agent-missing-'));
+  try {
+    const { writeFile } = await import('node:fs/promises');
+    const script = join(dir, 'late.spec.ts');
+    await writeFile(script, `import { test } from '@playwright/test';
+test('log in late', async ({ page }) => {
+  await page.goto('${shop.url}');
+  await page.getByRole('textbox', { name: 'Username' }).fill('demo');
+  await page.getByRole('textbox', { name: 'Password' }).fill(process.env.MCP_LATE_PASSWORD!);
+  await page.getByRole('button', { name: 'Log in' }).click();
+});`);
+    const first = await client.callTool({ name: 'understudy_save', arguments: { app: 'shop', name: 'Log in late', script } });
+    assert.notEqual(first.isError, true, 'an answer to act on, not an error');
+    const r = JSON.parse(text(first));
+    assert.equal(r.saved, false);
+    assert.equal(r.ran, false);
+    assert.deepEqual(r.missingLoginValues, [{ placeholder: 'ENV.MCP_LATE_PASSWORD', setOneOf: ['UNDERSTUDY_SHOP_ENV_MCP_LATE_PASSWORD', 'UNDERSTUDY_ENV_MCP_LATE_PASSWORD', 'MCP_LATE_PASSWORD'] }]);
+    assert.equal(r.envFile, join(home, 'understudy.env'));
+    assert.match(r.next, /never to paste it into chat/);
+    assert.ok(r.retry.hash);
+
+    // The user adds the line to the file; the running server picks it up.
+    await writeFile(r.envFile, "UNDERSTUDY_SHOP_ENV_MCP_LATE_PASSWORD='not-a-real-password'\n");
+    const again = JSON.parse(text(await client.callTool({ name: 'understudy_save', arguments: { app: 'shop', name: 'Log in late', hash: r.retry.hash } })));
+    assert.equal(again.saved, true, JSON.stringify(again));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

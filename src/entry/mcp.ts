@@ -30,6 +30,7 @@ import { collections } from '../store/db.js';
 import { startExtensionRecorder, extensionDir, type ExtensionRecorder } from '../adapters/recorder/extension.js';
 import { saveRecording, loadRecording } from '../core/recording-store.js';
 import { proveAndSave } from '../flows/save.js';
+import { MissingValuesError } from '../flows/execute.js';
 import { parseScript } from '../adapters/recorder/script.js';
 import { setPlaceholders, appPlaceholders } from '../memory/placeholders.js';
 
@@ -55,8 +56,25 @@ const ok = (data: unknown) => ({ content: [{ type: 'text' as const, text: JSON.s
 const err = (e: unknown) => ({ isError: true, content: [{ type: 'text' as const, text: e instanceof Error ? e.message : String(e) }] });
 /** Run a handler, returning its result as JSON or its error as a readable message. */
 const wrap = async (fn: () => Promise<unknown>) => {
-  try { return ok(await fn()); } catch (e) { return err(e); }
+  try { return ok(await fn()); } catch (e) {
+    return e instanceof MissingValuesError ? ok(missingValues(e)) : err(e);
+  }
 };
+
+/**
+ * Login values are missing, and nothing ran. Never ask for the value in chat:
+ * say which line goes in which file, and that a retry re-reads the file.
+ */
+const missingValues = (e: MissingValuesError, retry?: Record<string, unknown>) => ({
+  ran: false,
+  missingLoginValues: e.missing,
+  envFile: e.envFile,
+  next:
+    `Ask the user to add ${e.missing.map((m) => `${m.setOneOf[0]}=<value>`).join(', ')} to ${e.envFile} ` +
+    '(or run `understudy config set …`) — never to paste it into chat — then call this again; the file is re-read. ' +
+    'Or pass a value you fetched yourself in values.',
+  ...(retry ? { retry } : {}),
+});
 /** Drop undefined fields: the zod types allow them, the functions here don't. */
 const defined = <T extends object>(o: T) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as { [K in keyof T]: Exclude<T[K], undefined> };
 
@@ -64,8 +82,8 @@ const defined = <T extends object>(o: T) => Object.fromEntries(Object.entries(o)
 async function continueRun(state: PlanState, opts: { headed?: boolean }) {
   if (state.status !== 'planned' || state.dryRun) return state;
   const values = valuesByRun.get(state.runId) ?? {};
-  valuesByRun.delete(state.runId);
   const { executed, recorded, plan, nowProven } = await runPlan(state.runId, { values, ...opts });
+  valuesByRun.delete(state.runId);
   const r = executed.result;
   return {
     status: r.ok ? 'passed' : 'failed',
@@ -225,11 +243,18 @@ server.registerTool('understudy_save', {
     rec = await loadRecording(hash);
   }
   const hash = rec.hash;
-  const out = await proveAndSave(rec, {
-    title: a.name, madeBy,
-    ...(a.verify === false ? { verify: false, unproven: a.note ? `saved by an agent without a replay: ${a.note}` : 'saved by an agent without a replay' } : {}),
-    ...(a.values ? { values: a.values } : {}), ...(a.intent ? { intent: a.intent } : {}), ...(a.slug ? { slug: a.slug } : {}),
-  });
+  let out;
+  try {
+    out = await proveAndSave(rec, {
+      title: a.name, madeBy,
+      ...(a.verify === false ? { verify: false, unproven: a.note ? `saved by an agent without a replay: ${a.note}` : 'saved by an agent without a replay' } : {}),
+      ...(a.values ? { values: a.values } : {}), ...(a.intent ? { intent: a.intent } : {}), ...(a.slug ? { slug: a.slug } : {}),
+    });
+  } catch (e) {
+    // The recording is kept; saving it again by hash needs nothing re-recorded.
+    if (e instanceof MissingValuesError) return { saved: false, ...missingValues(e, { tool: 'understudy_save', hash, name: a.name }) };
+    throw e;
+  }
   const r = out.proven?.result;
   const base = {
     recording: hash,

@@ -14,7 +14,43 @@ import { loadSession, forgetSession, loadSessionById, forgetSessionById } from '
 import type { RawRecording } from '../core/recording.js';
 import { replay, type ReplayResult } from '../core/replay.js';
 import { foldLessons, lessonsFor } from '../memory/notes.js';
-import { valuesFromEnv, valueEnvNames } from '../store/settings.js';
+import { valuesFromEnv, valueEnvNames, reloadEnvFiles, writableEnvFile } from '../store/settings.js';
+
+/** A login value a recording needs, and where it may be set. */
+export interface MissingValue {
+  placeholder: string;
+  /** Environment variables (or env file lines) that would supply it, most specific first. */
+  setOneOf: string[];
+}
+
+/**
+ * Thrown before any browser opens when login values are missing, so a caller
+ * can ask for them (the terminal) or say where to put them (MCP), then retry.
+ */
+export class MissingValuesError extends Error {
+  readonly missing: MissingValue[];
+  /** The env file Understudy reads, and writes to. */
+  readonly envFile: string;
+  constructor(missing: MissingValue[]) {
+    const envFile = writableEnvFile();
+    super(
+      `missing login value(s) — nothing was run:\n` +
+        missing.map((m) => `- ${m.placeholder}: set ${m.setOneOf.join(' or ')}, or pass it for this run`).join('\n') +
+        `\n  (e.g. add ${missing[0]!.setOneOf[0]}=… to ${envFile})`,
+    );
+    this.name = 'MissingValuesError';
+    this.missing = missing;
+    this.envFile = envFile;
+  }
+}
+
+/** The login values this recording needs that neither `given` nor the environment supply. */
+export function missingValuesFor(recording: RawRecording, given: Record<string, string> = {}): MissingValue[] {
+  reloadEnvFiles();
+  const refs = new Set(recording.events.map((e) => e.valueRef).filter((r): r is string => Boolean(r)));
+  const found = { ...valuesFromEnv(refs, recording.appSlug), ...given };
+  return [...refs].filter((r) => !(r in found)).map((r) => ({ placeholder: r, setOneOf: valueEnvNames(r, recording.appSlug) }));
+}
 
 export interface ExecuteOptions {
   /** Values for steps that deliberately don't store theirs, e.g. { 'SECRET.password': '…' }. */
@@ -44,7 +80,9 @@ export async function execute(recording: RawRecording, opts: ExecuteOptions = {}
         're-record it with --arm-manually',
     );
   }
-  // Login values: given explicitly, else from UNDERSTUDY_<REF> in the environment.
+  // Login values: given explicitly, else from UNDERSTUDY_<REF> in the environment
+  // (env files re-read, so one just added is seen).
+  reloadEnvFiles();
   const refs = new Set(recording.events.map((e) => e.valueRef).filter((r): r is string => Boolean(r)));
   const values = { ...valuesFromEnv(refs, recording.appSlug), ...(opts.values ?? {}) };
   const missingValues = [...refs].filter((r) => !(r in values));
@@ -52,10 +90,7 @@ export async function execute(recording: RawRecording, opts: ExecuteOptions = {}
   // without a password would spend a real login attempt — and some apps lock
   // the account after a few.
   if (missingValues.length) {
-    throw new Error(
-      `missing login value(s) — nothing was run:\n` +
-        missingValues.map((r) => `- ${r}: set ${valueEnvNames(r, recording.appSlug).join(' or ')}, or pass it for this run`).join('\n'),
-    );
+    throw new MissingValuesError(missingValues.map((r) => ({ placeholder: r, setOneOf: valueEnvNames(r, recording.appSlug) })));
   }
 
   // A late-armed recording starts signed in; a cold browser would land on a

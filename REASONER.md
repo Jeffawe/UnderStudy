@@ -60,7 +60,8 @@ Runs plan before any browser opens.
 - **File uploads can't be recorded** — write a Playwright script instead.
 - **Don't save anything irreversible** (a real order): saving replays it.
 - **Logins are often rate-limited**; a missing login value stops a run before
-  it opens a browser, so check `needs` from recall first.
+  it opens a browser, so check `needs` from recall first. The answer names the
+  env file line to add: ask the user to add it, then call again.
 - **"Matched no elements" isn't always a bad selector** — check the page
   rendered at all.
 - **On Atlas, a just-saved flow takes a few seconds to be searchable.**

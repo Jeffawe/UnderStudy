@@ -14,7 +14,7 @@ import { listRecordings, loadRecording, saveRecording } from '../core/recording-
 import { loadSession, saveSession } from '../core/auth-cache.js';
 import { buildRecording, type RawRecording } from '../core/recording.js';
 import type { ReplayResult } from '../core/replay.js';
-import { execute, prove } from '../flows/execute.js';
+import { execute, prove, MissingValuesError } from '../flows/execute.js';
 import { destructiveControls, remember } from '../memory/notes.js';
 import { start, answer, runPlan, type PlanState } from '../plan/planner.js';
 import { distillRequest, saveDistilled } from '../flows/distill.js';
@@ -523,7 +523,8 @@ async function cmdImport(positional: string[], flags: Flags) {
  */
 async function executeWithReport(recording: RawRecording, flags: Flags, opts: { useLessons: boolean }): Promise<ReplayResult> {
   const values = valuesFromFlags(flags);
-  const x = await execute(recording, { values, headed: flags.has('headed'), useLessons: opts.useLessons }).catch((e: Error) => fail(e.message));
+  const x = await withLoginValues(values, (v) => execute(recording, { values: v, headed: flags.has('headed'), useLessons: opts.useLessons }))
+    .catch((e: Error) => fail(e.message));
   if (x.sessionRestoredFrom) console.log(`session: restored (saved ${x.sessionRestoredFrom})`);
   if (x.staleSession) {
     console.log('the restored session did not land where it was recorded, and has been discarded.');
@@ -685,7 +686,8 @@ async function reportPlan(state: PlanState, flags: Flags) {
   }
   console.log();
   const values = valuesFromFlags(flags);
-  const { executed, recorded, nowProven } = await runPlan(state.runId, { values, headed: flags.has('headed') }).catch((e: Error) => fail(e.message));
+  const { executed, recorded, nowProven } = await withLoginValues(values, (v) => runPlan(state.runId, { values: v, headed: flags.has('headed') }))
+    .catch((e: Error) => fail(e.message));
   if (executed.lessons?.fired) console.log(`lessons  ${executed.lessons.fired} fired, ${executed.lessons.helped} on steps that have failed before\n`);
   printReplay(executed.result);
   printRunReport(recorded);
@@ -797,15 +799,102 @@ async function cmdSave(positional: string[], flags: Flags) {
 }
 
 /** Ask a yes/no question in the terminal. No terminal (piped, scripted): the answer is no. */
-async function askYesNo(question: string): Promise<boolean> {
+async function askYesNo(question: string, byDefault = false): Promise<boolean> {
   if (!process.stdin.isTTY) return false;
+  const answer = (await ask(`${question} ${byDefault ? '[Y/n]' : '[y/N]'} `)).trim();
+  return answer ? /^y(es)?$/i.test(answer) : byDefault;
+}
+
+/** Ask for a line in the terminal. */
+async function ask(question: string): Promise<string> {
   const { createInterface } = await import('node:readline/promises');
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
-    return /^y(es)?$/i.test((await rl.question(`${question} [y/N] `)).trim());
+    return await rl.question(question);
   } finally {
     rl.close();
   }
+}
+
+/** Ask for a line without showing it (a password): each key shows as *. */
+function askHidden(question: string): Promise<string> {
+  const stdin = process.stdin;
+  process.stdout.write(question);
+  stdin.setRawMode(true);
+  stdin.setEncoding('utf8');
+  stdin.resume();
+  return new Promise((resolve) => {
+    let typed = '';
+    const done = () => {
+      stdin.off('data', onData);
+      stdin.setRawMode(false);
+      stdin.pause();
+      process.stdout.write('\n');
+      resolve(typed);
+    };
+    const onData = (chunk: string) => {
+      for (const ch of chunk) {
+        if (ch === '\r' || ch === '\n') return done();
+        if (ch === '\u0003') { // Ctrl+C
+          stdin.setRawMode(false);
+          process.stdout.write('\n');
+          process.exit(130);
+        }
+        if (ch === '\u007f' || ch === '\b') {
+          if (typed) { typed = typed.slice(0, -1); process.stdout.write('\b \b'); }
+          continue;
+        }
+        if (ch < ' ') continue;
+        typed += ch;
+        process.stdout.write('*');
+      }
+    };
+    stdin.on('data', onData);
+  });
+}
+
+/**
+ * Run something that needs login values; if some are missing (nothing ran
+ * yet), ask for them in the terminal and run it again. Each one can be typed
+ * — hidden if it's a secret — or put in the env file, then Enter. Typed
+ * values can be saved to the env file so they aren't asked for again.
+ * No terminal: the error says where to put them, and nothing is asked.
+ */
+async function withLoginValues<T>(values: Record<string, string>, attempt: (values: Record<string, string>) => Promise<T>): Promise<T> {
+  for (;;) {
+    try {
+      return await attempt(values);
+    } catch (e) {
+      if (!(e instanceof MissingValuesError) || !process.stdin.isTTY) throw e;
+      values = { ...values, ...(await askForValues(e)) };
+    }
+  }
+}
+
+async function askForValues(e: MissingValuesError): Promise<Record<string, string>> {
+  console.log(`\n${e.missing.length === 1 ? 'a login value is' : 'login values are'} needed to replay this, and not set — nothing has run yet.`);
+  console.log(`type it, or add it to ${e.envFile} and press Enter.  (Ctrl+C to stop)\n`);
+  const typed: Record<string, string> = {};
+  const toSave: Record<string, string> = {};
+  for (const m of e.missing) {
+    const secret = /^SECRET\./i.test(m.placeholder) || /pass|secret|token|key/i.test(m.placeholder);
+    const question = `  ${m.placeholder}${secret ? ' (hidden)' : ''}: `;
+    const value = secret ? await askHidden(question) : (await ask(question)).trim();
+    if (!value) continue; // they put it in the env file — the retry re-reads it
+    typed[m.placeholder] = value;
+    toSave[m.setOneOf[0]!] = value;
+  }
+  if (Object.keys(toSave).length) {
+    const keys = Object.keys(toSave).join(', ');
+    if (await askYesNo(`\n  save ${keys} to ${e.envFile} so you're not asked again?`, true)) {
+      const file = await writeEnvValues(toSave).catch((err: Error) => {
+        console.log(`  couldn't save it: ${err.message} — using it for this run only`);
+      });
+      if (file) console.log(`  saved to ${file} (readable only by you)`);
+    }
+  }
+  console.log();
+  return typed;
 }
 
 /**
@@ -818,15 +907,15 @@ async function saveAndReport(recording: RawRecording, title: string, opts: Omit<
   // No lessons: what gets saved is what the recording does on its own. Proving
   // also works out whether it needs to start signed in (flows/execute.ts: prove).
   let printed = false;
-  const out = await proveAndSave(recording, {
-    title, ...opts,
+  const out = await withLoginValues(opts.values ?? {}, (values) => proveAndSave(recording, {
+    title, ...opts, values,
     keepIfFailed: async (proven) => {
       printReplay(proven.result);
       printed = true;
       console.log('\nthe replay failed, so this would not normally be kept.');
       return askYesNo('keep it anyway, marked unproven (the first run that passes proves it)?');
     },
-  }).catch((e: Error) => fail(e.message));
+  })).catch((e: Error) => fail(e.message));
 
   if (out.proven && !printed) printReplay(out.proven.result);
   const note = out.proven ? signInNote(recording, out.proven.signIn) : undefined;
