@@ -46,7 +46,8 @@
     "understudy": "tsx src/entry/cli.ts",
     "mcp": "tsx src/entry/mcp.ts",
     "extension:build": "tsx scripts/build-extension.ts",
-    "vendor:accname": "node scripts/vendor-accname.mjs"
+    "vendor:accname": "node scripts/vendor-accname.mjs",
+    "prepublishOnly": "npm run typecheck"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
