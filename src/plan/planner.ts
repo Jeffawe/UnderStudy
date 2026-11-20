@@ -189,7 +189,7 @@ async function advance(run: Run): Promise<PlanState> {
 }
 
 /** One recording for the whole plan: each flow's steps, joined by its seam. */
-export async function recordingForPlan(runId: string): Promise<{ run: Run; recording: RawRecording; steps: Step[]; starts: number[] }> {
+export async function recordingForPlan(runId: string): Promise<{ run: Run; recording: RawRecording; steps: Step[]; starts: number[]; unproven: boolean }> {
   const { runs, flows } = await collections();
   const run = await runs.findOne({ _id: new ObjectId(runId) });
   if (!run || run.status !== 'planned') throw new Error(`run ${runId} isn't planned (it is ${run?.status ?? 'missing'})`);
@@ -216,7 +216,7 @@ export async function recordingForPlan(runId: string): Promise<{ run: Run; recor
       : {}),
     events: steps.map((s, seq) => ({ ...s, seq, ts: seq })),
   };
-  return { run, recording, steps, starts };
+  return { run, recording, steps, starts, unproven: chain.some((f) => f.proven === false) };
 }
 
 /**
@@ -224,11 +224,11 @@ export async function recordingForPlan(runId: string): Promise<{ run: Run; recor
  * outcome written onto the same run document.
  */
 export async function runPlan(runId: string, opts: { values?: Record<string, string>; headed?: boolean } = {}) {
-  const { run, recording, steps, starts } = await recordingForPlan(runId);
+  const { run, recording, steps, starts, unproven } = await recordingForPlan(runId);
   const executed = await execute(recording, { ...opts, useLessons: true });
   const recorded = await recordRun({
     app: run.app, flow: run.plan.join('+'), plan: run.plan, goal: run.goal, mode: 'run',
-    result: executed.result, steps, runId: run._id!,
+    result: executed.result, steps, runId: run._id!, ...(unproven ? { unproven: true } : {}),
   });
   // Each unproven flow in a plan that passed is proven now.
   const nowProven: string[] = [];

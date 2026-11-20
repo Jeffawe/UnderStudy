@@ -170,7 +170,11 @@ test('saving without a replay: kept as unproven; the first passing run proves it
   assert.ok(out.flow.steps.every((s) => !s.expectedSig), 'no replay, so no page fingerprints yet');
 
   const { recall } = await import('../src/memory/recall.js');
-  assert.equal((await recall('shop', 'cart-unverified')).best?.proven, false, 'recall says so');
+  const r = await recall('shop', 'cart-unverified');
+  assert.equal(r.best?.proven, false, 'recall says so');
+  assert.match(r.why, /unproven \(saved without a replay\), so it may not work/);
+  const { distillRequest } = await import('../src/flows/distill.js');
+  await assert.rejects(distillRequest('shop', 'cart-unverified'), /is unproven .* run it once/, 'not distilled until proven');
 
   // A passing run proves it.
   const { flows } = await collections();
@@ -183,6 +187,7 @@ test('saving without a replay: kept as unproven; the first passing run proves it
   assert.ok(after.steps.slice(1).every((s) => s.expectedSig), 'each step now knows the page it lands on');
   assert.ok(after.endState?.startsWith('/cart'));
   assert.equal(await proveByRun('shop', 'cart-unverified', result), false, 'already proven: nothing to do');
+  assert.ok((await distillRequest('shop', 'cart-unverified')).flow, 'proven now, so it can be distilled');
 });
 
 test('a failed replay is refused unless the caller keeps it — then it is unproven, and its run is recorded', { timeout: 120_000 }, async () => {
@@ -206,4 +211,12 @@ test('a failed replay is refused unless the caller keeps it — then it is unpro
   assert.equal(kept.run?.drift.firstRun, true, 'the failed run is still on record');
   const { runs } = await collections();
   assert.equal((await runs.findOne({ app: 'shop', plan: ['broken'] }))?.status, 'failed');
+});
+
+test('on a tie, recall puts a proven flow ahead of an unproven one', async () => {
+  const { rank } = await import('../src/memory/recall.js');
+  const m = (slug: string, score: number, proven: boolean) =>
+    ({ slug, title: slug, kind: 'recording' as const, madeBy: 'user' as const, proven, score, destructive: false, requiresSession: false });
+  assert.deepEqual(rank([m('shaky', 0.81, false), m('solid', 0.81, true), m('low', 0.5, true)]).map((x) => x.slug), ['solid', 'shaky', 'low']);
+  assert.deepEqual(rank([m('shaky', 0.9, false), m('solid', 0.81, true)]).map((x) => x.slug), ['shaky', 'solid'], 'a clearly better match still wins');
 });

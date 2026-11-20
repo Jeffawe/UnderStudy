@@ -6,8 +6,8 @@
  *   saveDistilled(app, flow, answer)   → validated; every problem at once; nothing
  *                                        written unless the whole answer is clean
  *
- * No replay here: a saved flow was already proven when it was saved, so its
- * steps and the page each one reached are on record.
+ * No replay here: a saved flow was proven when it was saved (or by a run since —
+ * unproven ones are refused), so its steps and the page each one reached are on record.
  */
 
 import { buildDistillRequest, validateDistilled, type Distilled, type DistillRequest } from '../core/distill.js';
@@ -25,6 +25,11 @@ async function loadFlow(app: string, slug: string): Promise<Flow> {
   const flow = await flows.findOne({ app, slug });
   if (!flow) throw new Error(`no flow '${slug}' for app '${app}'`);
   if (flow.kind !== 'recording') throw new Error(`'${slug}' is a segment — distill the recording it came from (${flow.from?.flow})`);
+  // Distilling trusts every step to have passed; an unproven one may not have,
+  // and its segments would carry the bad step into other plans.
+  if (flow.proven === false) {
+    throw new Error(`'${slug}' is unproven (${flow.unprovenBecause ?? 'never replayed cleanly'}) — run it once; when a run passes it's proven, and can be distilled`);
+  }
   return flow;
 }
 

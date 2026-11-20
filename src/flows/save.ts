@@ -181,7 +181,7 @@ export async function proveAndSave(recording: RawRecording, opts: ProveAndSave):
   }
   const saved = await saveFlow(proven.recording, proven.result, { ...opts, ...(unproven ? { unproven } : {}) });
   const { flow, placeholders } = await withPlaceholders(saved);
-  const run = await recordRun({ app: flow.app, flow: flow.slug, result: proven.result, steps: flow.steps });
+  const run = await recordRun({ app: flow.app, flow: flow.slug, result: proven.result, steps: flow.steps, ...(flow.proven === false ? { unproven: true } : {}) });
   return { saved: true, verified: proven.result.ok, proven, flow, run, placeholders };
 }
 

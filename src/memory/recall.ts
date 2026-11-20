@@ -27,6 +27,8 @@ export interface FlowMatch {
   madeBy: 'user' | 'agent';
   /** False: kept without a passing replay — may not work. */
   proven: boolean;
+  /** Why it's unproven, when it is. */
+  unprovenBecause?: string;
   score: number;
   destructive: boolean;
   requiresSession: boolean;
@@ -131,9 +133,22 @@ export function wordScore(goal: string, flow: Pick<Flow, 'slug' | 'title' | 'int
 }
 
 const toMatch = (f: Flow & { score?: number }, score: number): FlowMatch => ({
-  slug: f.slug, title: f.title, kind: f.kind, madeBy: f.madeBy ?? 'user', proven: f.proven !== false, score,
+  slug: f.slug, title: f.title, kind: f.kind, madeBy: f.madeBy ?? 'user', proven: f.proven !== false,
+  ...(f.proven === false && f.unprovenBecause ? { unprovenBecause: f.unprovenBecause } : {}), score,
   destructive: f.destructive, requiresSession: f.requiresSession,
 });
+
+/** Scores this close are a tie. */
+const TIE = 0.005;
+
+/** Highest score first; on a tie, a proven flow ahead of an unproven one. */
+export function rank(matches: FlowMatch[]): FlowMatch[] {
+  return [...matches].sort((a, b) => (Math.abs(a.score - b.score) <= TIE ? Number(b.proven) - Number(a.proven) || b.score - a.score : b.score - a.score));
+}
+
+/** The verdict's reason, plus a warning when the flow it picked may not work. */
+const withProven = (why: string, best: FlowMatch | undefined) =>
+  best && !best.proven ? `${why} — but '${best.slug}' is unproven (${best.unprovenBecause ?? 'no passing run yet'}), so it may not work` : why;
 
 /** The best flow's steps and the login values they need, for an agent driving it itself. */
 async function plan(app: string, slug: string): Promise<Pick<Recall, 'steps' | 'needs'>> {
@@ -175,7 +190,7 @@ export async function recall(app: string, goal: string, opts: { limit?: number; 
   );
   if (exact) {
     const best = toMatch(exact, 1);
-    return { goal, method: 'exact', verdict: 'known', best, why: `named exactly`, flows: [best], notes: [], ...(opts.withSteps ? await plan(app, best.slug) : {}) };
+    return { goal, method: 'exact', verdict: 'known', best, why: withProven('named exactly', best), flows: [best], notes: [], ...(opts.withSteps ? await plan(app, best.slug) : {}) };
   }
 
   // 2. By meaning, if there's a model.
@@ -185,25 +200,24 @@ export async function recall(app: string, goal: string, opts: { limit?: number; 
       vectorSearch(c.flows, app, vector!, { limit }),
       vectorSearch(c.notes, app, vector!, { limit }),
     ]);
-    const matches = flows.map((f) => toMatch(f, f.score));
+    const matches = rank(flows.map((f) => toMatch(f, f.score)));
     const { verdict, why } = judge(matches.map((m) => m.score), MEANING);
     return {
-      goal, method: 'meaning', verdict, why, flows: matches,
+      goal, method: 'meaning', verdict, why: verdict === 'known' ? withProven(why, matches[0]) : why, flows: matches,
       ...(verdict === 'known' ? { best: matches[0]!, ...(opts.withSteps ? await plan(app, matches[0]!.slug) : {}) } : {}),
       notes: notes.map((n) => ({ kind: n.kind, text: n.text, score: n.score })),
     };
   }
 
   // 3. By words, with no model. Corpora are small, so scoring every flow is fine.
-  const all = await c.flows.find({ app }, { projection: { slug: 1, title: 1, intent: 1, kind: 1, madeBy: 1, proven: 1, destructive: 1, requiresSession: 1 } }).toArray();
+  const all = await c.flows.find({ app }, { projection: { slug: 1, title: 1, intent: 1, kind: 1, madeBy: 1, proven: 1, unprovenBecause: 1, destructive: 1, requiresSession: 1 } }).toArray();
   const matches = all
     .map((f) => toMatch(f as Flow, wordScore(goal, f as Flow)))
-    .filter((m) => m.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
-  const { verdict, why } = judge(matches.map((m) => m.score), WORDS);
+    .filter((m) => m.score > 0);
+  const ranked = rank(matches).slice(0, limit);
+  const { verdict, why } = judge(ranked.map((m) => m.score), WORDS);
   return {
-    goal, method: 'words', verdict, why, flows: matches, notes: [],
-    ...(verdict === 'known' ? { best: matches[0]!, ...(opts.withSteps ? await plan(app, matches[0]!.slug) : {}) } : {}),
+    goal, method: 'words', verdict, why: verdict === 'known' ? withProven(why, ranked[0]) : why, flows: ranked, notes: [],
+    ...(verdict === 'known' ? { best: ranked[0]!, ...(opts.withSteps ? await plan(app, ranked[0]!.slug) : {}) } : {}),
   };
 }

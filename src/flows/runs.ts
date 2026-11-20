@@ -41,6 +41,12 @@ export async function recordRun(opts: {
   goal?: string;
   /** The flows run, in order, when it was more than one. Defaults to [flow]. */
   plan?: string[];
+  /**
+   * A flow in this run is unproven. If the run fails, what it saw may come from
+   * the recording being wrong (landing on a page the flow never meant to), not
+   * the app — its findings say so.
+   */
+  unproven?: boolean;
   /** Fill in this existing run (one that was planned first) instead of adding a new one. */
   runId?: ObjectId;
   startedAt?: Date;
@@ -66,6 +72,9 @@ export async function recordRun(opts: {
   // 2. Findings.
   const name = plan.join(' + ');
   const drafts = extractFindings(result, name);
+  if (opts.unproven && !result.ok) {
+    for (const d of drafts) d.evidence = { ...d.evidence, fromUnprovenFlow: 'a failed run of an unproven flow — may be the recording, not the app' };
+  }
   const fromDrift = driftFinding(name, drift);
   if (fromDrift) drafts.push(fromDrift);
   await saveFindings(c.findings, app, drafts, now);

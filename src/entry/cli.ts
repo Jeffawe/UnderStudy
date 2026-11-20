@@ -573,7 +573,9 @@ async function runSavedFlow(app: string, slug: string, flags: Flags, how: { mode
   if (flow.proven === false) console.log(`note: '${slug}' is UNPROVEN (${flow.unprovenBecause}) — this run will tell.\n`);
   const result = await executeWithReport(recordingFrom(flow), flags, { useLessons: true });
   printReplay(result);
-  const run = await recordRun({ app, flow: slug, result, steps: flow.steps, mode: how.mode, ...(how.goal ? { goal: how.goal } : {}) });
+  const run = await recordRun({
+    app, flow: slug, result, steps: flow.steps, mode: how.mode, ...(how.goal ? { goal: how.goal } : {}), ...(flow.proven === false ? { unproven: true } : {}),
+  });
   if (await proveByRun(app, slug, result)) console.log(`\nproven   '${slug}' passed, so it's no longer marked unproven`);
   printRunReport(run);
   if (!result.ok) process.exitCode = 3;
@@ -962,7 +964,7 @@ async function cmdFindings(positional: string[], flags: Flags) {
     return;
   }
   for (const f of rows) {
-    console.log(`  ${f.severity.padEnd(6)} ×${String(f.occurrences).padEnd(4)} ${f.kind.padEnd(14)} ${f.statement.slice(0, 110)}`);
+    console.log(`  ${f.severity.padEnd(6)} ×${String(f.occurrences).padEnd(4)} ${f.kind.padEnd(14)} ${f.statement.slice(0, 110)}${f.evidence?.fromUnprovenFlow ? '  [from an unproven flow — may be the recording]' : ''}`);
   }
 }
 
