@@ -180,3 +180,28 @@ test('log in by email', async ({ page }) => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('an agent can skip the replay with verify: false — saved, but recall says it is unproven', { timeout: 120_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'understudy-agent-noverify-'));
+  try {
+    const { writeFile } = await import('node:fs/promises');
+    const script = join(dir, 'missing.spec.ts');
+    // Would fail a replay: the shop has no such link. Skipping the replay keeps it anyway.
+    await writeFile(script, `import { test } from '@playwright/test';
+test('open help', async ({ page }) => {
+  await page.goto('${shop.url}');
+  await page.getByRole('link', { name: 'Help' }).click();
+});`);
+    const saved = JSON.parse(text(await client.callTool({
+      name: 'understudy_save',
+      arguments: { app: 'shop', name: 'Open help', script, verify: false, note: 'help link is behind a feature flag' },
+    })));
+    assert.equal(saved.saved, true, JSON.stringify(saved));
+    assert.equal(saved.replayed, false);
+    assert.ok(saved.unproven, 'the answer says so');
+    const recall = JSON.parse(text(await client.callTool({ name: 'understudy_recall', arguments: { app: 'shop', goal: 'open-help' } })));
+    assert.equal(recall.best.proven, false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

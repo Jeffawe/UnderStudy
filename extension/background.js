@@ -72,14 +72,14 @@ function startRecording(tabId, opts = {}) {
   return (starting ??= doStart(tabId, opts).finally(() => { starting = null; }));
 }
 
-async function doStart(tabId, { signedIn = false } = {}) {
+async function doStart(tabId, { signedIn = false, save = true } = {}) {
   if (await current()) throw new Error('Already recording — stop that one first.');
-  const { app, token, started } = await hello();
+  const { app, token, started, savedBy = 'terminal' } = await hello();
   if (started) throw new Error('That Understudy recording has already started. Run the command again for a new one.');
   const tab = await chrome.tabs.get(tabId);
   const storageState = await captureSession(tab);
   await post('/start', { token, url: tab.url, storageState, signedIn });
-  await chrome.storage.session.set({ rec: { tabId, token, app, origin: new URL(tab.url).origin } });
+  await chrome.storage.session.set({ rec: { tabId, token, app, origin: new URL(tab.url).origin, save, savedBy } });
   await inject(tabId);
   await chrome.action.setBadgeText({ tabId, text: 'REC' });
   await chrome.action.setBadgeBackgroundColor({ tabId, color: '#c62828' });
@@ -108,14 +108,15 @@ async function onPermissionAdded({ origins = [] }) {
   if (!origins.some((o) => o.replace(/\/\*$/, '') === pending.origin)) return;
   await chrome.storage.session.remove('pending');
   try {
-    await startRecording(pending.tabId, { signedIn: pending.signedIn });
+    await startRecording(pending.tabId, { signedIn: pending.signedIn, save: pending.save !== false });
   } catch (e) {
     if (!/Already recording/.test(e.message)) await noteFailure(pending.tabId, e.message);
   }
 }
 chrome.permissions.onAdded.addListener(onPermissionAdded);
 
-async function stopRecording() {
+/** Stop. `name` (when the user ticked "Save as a flow when I stop"): the terminal proves and saves it under that name. */
+async function stopRecording({ name } = {}) {
   const rec = await current();
   if (!rec) return { stopped: false };
   // A field still being typed in hasn't been sent yet; flush it.
@@ -126,8 +127,9 @@ async function stopRecording() {
   await queue;
   await chrome.storage.session.remove('rec');
   await chrome.action.setBadgeText({ tabId: rec.tabId, text: '' }).catch(() => {});
-  const { events } = await post('/stop', { token: rec.token });
-  return { stopped: true, events };
+  const saving = Boolean(name) && rec.save && rec.savedBy !== 'agent';
+  const { events, hash } = await post('/stop', { token: rec.token, ...(saving ? { name } : {}) });
+  return { stopped: true, events, hash, saving, savedBy: rec.savedBy };
 }
 
 // Events go out one at a time, in the order they happened.
@@ -154,8 +156,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await chrome.storage.session.remove('lastError');
       return { rec: (await current()) ?? null, lastError: lastError ?? null, cli: await hello().catch((e) => ({ error: e.message })) };
     },
-    'understudy:start': () => startRecording(msg.tabId, { signedIn: Boolean(msg.signedIn) }),
-    'understudy:stop': () => stopRecording(),
+    'understudy:start': () => startRecording(msg.tabId, { signedIn: Boolean(msg.signedIn), save: msg.save !== false }),
+    'understudy:stop': () => stopRecording({ name: msg.name }),
   };
   const handler = handlers[msg.type];
   if (!handler) return false;

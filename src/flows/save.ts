@@ -15,9 +15,10 @@ import type { Flow, Step } from '../store/types.js';
 import { collections, ensureSchema } from '../store/db.js';
 import { embed, embedderConfig } from '../store/embed.js';
 import { flowDestructiveReason } from './destructive.js';
-import { prove } from './execute.js';
-import { recordRun } from './runs.js';
-import { applyPlaceholders } from '../memory/placeholders.js';
+import { prove, type Proven } from './execute.js';
+import { forgetSessionById } from '../core/auth-cache.js';
+import { recordRun, type RecordedRun } from './runs.js';
+import { applyPlaceholders, type Applied } from '../memory/placeholders.js';
 
 /** "Log in as a member!" → "log-in-as-a-member" */
 export function slugify(title: string): string {
@@ -61,6 +62,8 @@ export interface SaveOptions {
   intent?: string;
   /** 'agent' when an agent drove it and handed over the script. Default 'user'. */
   madeBy?: 'user' | 'agent';
+  /** Set when it's being kept without a passing replay: why. Marks the flow unproven. */
+  unproven?: string;
 }
 
 export async function saveFlow(recording: RawRecording, result: ReplayResult, opts: SaveOptions): Promise<Flow> {
@@ -98,6 +101,7 @@ export async function saveFlow(recording: RawRecording, result: ReplayResult, op
     steps,
     searchText,
     ...(embedding ? { embedding } : {}),
+    ...(opts.unproven ? { proven: false, unprovenBecause: opts.unproven } : {}),
     updatedAt: now,
   };
 
@@ -107,6 +111,7 @@ export async function saveFlow(recording: RawRecording, result: ReplayResult, op
   if (!embedding) unset.embedding = '';
   if (!why) unset.destructiveBecause = '';
   if (!recording.entry?.session) unset.session = '';
+  if (!opts.unproven) { unset.proven = ''; unset.unprovenBecause = ''; }
   await flows.updateOne(
     { app, slug },
     { $set: flow, $setOnInsert: { createdAt: now }, ...(Object.keys(unset).length ? { $unset: unset } : {}) },
@@ -127,23 +132,83 @@ export interface ProveAndSave extends SaveOptions {
   /** Login values, if not in the environment as UNDERSTUDY_<REF>. */
   values?: Record<string, string>;
   headed?: boolean;
-  /** Save even though the proving replay failed (it stays marked by its failing run). */
+  /**
+   * false: keep it without replaying it — e.g. it ends in a real purchase, or
+   * the caller already knows it works. It's saved as unproven; the first run
+   * that passes proves it.
+   */
+  verify?: boolean;
+  /** Keep it even though the replay failed (saved as unproven). */
   force?: boolean;
+  /** Asked when the replay fails: keep it anyway, as unproven? (The terminal asks the user.) */
+  keepIfFailed?: (proven: Proven) => Promise<boolean>;
 }
+
+export type SaveOutcome =
+  | { saved: false; proven: Proven }
+  | { saved: true; verified: boolean; proven?: Proven; flow: Flow; run?: RecordedRun; placeholders: Applied };
 
 /**
  * What `save` does, for the CLI and the MCP server alike: prove the recording
  * (replaying it headless, working out whether it needs to start signed in),
- * then — only if it passed — store it as a flow and record that first run.
+ * then store it as a flow and record that first run. A recording that fails
+ * its replay is only kept if the caller says so (force / keepIfFailed), and
+ * then as unproven. With verify: false there's no replay at all.
  */
-export async function proveAndSave(recording: RawRecording, opts: ProveAndSave) {
+export async function proveAndSave(recording: RawRecording, opts: ProveAndSave): Promise<SaveOutcome> {
+  if (opts.verify === false) {
+    // No replay, so nothing can say whether a copied sign-in is needed. Unless
+    // the user said it is (ticked "I'm signed in here"), don't keep it.
+    let rec = recording;
+    if (rec.entry?.session && !rec.entry.requiresSession) {
+      await forgetSessionById(rec.appSlug, rec.entry.session);
+      const { session: _gone, ...rest } = rec.entry;
+      rec = { ...rec };
+      if (Object.keys(rest).length) rec.entry = rest;
+      else delete rec.entry;
+    }
+    const none = { ok: true, steps: [], sigSequence: [], signals: [], durationMs: 0 } as unknown as ReplayResult;
+    const flow = await saveFlow(rec, none, { ...opts, unproven: opts.unproven ?? 'saved without a replay' });
+    return { saved: true, verified: false, ...(await withPlaceholders(flow)) };
+  }
+
   const proven = await prove(recording, { ...(opts.values ? { values: opts.values } : {}), ...(opts.headed ? { headed: true } : {}) });
-  if (!proven.result.ok && !opts.force) return { saved: false as const, proven };
-  let flow = await saveFlow(proven.recording, proven.result, opts);
-  // The app keeps email fields as placeholders? Convert now — AFTER proving,
-  // so proving used the real address and needed no settings.
-  const placeholders = await applyPlaceholders(flow.app, undefined, flow.slug);
-  if (placeholders.converted.length) flow = (await (await collections()).flows.findOne({ _id: flow._id! }))!;
+  let unproven = opts.unproven;
+  if (!proven.result.ok) {
+    const keep = opts.force || (opts.keepIfFailed ? await opts.keepIfFailed(proven) : false);
+    if (!keep) return { saved: false, proven };
+    unproven ??= 'its replay failed, and it was kept anyway';
+  }
+  const saved = await saveFlow(proven.recording, proven.result, { ...opts, ...(unproven ? { unproven } : {}) });
+  const { flow, placeholders } = await withPlaceholders(saved);
   const run = await recordRun({ app: flow.app, flow: flow.slug, result: proven.result, steps: flow.steps });
-  return { saved: true as const, proven, flow, run, placeholders };
+  return { saved: true, verified: proven.result.ok, proven, flow, run, placeholders };
+}
+
+/** The app keeps email fields as placeholders? Convert now — after proving, which used the real address. */
+async function withPlaceholders(flow: Flow): Promise<{ flow: Flow; placeholders: Applied }> {
+  const placeholders = await applyPlaceholders(flow.app, undefined, flow.slug);
+  if (!placeholders.converted.length) return { flow, placeholders };
+  return { flow: (await (await collections()).flows.findOne({ _id: flow._id! }))!, placeholders };
+}
+
+/**
+ * An unproven flow that just passed a run is proven now: mark it, and fill in
+ * what its missing replay would have recorded — the page each step lands on,
+ * and where it starts and ends. `offset` skips steps the run added in front.
+ */
+export async function proveByRun(app: string, slug: string, result: ReplayResult, offset = 0): Promise<boolean> {
+  if (!result.ok) return false;
+  const { flows } = await collections();
+  const flow = await flows.findOne({ app, slug, proven: false });
+  if (!flow) return false;
+  const sigAt = new Map(result.steps.map((s) => [s.seq - offset, s.sig]));
+  const steps = flow.steps.map((s, i) => (sigAt.get(i) ? { ...s, expectedSig: sigAt.get(i)! } : s));
+  const first = offset > 0 ? result.steps.find((s) => s.seq === offset - 1)?.sig : result.sigSequence[0];
+  const last = sigAt.get(flow.steps.length - 1);
+  await flows.updateOne({ _id: flow._id! }, {
+    $set: { steps, ...(first && !flow.startState ? { startState: first } : {}), ...(last ? { endState: last } : {}), updatedAt: new Date() },
+    $unset: { proven: '', unprovenBecause: '' },
+  });
+  return true;
 }

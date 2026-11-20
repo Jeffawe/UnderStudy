@@ -55,9 +55,16 @@ in the terminal to start recording from there.
      machine (`.understudy/sessions/`, readable only by you), never sent
      anywhere else.
 4. Use the page as normal. The icon shows **REC**.
-5. Click the icon → **Stop and save** (or press Ctrl+C in the terminal).
-6. The terminal prints a hash. Then: `understudy save <hash> "<what it does>"`
-   — that replays it headless to prove it works, then keeps it.
+5. Click the icon → say what the flow does → **Stop**. With **Save as a flow
+   when I stop** ticked (the default), the terminal replays it headless to
+   prove it works, then keeps it.
+6. Unticked, it's only recorded: the popup shows the command to save it later,
+   `understudy save <hash> "<what it does>"`. (Ctrl+C in the terminal also
+   stops.) If an agent started the recording, the agent saves it.
+
+If the replay fails — say the page started in a state the replay can't repeat —
+the terminal asks whether to keep it anyway. Kept, it's marked **unproven**
+until a run of it passes.
 
 ## What it can't record
 

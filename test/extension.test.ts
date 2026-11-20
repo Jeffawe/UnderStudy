@@ -52,22 +52,25 @@ after(async () => {
 });
 
 /** Point the extension at a recorder, open the shop, and start recording on that tab. */
-async function startOn(url: string, opts: { signedIn?: boolean } = {}) {
-  const rec = await startExtensionRecorder({ appSlug: 'shop', port: 0 });
+async function startOn(url: string, opts: { signedIn?: boolean; save?: boolean; savedBy?: 'terminal' | 'agent' } = {}) {
+  const rec = await startExtensionRecorder({ appSlug: 'shop', port: 0, savedBy: opts.savedBy });
   const port = Number(new URL(rec.url).port);
   await worker.evaluate((p) => chrome.storage.local.set({ port: p }), port);
   const page = await browser.newPage();
   await page.goto(url);
   const tabId = await worker.evaluate(async (u) => (await chrome.tabs.query({ url: `${u}*` }))[0]!.id!, url.replace(/\/[^/]*$/, '/'));
   const started = await worker.evaluate(
-    ([id, signedIn]) => (self as unknown as { understudy: { startRecording: Function } }).understudy.startRecording(id, { signedIn }),
-    [tabId, Boolean(opts.signedIn)] as const,
+    ([id, signedIn, save]) => (self as unknown as { understudy: { startRecording: Function } }).understudy.startRecording(id, { signedIn, save }),
+    [tabId, Boolean(opts.signedIn), opts.save ?? true] as const,
   );
   assert.equal((started as { app: string }).app, 'shop');
   return { rec, page };
 }
 
-const stop = () => worker.evaluate(() => (self as unknown as { understudy: { stopRecording: Function } }).understudy.stopRecording());
+const stop = (name?: string) =>
+  worker.evaluate((n) => (self as unknown as { understudy: { stopRecording: Function } }).understudy.stopRecording({ name: n }), name) as Promise<{
+    stopped: boolean; hash?: string; saving?: boolean; savedBy?: string;
+  }>;
 const brief = (events: { action: string; role?: string; name?: string; value?: string; valueRef?: string }[]) =>
   events.map((e) => [e.action, e.role, e.name, e.valueRef ?? e.value].filter(Boolean).join(' '));
 
@@ -242,4 +245,31 @@ test('a start that fails after the popup closed shows up as a red ! and a messag
   assert.match(lastError, /Understudy is not waiting/);
   await page.close();
   await worker.evaluate(() => chrome.storage.session.remove('lastError'));
+});
+
+test('"Save as a flow when I stop": a name at stop hands the terminal a flow to save; unticked, it gives the hash to save later', { timeout: 120_000 }, async () => {
+  for (const [save, name, saving] of [[true, 'Open the cart', true], [false, 'ignored', false]] as const) {
+    const { rec, page } = await startOn(shop.url, { save });
+    await page.getByRole('textbox', { name: 'Username' }).fill('demo');
+    await page.waitForTimeout(200);
+    const r = await stop(name);
+    const out = await rec.done;
+    await page.close();
+    assert.equal(r.saving, saving);
+    assert.equal(r.savedBy, 'terminal');
+    assert.equal(r.hash, out.recording.hash, 'the popup can show "understudy save <hash>"');
+    assert.equal(out.saveAs, saving ? name : undefined);
+  }
+});
+
+test('an agent that started the recording saves it itself: a name from the popup is ignored', { timeout: 120_000 }, async () => {
+  const { rec, page } = await startOn(shop.url, { savedBy: 'agent' });
+  await page.getByRole('textbox', { name: 'Username' }).fill('demo');
+  await page.waitForTimeout(200);
+  const r = await stop('Not the user\'s call');
+  const out = await rec.done;
+  await page.close();
+  assert.equal(r.savedBy, 'agent');
+  assert.equal(r.saving, false);
+  assert.equal(out.saveAs, undefined);
 });

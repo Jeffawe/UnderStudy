@@ -93,6 +93,8 @@ a few goals with `understudy recall` first.
 ```bash
 understudy record myapp                     # record in your own browser, with the extension
 understudy save <hash> "log in as a member" # prove it by replaying, then keep it
+                                            #   --no-verify keeps it without a replay (unproven)
+                                            #   --force keeps it even if the replay fails
 understudy flows myapp                      # what it knows how to do
 understudy replay myapp log-in-as-a-member  # run one flow
 understudy run myapp "sign in"              # find the flow for a goal, and run it
@@ -101,7 +103,8 @@ understudy emit myapp log-in-as-a-member    # print it as a Playwright (or Cypre
 understudy app myapp --placeholder email    # keep email addresses out of memory (moves them to your env file)
 ```
 
-`understudy --help` lists everything. A flow that commits something real — a
+An unproven flow is marked as such in `flows` and recall; the first run of
+it that passes proves it. `understudy --help` lists everything. A flow that commits something real — a
 purchase, a deletion — is marked destructive and refused unless you pass
 `--allow-purchases`.
 

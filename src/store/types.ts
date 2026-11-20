@@ -56,6 +56,14 @@ export interface Flow {
    * (flows saved before this field existed were all recordings).
    */
   madeBy?: 'user' | 'agent';
+  /**
+   * False when it was kept without a passing replay (skipped, or kept after
+   * failing). Missing = proven. The first run that passes sets it back, and
+   * fills in what a replay records: the page each step lands on.
+   */
+  proven?: boolean;
+  /** Why it's unproven, e.g. "saved without a replay". */
+  unprovenBecause?: string;
   /** Segments only: the flow it was cut from, and which of its steps ([start, end)). */
   from?: { flow: string; steps: [number, number] };
   preconditions: Precondition[];

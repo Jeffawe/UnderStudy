@@ -23,7 +23,7 @@ import { join, resolve as resolvePath } from 'node:path';
 import { existsSync } from 'node:fs';
 import { chromium } from 'playwright';
 import { emitFlow, type Framework } from '../flows/emit.js';
-import { recordingFrom, proveAndSave } from '../flows/save.js';
+import { recordingFrom, proveAndSave, proveByRun, type ProveAndSave } from '../flows/save.js';
 import { recordRun, type RecordedRun } from '../flows/runs.js';
 import { recall, type Recall } from '../memory/recall.js';
 import { setPlaceholders, appPlaceholders } from '../memory/placeholders.js';
@@ -418,6 +418,12 @@ async function cmdRecordExtension(slug: string, flags: Flags) {
     console.log(`\n${out.droppedUploads} file upload(s) NOT recorded — a page can't say which file was chosen.`);
     console.log('  write that part as a Playwright script and `understudy import` it instead.');
   }
+  if (out.saveAs) {
+    // Ticked "Save as a flow when I stop": prove and save it now, here.
+    console.log(`\nsaving it as "${out.saveAs}" (you ticked "Save as a flow when I stop")\n`);
+    await saveAndReport(out.recording, out.saveAs, { values: valuesFromFlags(flags) });
+    return;
+  }
   if (out.sessionPath) {
     console.log(out.recording.entry?.requiresSession
       ? '\nyou said you were signed in: replay starts from your sign-in (saved locally, 0600).'
@@ -563,9 +569,11 @@ async function runSavedFlow(app: string, slug: string, flags: Flags, how: { mode
   }
 
   console.log(`running ${app}/${slug} — ${flow.title}\n`);
+  if (flow.proven === false) console.log(`note: '${slug}' is UNPROVEN (${flow.unprovenBecause}) — this run will tell.\n`);
   const result = await executeWithReport(recordingFrom(flow), flags, { useLessons: true });
   printReplay(result);
   const run = await recordRun({ app, flow: slug, result, steps: flow.steps, mode: how.mode, ...(how.goal ? { goal: how.goal } : {}) });
+  if (await proveByRun(app, slug, result)) console.log(`\nproven   '${slug}' passed, so it's no longer marked unproven`);
   printRunReport(run);
   if (!result.ok) process.exitCode = 3;
 }
@@ -578,7 +586,7 @@ function printRecall(r: Recall, showSteps = false) {
   if (r.flows.length) {
     console.log('flows');
     for (const f of r.flows) {
-      const marks = [f.destructive && 'DESTRUCTIVE', f.requiresSession && 'needs session', f.kind === 'segment' && 'segment'].filter(Boolean).join(', ');
+      const marks = [f.proven === false && 'UNPROVEN', f.destructive && 'DESTRUCTIVE', f.requiresSession && 'needs session', f.kind === 'segment' && 'segment'].filter(Boolean).join(', ');
       console.log(`  ${f.score.toFixed(3)}  ${f.slug.padEnd(32)} ${f.title}${marks ? `  [${marks}]` : ''}`);
     }
   }
@@ -677,10 +685,11 @@ async function reportPlan(state: PlanState, flags: Flags) {
   }
   console.log();
   const values = valuesFromFlags(flags);
-  const { executed, recorded } = await runPlan(state.runId, { values, headed: flags.has('headed') }).catch((e: Error) => fail(e.message));
+  const { executed, recorded, nowProven } = await runPlan(state.runId, { values, headed: flags.has('headed') }).catch((e: Error) => fail(e.message));
   if (executed.lessons?.fired) console.log(`lessons  ${executed.lessons.fired} fired, ${executed.lessons.helped} on steps that have failed before\n`);
   printReplay(executed.result);
   printRunReport(recorded);
+  for (const slug of nowProven) console.log(`proven   '${slug}' passed, so it's no longer marked unproven`);
   if (!executed.result.ok) process.exitCode = 3;
 }
 
@@ -777,32 +786,63 @@ async function cmdSave(positional: string[], flags: Flags) {
   if (!hash || !titleWords.length) {
     fail('save needs a recording hash and a name', 'understudy save <hash> "log in as a member"');
   }
-  const title = titleWords.join(' ');
   const recording = await loadRecording(hash).catch(() => fail(`no recording '${hash}'`, 'understudy recordings'));
-
-  console.log(`proving ${hash} by replaying it…\n`);
-  const values = valuesFromFlags(flags);
   const slug = str(flags.get('slug'));
   const intent = str(flags.get('intent'));
+  await saveAndReport(recording, titleWords.join(' '), {
+    values: valuesFromFlags(flags), headed: flags.has('headed'),
+    verify: !flags.has('no-verify'), force: flags.has('force'),
+    ...(slug ? { slug } : {}), ...(intent ? { intent } : {}),
+  });
+}
+
+/** Ask a yes/no question in the terminal. No terminal (piped, scripted): the answer is no. */
+async function askYesNo(question: string): Promise<boolean> {
+  if (!process.stdin.isTTY) return false;
+  const { createInterface } = await import('node:readline/promises');
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return /^y(es)?$/i.test((await rl.question(`${question} [y/N] `)).trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Prove a recording and keep it as a flow, saying what happened. Used by
+ * `save`, and by `record` when the extension's "Save as a flow when I stop" is ticked.
+ */
+async function saveAndReport(recording: RawRecording, title: string, opts: Omit<ProveAndSave, 'title' | 'keepIfFailed'>) {
+  if (opts.verify === false) console.log('saving without a replay — it will be marked unproven until a run passes\n');
+  else console.log(`proving ${recording.hash} by replaying it…\n`);
   // No lessons: what gets saved is what the recording does on its own. Proving
   // also works out whether it needs to start signed in (flows/execute.ts: prove).
+  let printed = false;
   const out = await proveAndSave(recording, {
-    title, values, headed: flags.has('headed'), force: flags.has('force'),
-    ...(slug ? { slug } : {}), ...(intent ? { intent } : {}),
+    title, ...opts,
+    keepIfFailed: async (proven) => {
+      printReplay(proven.result);
+      printed = true;
+      console.log('\nthe replay failed, so this would not normally be kept.');
+      return askYesNo('keep it anyway, marked unproven (the first run that passes proves it)?');
+    },
   }).catch((e: Error) => fail(e.message));
-  printReplay(out.proven.result);
-  const note = signInNote(recording, out.proven.signIn);
+
+  if (out.proven && !printed) printReplay(out.proven.result);
+  const note = out.proven ? signInNote(recording, out.proven.signIn) : undefined;
   if (note) console.log(`\nsign-in  ${note}`);
   if (!out.saved) {
-    console.error('not saved — the recording did not replay cleanly' + (recording.entry?.session ? ', signed in or not' : '') + '. Fix it, or re-record.');
+    console.error('\nnot saved — the recording did not replay cleanly' + (recording.entry?.session ? ', signed in or not' : '') + '.');
+    console.error('  fix it or re-record; or keep it anyway with --force (or --no-verify to skip the replay), marked unproven.');
     process.exitCode = 3;
     return;
   }
-  const { flow, run } = out;
+  const { flow } = out;
   for (const c of out.placeholders.converted) console.log(`\nemail    uses ${c.placeholder} (value in ${c.valueIn}) — this app keeps emails out of memory`);
   console.log(`\nsaved    ${flow.app}/${flow.slug}  (${flow.steps.length} steps${flow.embedding ? ', searchable by meaning' : ''})`);
+  if (flow.proven === false) console.log(`         UNPROVEN — ${flow.unprovenBecause}. The first run that passes proves it.`);
   if (flow.destructive) console.log(`         DESTRUCTIVE — ${flow.destructiveBecause}. Replays need --allow-purchases.`);
-  printRunReport(run);
+  if (out.run) printRunReport(out.run);
   console.log(`\nreplay it any time:  understudy replay ${flow.app} ${flow.slug}`);
 }
 
@@ -817,7 +857,7 @@ async function cmdFlows(positional: string[]) {
   for (const f of rows) {
     const last = await runs.find({ app, plan: [f.slug] }).sort({ startedAt: -1 }).limit(1).next();
     const status = last ? `${last.status} ${last.startedAt.toISOString().slice(0, 16).replace('T', ' ')}` : 'never run';
-    const marks = [f.destructive && 'DESTRUCTIVE', f.requiresSession && 'needs session', f.kind === 'segment' && 'segment', f.madeBy === 'agent' && 'made by an agent']
+    const marks = [f.proven === false && 'UNPROVEN', f.destructive && 'DESTRUCTIVE', f.requiresSession && 'needs session', f.kind === 'segment' && 'segment', f.madeBy === 'agent' && 'made by an agent']
       .filter(Boolean).join(', ');
     console.log(`  ${f.slug.padEnd(32)} ${status.padEnd(24)} ${f.title}${marks ? `  [${marks}]` : ''}`);
   }

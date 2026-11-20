@@ -25,6 +25,7 @@ import { resolveSeam, acceptSeamAnswer } from './seams.js';
 import type { RawRecording } from '../core/recording.js';
 import { execute } from '../flows/execute.js';
 import { recordRun } from '../flows/runs.js';
+import { proveByRun } from '../flows/save.js';
 
 export interface PlanRequest {
   app: string;
@@ -188,7 +189,7 @@ async function advance(run: Run): Promise<PlanState> {
 }
 
 /** One recording for the whole plan: each flow's steps, joined by its seam. */
-export async function recordingForPlan(runId: string): Promise<{ run: Run; recording: RawRecording; steps: Step[] }> {
+export async function recordingForPlan(runId: string): Promise<{ run: Run; recording: RawRecording; steps: Step[]; starts: number[] }> {
   const { runs, flows } = await collections();
   const run = await runs.findOne({ _id: new ObjectId(runId) });
   if (!run || run.status !== 'planned') throw new Error(`run ${runId} isn't planned (it is ${run?.status ?? 'missing'})`);
@@ -196,12 +197,14 @@ export async function recordingForPlan(runId: string): Promise<{ run: Run; recor
   const first = chain[0]!;
 
   const steps: Step[] = [];
+  const starts: number[] = [];
   chain.forEach((flow, i) => {
     if (i > 0) steps.push(...(run.planning?.seams?.[String(i)]?.steps ?? []));
     // A segment cut from the middle of a recording doesn't open its own page.
     if (i === 0 && flow.steps[0]?.action !== 'goto' && flow.steps[0]?.url) {
       steps.push({ action: 'goto', value: flow.steps[0].url, url: flow.steps[0].url, resolution: 'synthesized' });
     }
+    starts.push(steps.length);
     steps.push(...flow.steps);
   });
 
@@ -213,7 +216,7 @@ export async function recordingForPlan(runId: string): Promise<{ run: Run; recor
       : {}),
     events: steps.map((s, seq) => ({ ...s, seq, ts: seq })),
   };
-  return { run, recording, steps };
+  return { run, recording, steps, starts };
 }
 
 /**
@@ -221,11 +224,16 @@ export async function recordingForPlan(runId: string): Promise<{ run: Run; recor
  * outcome written onto the same run document.
  */
 export async function runPlan(runId: string, opts: { values?: Record<string, string>; headed?: boolean } = {}) {
-  const { run, recording, steps } = await recordingForPlan(runId);
+  const { run, recording, steps, starts } = await recordingForPlan(runId);
   const executed = await execute(recording, { ...opts, useLessons: true });
   const recorded = await recordRun({
     app: run.app, flow: run.plan.join('+'), plan: run.plan, goal: run.goal, mode: 'run',
     result: executed.result, steps, runId: run._id!,
   });
-  return { executed, recorded, plan: run.plan };
+  // Each unproven flow in a plan that passed is proven now.
+  const nowProven: string[] = [];
+  for (const [i, slug] of run.plan.entries()) {
+    if (await proveByRun(run.app, slug, executed.result, starts[i])) nowProven.push(slug);
+  }
+  return { executed, recorded, plan: run.plan, nowProven };
 }

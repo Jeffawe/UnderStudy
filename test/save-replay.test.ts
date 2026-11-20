@@ -155,3 +155,55 @@ test('a destructive flow is marked on save', { timeout: 60_000 }, async () => {
   assert.equal(flow.destructive, true);
   assert.match(flow.destructiveBecause!, /Place order/);
 });
+
+test('saving without a replay: kept as unproven; the first passing run proves it and fills in the pages', { timeout: 120_000 }, async () => {
+  shop.set({ promo: false, broken: false });
+  const { proveAndSave, proveByRun } = await import('../src/flows/save.js');
+  const rec = recordingOfLoginAndCart();
+  const out = await proveAndSave(rec, { title: 'Cart, unverified', verify: false });
+  assert.equal(out.saved, true);
+  if (!out.saved) return;
+  assert.equal(out.verified, false);
+  assert.equal(out.run, undefined, 'no replay, so no run');
+  assert.equal(out.flow.proven, false);
+  assert.equal(out.flow.unprovenBecause, 'saved without a replay');
+  assert.ok(out.flow.steps.every((s) => !s.expectedSig), 'no replay, so no page fingerprints yet');
+
+  const { recall } = await import('../src/memory/recall.js');
+  assert.equal((await recall('shop', 'cart-unverified')).best?.proven, false, 'recall says so');
+
+  // A passing run proves it.
+  const { flows } = await collections();
+  const flow = (await flows.findOne({ app: 'shop', slug: 'cart-unverified' }))!;
+  const result = await replay(recordingFrom(flow), { values });
+  assert.equal(result.ok, true);
+  assert.equal(await proveByRun('shop', 'cart-unverified', result), true);
+  const after = (await flows.findOne({ app: 'shop', slug: 'cart-unverified' }))!;
+  assert.equal(after.proven, undefined, 'no longer unproven');
+  assert.ok(after.steps.slice(1).every((s) => s.expectedSig), 'each step now knows the page it lands on');
+  assert.ok(after.endState?.startsWith('/cart'));
+  assert.equal(await proveByRun('shop', 'cart-unverified', result), false, 'already proven: nothing to do');
+});
+
+test('a failed replay is refused unless the caller keeps it — then it is unproven, and its run is recorded', { timeout: 120_000 }, async () => {
+  const { proveAndSave } = await import('../src/flows/save.js');
+  const u = shop.url;
+  // Asks for a link the shop doesn't have, so the replay fails.
+  const broken = buildRecording({ source: 'live', origin: 'test-broken', appSlug: 'shop', startUrl: u }, [
+    { seq: 0, ts: 0, action: 'goto', url: u, resolution: 'synthesized' },
+    { seq: 1, ts: 1, action: 'click', role: 'link', name: 'No such link', url: u, resolution: 'accname' },
+  ]);
+  let asked = 0;
+  const refused = await proveAndSave(broken, { title: 'Broken', keepIfFailed: async () => { asked++; return false; } });
+  assert.equal(refused.saved, false);
+  assert.equal(asked, 1, 'the caller was asked');
+
+  const kept = await proveAndSave(broken, { title: 'Broken', keepIfFailed: async () => true });
+  assert.equal(kept.saved, true);
+  if (!kept.saved) return;
+  assert.equal(kept.flow.proven, false);
+  assert.match(kept.flow.unprovenBecause!, /replay failed/);
+  assert.equal(kept.run?.drift.firstRun, true, 'the failed run is still on record');
+  const { runs } = await collections();
+  assert.equal((await runs.findOne({ app: 'shop', plan: ['broken'] }))?.status, 'failed');
+});

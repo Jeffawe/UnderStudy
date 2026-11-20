@@ -36,7 +36,8 @@ Runs plan before any browser opens.
   (`understudy_record`, then `understudy_save` once they've stopped), or drive
   it yourself and save the Playwright script (`understudy_save` with `script`;
   read passwords from `process.env`). Saving replays it first and keeps it only
-  if every step passes. Save what the user would want tested again; a one-off
+  if every step passes — or pass `verify: false` (with a `note`) when you know
+  why the replay can't pass; it's kept as unproven until a run passes. Save what the user would want tested again; a one-off
   is enough as facts and lessons. Saving needs no permission.
 - **Distilling** names a flow and splits it into reusable segments. **Ask the
   user before each one**; any flow may be distilled. Refer to steps by index

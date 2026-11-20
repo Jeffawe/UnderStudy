@@ -25,6 +25,8 @@ export interface FlowMatch {
   title: string;
   kind: Flow['kind'];
   madeBy: 'user' | 'agent';
+  /** False: kept without a passing replay — may not work. */
+  proven: boolean;
   score: number;
   destructive: boolean;
   requiresSession: boolean;
@@ -129,7 +131,7 @@ export function wordScore(goal: string, flow: Pick<Flow, 'slug' | 'title' | 'int
 }
 
 const toMatch = (f: Flow & { score?: number }, score: number): FlowMatch => ({
-  slug: f.slug, title: f.title, kind: f.kind, madeBy: f.madeBy ?? 'user', score,
+  slug: f.slug, title: f.title, kind: f.kind, madeBy: f.madeBy ?? 'user', proven: f.proven !== false, score,
   destructive: f.destructive, requiresSession: f.requiresSession,
 });
 
@@ -193,7 +195,7 @@ export async function recall(app: string, goal: string, opts: { limit?: number; 
   }
 
   // 3. By words, with no model. Corpora are small, so scoring every flow is fine.
-  const all = await c.flows.find({ app }, { projection: { slug: 1, title: 1, intent: 1, kind: 1, madeBy: 1, destructive: 1, requiresSession: 1 } }).toArray();
+  const all = await c.flows.find({ app }, { projection: { slug: 1, title: 1, intent: 1, kind: 1, madeBy: 1, proven: 1, destructive: 1, requiresSession: 1 } }).toArray();
   const matches = all
     .map((f) => toMatch(f as Flow, wordScore(goal, f as Flow)))
     .filter((m) => m.score > 0)

@@ -16,6 +16,9 @@
     .small { color: #666; font-size: 11px; }
     details { margin-top: 10px; }
     input[type=number] { width: 80px; }
+    input[type=text] { width: 100%; padding: 7px 8px; font: inherit; border: 1px solid #ccc; border-radius: 6px; margin: 2px 0 8px; }
+    .field { display: block; margin: 0 0 4px; }
+    .hint { color: #666; font-size: 11px; margin: 6px 0 0; }
   </style>
 </head>
 <body>
@@ -26,10 +29,19 @@
       <span>I'm signed in here
       <span class="small">Not sure? Leave it — Understudy works it out when you save.</span></span>
     </label>
+    <label id="saveOnStopRow"><input type="checkbox" id="saveOnStop" checked>
+      <span>Save as a flow when I stop
+      <span class="small">Understudy replays it to check it works, then keeps it.</span></span>
+    </label>
     <button id="start">Record from this page</button>
   </div>
   <div id="stopPane" hidden>
-    <button id="stop">Stop and save</button>
+    <div id="nameRow" hidden>
+      <label class="field" for="flowName">What does this flow do?</label>
+      <input type="text" id="flowName" placeholder="e.g. log in and add to cart">
+    </div>
+    <button id="stop">Stop</button>
+    <p class="hint" id="stopHint"></p>
   </div>
   <details>
     <summary class="small">Settings</summary>

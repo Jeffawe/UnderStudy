@@ -65,7 +65,7 @@ async function continueRun(state: PlanState, opts: { headed?: boolean }) {
   if (state.status !== 'planned' || state.dryRun) return state;
   const values = valuesByRun.get(state.runId) ?? {};
   valuesByRun.delete(state.runId);
-  const { executed, recorded, plan } = await runPlan(state.runId, { values, ...opts });
+  const { executed, recorded, plan, nowProven } = await runPlan(state.runId, { values, ...opts });
   const r = executed.result;
   return {
     status: r.ok ? 'passed' : 'failed',
@@ -80,6 +80,7 @@ async function continueRun(state: PlanState, opts: { headed?: boolean }) {
       : 'same path',
     findings: recorded.findings.map((f) => ({ kind: f.kind, severity: f.severity, statement: f.statement })),
     ...(executed.lessons?.fired ? { lessons: executed.lessons } : {}),
+    ...(nowProven.length ? { nowProven } : {}),
     ...(executed.missingValues.length ? { missingValues: executed.missingValues } : {}),
     ...(executed.staleSession ? { staleSession: executed.staleSession } : {}),
   };
@@ -173,7 +174,7 @@ server.registerTool('understudy_record', {
   inputSchema: { app: z.string(), port: z.number().int().min(0).max(65535).optional().describe('Default 7397.') },
 }, ({ app, port }) => wrap(async () => {
   if (recording) throw new Error(`already waiting for a recording of "${recording.app}" — the user needs to stop it first`);
-  const rec = await startExtensionRecorder({ appSlug: app, ...(port ? { port } : {}) });
+  const rec = await startExtensionRecorder({ appSlug: app, savedBy: 'agent', ...(port ? { port } : {}) });
   recording = { app, rec };
   rec.done.then(async (out) => {
     recording = null;
@@ -187,7 +188,7 @@ server.registerTool('understudy_record', {
     tellTheUser: [
       'In Chrome, go to the page where the flow starts.',
       'Click the Understudy icon → "Record from this page" (tick "I\'m signed in here" if the flow starts signed in).',
-      'Do the flow as normal, then click the icon → "Stop and save".',
+      'Do the flow as normal, then click the icon → "Stop".',
       `Extension not loaded yet? chrome://extensions → Developer mode → Load unpacked → ${extensionDir()}`,
     ],
     then: 'When they say they\'ve stopped, call understudy_save with a name for the flow.',
@@ -201,6 +202,8 @@ server.registerTool('understudy_save', {
     hash: z.string().optional(),
     script: z.string().optional().describe('Path to a Playwright script of a flow you drove; read passwords from process.env.'),
     intent: z.string().optional(), slug: z.string().optional(), values,
+    verify: z.boolean().optional().describe('false: keep it without replaying (e.g. it ends in a real purchase). Saved as unproven until a run passes.'),
+    note: z.string().optional().describe('With verify false: why, e.g. what you checked yourself.'),
   },
 }, (a) => wrap(async () => {
   let rec;
@@ -216,27 +219,33 @@ server.registerTool('understudy_save', {
     await saveRecording(rec);
     madeBy = 'agent';
   } else {
-    if (!a.hash && recording?.app === a.app) throw new Error('the user is still recording — ask them to click "Stop and save" in the extension first');
+    if (!a.hash && recording?.app === a.app) throw new Error('the user is still recording — ask them to click "Stop" in the extension first');
     const hash = a.hash ?? finished.get(a.app)?.hash;
     if (!hash) throw new Error(`no finished recording for "${a.app}" — start one with understudy_record, pass a hash, or pass a script`);
     rec = await loadRecording(hash);
   }
   const hash = rec.hash;
-  const out = await proveAndSave(rec, { title: a.name, madeBy, ...(a.values ? { values: a.values } : {}), ...(a.intent ? { intent: a.intent } : {}), ...(a.slug ? { slug: a.slug } : {}) });
-  const r = out.proven.result;
+  const out = await proveAndSave(rec, {
+    title: a.name, madeBy,
+    ...(a.verify === false ? { verify: false, unproven: a.note ? `saved by an agent without a replay: ${a.note}` : 'saved by an agent without a replay' } : {}),
+    ...(a.values ? { values: a.values } : {}), ...(a.intent ? { intent: a.intent } : {}), ...(a.slug ? { slug: a.slug } : {}),
+  });
+  const r = out.proven?.result;
   const base = {
     recording: hash,
-    passed: r.ok,
-    failedSteps: r.steps.filter((s) => !s.ok).map((s) => ({ seq: s.seq, action: s.action, error: s.error })),
-    ...(out.proven.missingValues.length ? { missingValues: out.proven.missingValues } : {}),
-    signIn: out.proven.signIn,
+    ...(r ? {
+      passed: r.ok,
+      failedSteps: r.steps.filter((s) => !s.ok).map((s) => ({ seq: s.seq, action: s.action, error: s.error })),
+      signIn: out.proven!.signIn,
+    } : { replayed: false }),
     ...(finished.get(a.app)?.droppedUploads ? { droppedUploads: finished.get(a.app)!.droppedUploads } : {}),
   };
-  if (!out.saved) return { saved: false, ...base, why: 'it did not replay cleanly, so it was not kept' };
+  if (!out.saved) return { saved: false, ...base, why: 'it did not replay cleanly, so it was not kept. Fix the step, or pass verify: false to keep it unproven.' };
   return {
     saved: true, flow: out.flow.slug, steps: out.flow.steps.length, madeBy, ...base,
+    ...(out.flow.proven === false ? { unproven: out.flow.unprovenBecause } : {}),
     ...(out.flow.destructive ? { destructive: out.flow.destructiveBecause } : {}),
-    findings: out.run.findings.map((f) => f.statement),
+    ...(out.run ? { findings: out.run.findings.map((f) => f.statement) } : {}),
     ...(out.placeholders.converted.length ? { placeholders: out.placeholders.converted } : {}),
   };
 }));

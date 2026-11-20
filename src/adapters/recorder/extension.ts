@@ -51,6 +51,8 @@ export interface ExtensionRecording {
   droppedUploads: number;
   /** Where the tab's session was saved for proving to try, if one was sent. */
   sessionPath?: string;
+  /** The user ticked "Save as a flow when I stop" and named it: save it under this name. */
+  saveAs?: string;
 }
 
 /** Chrome, Edge, Brave… use chrome-extension://<32 letters>; Firefox uses moz-extension://<uuid>. */
@@ -66,7 +68,13 @@ async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
   return s ? (JSON.parse(s) as Record<string, unknown>) : {};
 }
 
-export async function startExtensionRecorder(opts: { appSlug: string; port?: number; startUrl?: string }): Promise<ExtensionRecorder> {
+export async function startExtensionRecorder(opts: {
+  appSlug: string; port?: number; startUrl?: string;
+  /** Who saves the recording as a flow: the terminal (the user's `record`), or an agent that will call save itself. */
+  savedBy?: 'terminal' | 'agent';
+}): Promise<ExtensionRecorder> {
+  const savedBy = opts.savedBy ?? 'terminal';
+  let saveAs: string | undefined;
   const token = randomBytes(18).toString('base64url');
   const events: RawEvent[] = [];
   let startedAt = 0;
@@ -95,7 +103,7 @@ export async function startExtensionRecorder(opts: { appSlug: string; port?: num
       if (origin && !isExtensionOrigin(origin)) return reply(res, origin, 403, { error: 'only the Understudy extension may talk to this' });
       const path = new URL(req.url ?? '/', 'http://x').pathname;
 
-      if (req.method === 'GET' && path === '/hello') return reply(res, origin, 200, { app: opts.appSlug, token, started });
+      if (req.method === 'GET' && path === '/hello') return reply(res, origin, 200, { app: opts.appSlug, token, started, savedBy });
 
       if (req.method !== 'POST') return reply(res, origin, 404, { error: 'not found' });
       const b = await body(req);
@@ -131,7 +139,11 @@ export async function startExtensionRecorder(opts: { appSlug: string; port?: num
       }
 
       if (path === '/stop') {
-        reply(res, origin, 200, { ok: true, events: events.length });
+        // A name means "save it as a flow" — only the terminal does that here;
+        // when an agent started this, the agent saves it.
+        const name = typeof b.name === 'string' ? b.name.trim().slice(0, 200) : '';
+        if (name && savedBy === 'terminal') saveAs = name;
+        reply(res, origin, 200, { ok: true, events: events.length, hash: build().hash, saving: Boolean(saveAs) });
         finish();
         return;
       }
@@ -147,14 +159,15 @@ export async function startExtensionRecorder(opts: { appSlug: string; port?: num
   });
   const { port } = server.address() as AddressInfo;
 
+  /** The recording as it stands: events in the order they happened. */
+  const build = () => buildRecording(
+    { source: 'live', origin: 'chrome-extension', appSlug: opts.appSlug, startUrl, ...(entry ? { entry } : {}) },
+    events.slice().sort((a, b) => a.ts - b.ts).map((e, i) => ({ ...e, seq: i })),
+  );
+
   const done = stopped.then(async (): Promise<ExtensionRecording> => {
     await new Promise<void>((r) => server.close(() => r()));
-    const ordered = events.slice().sort((a, b) => a.ts - b.ts).map((e, i) => ({ ...e, seq: i }));
-    const recording = buildRecording(
-      { source: 'live', origin: 'chrome-extension', appSlug: opts.appSlug, startUrl, ...(entry ? { entry } : {}) },
-      ordered,
-    );
-    return { recording, started, droppedUploads, ...(sessionPath ? { sessionPath } : {}) };
+    return { recording: build(), started, droppedUploads, ...(sessionPath ? { sessionPath } : {}), ...(saveAs ? { saveAs } : {}) };
   });
 
   return { url: `http://127.0.0.1:${port}`, done, stop: finish };

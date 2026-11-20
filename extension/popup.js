@@ -23,6 +23,13 @@ async function refresh() {
   if (s.rec) {
     show(`Recording "${s.rec.app}". Use the page as normal, then stop here.`, 'rec');
     $('stopPane').hidden = false;
+    // Saving here only when it was asked for — and never when an agent started
+    // the recording: then the agent saves it.
+    const saving = s.rec.save && s.rec.savedBy !== 'agent';
+    $('nameRow').hidden = !saving;
+    $('stop').textContent = saving ? 'Stop and save as a flow' : 'Stop';
+    $('stopHint').textContent = s.rec.savedBy === 'agent' ? 'Your agent will save it.' : saving ? '' : 'The recording is kept; save it as a flow from the terminal.';
+    if (saving) $('flowName').focus();
   } else if (s.lastError) {
     show(`Couldn't start recording: ${s.lastError}`, 'err');
     if (!s.cli?.error && !s.cli?.started) $('startPane').hidden = false;
@@ -33,6 +40,7 @@ async function refresh() {
   } else {
     show(`Ready to record "${s.cli.app}".`);
     $('startPane').hidden = false;
+    $('saveOnStopRow').hidden = s.cli.savedBy === 'agent';
   }
 }
 
@@ -44,13 +52,14 @@ $('start').addEventListener('click', async () => {
   if (!/^https?:/.test(tab.url)) return show('This page can\'t be recorded (only http and https pages).', 'err');
   const site = new URL(tab.url).origin;
   const signedIn = $('signedIn').checked;
+  const save = $('saveOnStop').checked;
   $('start').disabled = true;
 
   // Per-site access, asked for now — while you're clicking — rather than for every site at install.
   // If it has to be asked, Chrome closes this popup, so leave a note first: the
   // background worker starts recording the moment you allow it.
   if (!(await chrome.permissions.contains({ origins: [`${site}/*`] }))) {
-    await chrome.storage.session.set({ pending: { tabId: tab.id, origin: site, signedIn, at: Date.now() } });
+    await chrome.storage.session.set({ pending: { tabId: tab.id, origin: site, signedIn, save, at: Date.now() } });
     const allowed = await chrome.permissions.request({ origins: [`${site}/*`] }).catch(() => false);
     if (!allowed) {
       await chrome.storage.session.remove('pending');
@@ -60,19 +69,27 @@ $('start').addEventListener('click', async () => {
     // The popup usually doesn't survive the dialog; if it did, the worker is already starting.
   }
 
-  const r = await send({ type: 'understudy:start', tabId: tab.id, signedIn });
+  const r = await send({ type: 'understudy:start', tabId: tab.id, signedIn, save });
   $('start').disabled = false;
   if (!r.ok && !/Already recording/.test(r.error)) return show(r.error, 'err');
   window.close();
 });
 
 $('stop').addEventListener('click', async () => {
+  const saving = !$('nameRow').hidden;
+  const name = $('flowName').value.trim();
+  if (saving && !name) {
+    $('flowName').focus();
+    return show('Say what the flow does, so it can be found later.', 'err');
+  }
   $('stop').disabled = true;
-  const r = await send({ type: 'understudy:stop' });
+  const r = await send({ type: 'understudy:stop', ...(saving ? { name } : {}) });
   $('stop').disabled = false;
   if (!r.ok) return show(r.error, 'err');
-  show(`Saved ${r.events ?? 0} steps. The terminal shows the recording's hash.`);
   $('stopPane').hidden = true;
+  if (r.saving) show(`Recorded ${r.events ?? 0} steps. Now checking it works — the terminal shows the result.`);
+  else if (r.savedBy === 'agent') show(`Recorded ${r.events ?? 0} steps. Your agent will save it.`);
+  else show(`Recorded ${r.events ?? 0} steps. To keep it as a flow, run in the terminal:\nunderstudy save ${r.hash} "<what it does>"`);
 });
 
 $('port').addEventListener('change', async () => {
