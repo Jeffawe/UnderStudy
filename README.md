@@ -15,7 +15,9 @@ Understudy never calls a model itself — the agent is the model.
 record  →  save  →  replay / run  →  findings
 ```
 
-- **record** — click through a flow in your own browser, with the extension (Chrome, Edge, Brave and other Chromium browsers). Passwords are never stored: a password field is kept as
+- **record** — click through a flow in your own browser, with the
+  [Understudy recorder](https://chromewebstore.google.com/detail/understudy-recorder/mdobdjogkgimabdpmbmhhcdeoahoapjf) extension from the Chrome Web Store. Passwords
+  are never stored: a password field is kept as
   a reference like `SECRET.password`, and you supply the value when replaying.
 - **save** — the recording is replayed headless first. It is kept only if every
   step passes, so memory only holds flows known to work.
@@ -39,8 +41,8 @@ You need **Node 22+** and a **MongoDB** with vector search — a free
 Community Edition with `mongot` running locally.
 
 ```bash
-npm install -g @jeffawe/understudy               # 
-npx playwright install --only-shell chromium     # the headless browser replay uses, ~200 MB
+npm install -g @jeffawe/understudy               
+npx playwright install --only-shell chromium     
 
 understudy config set MONGODB_URI="mongodb+srv://…" EMBED_KEY="…"
 ```
@@ -55,21 +57,15 @@ Already keep your settings in an env file? Point at it instead:
 understudy config --env-file ~/secrets/understudy.env
 ```
 
-Optional, any time: `understudy doctor` checks the connection, search, model and
-browser; `understudy config` shows where every setting came from (no secrets
-shown); the recorder extension is on the [Chrome Web Store](https://chromewebstore.google.com/detail/understudy-recorder/mdobdjogkgimabdpmbmhhcdeoahoapjf)
-(Chrome, Edge, Brave and other Chromium browsers), and `understudy extension`
-says where its folder is if you'd rather load it by hand.
-
-Settings come from, highest first: real environment variables, `--env-file
-<path>` on any command, the env file saved with `understudy config`, then a
-`.env` in the current folder.
+To record, install the [Understudy recorder](https://chromewebstore.google.com/detail/understudy-recorder/mdobdjogkgimabdpmbmhhcdeoahoapjf) from the Chrome Web Store.
+Not using Chrome or another Chromium browser? See
+[extension/README.md](extension/README.md).
 
 | Setting | What it's for |
 |---|---|
 | `MONGODB_URI` | your Atlas `mongodb+srv://…` string, or local Community |
 | `EMBED_KEY` | optional: a Voyage key, to match goals by meaning (`voyage-4-lite`). Using another model? See below. |
-| `UNDERSTUDY_<REF>` | login values. A recording never stores a password: the field is kept as a name like `SECRET.password`, and at replay Understudy reads the value from `UNDERSTUDY_SECRET_PASSWORD`. Or pass it per run (`--value SECRET.password=…`, or `values` from an agent). Not set? The terminal asks for it (hidden) and offers to save it; an agent is told which line to add to your env file. Exported tests read the same variable. |
+| `UNDERSTUDY_<REF>` | login values. A recording never stores a password: the field is kept as a name like `SECRET.password`, and at replay Understudy reads the value from `UNDERSTUDY_SECRET_PASSWORD`. Or pass it per run (`--value SECRET.password=…`, or `values` from an agent). Not set? The terminal asks for it (hidden) and offers to save it; an agent is told which line to add to your env file.  |
 
 ### Using a different embedding model
 
@@ -118,9 +114,7 @@ npx playwright install chromium
 understudy record myapp --new-browser --url https://your-app.example
 ```
 
-Click through the flow in the window that opens, then close it to stop. Firefox
-users can also load the extension's Firefox build — see
-[extension/README.md](extension/README.md).
+Click through the flow in the window that opens, then close it to stop.
 
 ## Where your data goes
 
