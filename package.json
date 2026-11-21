@@ -1,7 +1,7 @@
 {
   "name": "@jeffawe/understudy",
-  "version": "0.2.0",
-  "description": "End-to-end tests for your own web apps: record a flow once, and Understudy remembers it, replays it, notices when the app changes, and runs goals you describe in words \u2014 on its own or as an MCP server for AI agents.",
+  "version": "0.2.1",
+  "description": "End-to-end tests for your own web apps: record a flow once, and Understudy remembers it, replays it, notices when the app changes, and runs goals you describe in words — on its own or as an MCP server for AI agents.",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {
@@ -26,8 +26,8 @@
     "node": ">=22"
   },
   "bin": {
-    "understudy": "./dist/entry/cli.js",
-    "understudy-mcp": "./dist/entry/mcp.js"
+    "understudy": "dist/entry/cli.js",
+    "understudy-mcp": "dist/entry/mcp.js"
   },
   "files": [
     "dist",
