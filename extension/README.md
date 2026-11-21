@@ -5,7 +5,13 @@ signed in or not — instead of a fresh browser that Understudy opens.
 
 ## Install (once)
 
-`understudy extension` prints where this folder is.
+**Chrome, Brave, Arc, Opera, Vivaldi, Edge:** install it from the
+[Chrome Web Store](https://chromewebstore.google.com/detail/understudy-recorder/mdobdjogkgimabdpmbmhhcdeoahoapjf), then pin it (puzzle-piece icon → pin
+**Understudy recorder**) so it's one click away. Edge asks you to allow
+extensions from other stores first.
+
+**Or load it by hand** (to try a change, or offline) — `understudy extension`
+prints where this folder is:
 
 1. Open your browser's extensions page and turn on **Developer mode**:
    | Browser | Extensions page |

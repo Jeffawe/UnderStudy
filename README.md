@@ -57,8 +57,9 @@ understudy config --env-file ~/secrets/understudy.env
 
 Optional, any time: `understudy doctor` checks the connection, search, model and
 browser; `understudy config` shows where every setting came from (no secrets
-shown); `understudy extension` says where the Chrome recorder is, for loading it
-once.
+shown); the recorder extension is on the [Chrome Web Store](https://chromewebstore.google.com/detail/understudy-recorder/mdobdjogkgimabdpmbmhhcdeoahoapjf)
+(Chrome, Edge, Brave and other Chromium browsers), and `understudy extension`
+says where its folder is if you'd rather load it by hand.
 
 Settings come from, highest first: real environment variables, `--env-file
 <path>` on any command, the env file saved with `understudy config`, then a

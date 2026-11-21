@@ -30,6 +30,12 @@ import { setPlaceholders, appPlaceholders } from '../memory/placeholders.js';
 import * as store from '../store/db.js';
 import { valueEnvName, readConfig, writeConfig, loadedFrom, HOME, expandHome, writeEnvValues } from '../store/settings.js';
 
+// Piped into `head` and the pipe closed early: stop quietly, like other CLIs.
+process.stdout.on('error', (e: NodeJS.ErrnoException) => {
+  if (e.code === 'EPIPE') process.exit(0);
+  throw e;
+});
+
 const USAGE = `understudy — learn a web app, then test it by intent
 
 USAGE
@@ -459,7 +465,9 @@ async function cmdApp(positional: string[], flags: Flags) {
 
 /** Where the Chrome extension is, and how to load it — it ships inside the package. */
 function cmdExtension() {
-  console.log(`Chrome, Edge, Brave and other Chromium browsers:\n  ${extensionDir()}\n`);
+  console.log('Chrome, Edge, Brave and other Chromium browsers — install it from the Chrome Web Store:');
+  console.log('  https://chromewebstore.google.com/detail/understudy-recorder/mdobdjogkgimabdpmbmhhcdeoahoapjf\n');
+  console.log(`or load it by hand from:\n  ${extensionDir()}\n`);
   console.log('  1. open the extensions page (chrome://extensions, edge://extensions, …) and turn on Developer mode');
   console.log('  2. click "Load unpacked" and choose the folder above');
   console.log('  3. pin it (puzzle-piece icon) so it is one click away');
