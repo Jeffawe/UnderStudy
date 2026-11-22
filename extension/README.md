@@ -10,7 +10,7 @@ signed in or not — instead of a fresh browser that Understudy opens.
 **Understudy recorder**) so it's one click away. Edge asks you to allow
 extensions from other stores first.
 
-**Or load it by hand** (to try a change, or offline) — `understudy extension`
+**Or load it by hand**= — `understudy extension`
 prints where this folder is:
 
 1. Open your browser's extensions page and turn on **Developer mode**:
@@ -22,15 +22,6 @@ prints where this folder is:
    | Arc, Opera, Vivaldi | their extensions page (all accept Chrome extensions) |
 2. Click **Load unpacked** and choose this `extension/` folder.
 3. Pin it (puzzle-piece icon → pin **Understudy recorder**) so it's one click away.
-
-Tested in Chrome and Chromium. Other Chromium-based browsers load Chrome
-extensions the same way and should work.
-
-**Firefox:** until it's listed on Firefox Add-ons, load the Firefox build
-yourself — it ships with Understudy, and `understudy extension` prints where.
-In Firefox open `about:debugging#/runtime/this-firefox` → **Load Temporary
-Add-on…** → choose `manifest.json` in that folder. Firefox removes temporary
-add-ons when it restarts.
 
 **Safari (and anywhere else the extension won't run):** record in a fresh
 browser that Understudy opens instead. It's a one-time extra download — the
