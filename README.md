@@ -112,11 +112,6 @@ understudy emit myapp log-in-as-a-member    # print it as a Playwright (or Cypre
 understudy app myapp --placeholder email    # keep email addresses out of memory (moves them to your env file)
 ```
 
-An imported script keeps its checks — `expect(...).toBeVisible()`,
-`toHaveText`, `toHaveURL`, `waitForURL` and the like — so a replay fails when
-the page is wrong, not just when a button is missing. A check it can't replay is
-listed when you import, never dropped silently.
-
 An unproven flow is marked as such in `flows` and recall; the first run of
 it that passes proves it. `understudy --help` lists everything, and
 `understudy --version` says which one you have. A flow that commits something real — a
