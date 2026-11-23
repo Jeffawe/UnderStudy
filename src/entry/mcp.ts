@@ -91,7 +91,7 @@ async function continueRun(state: PlanState, opts: { headed?: boolean }) {
     runId: state.runId,
     plan,
     seams: state.seams,
-    failedSteps: r.steps.filter((s) => !s.ok).map((s) => ({ seq: s.seq, action: s.action, error: s.error })),
+    failedSteps: r.steps.filter((s) => !s.ok).map((s) => ({ seq: s.seq, action: s.action, error: s.error, ...(s.saw ? { saw: s.saw } : {}) })),
     unexpectedPages: r.steps.filter((s) => s.unexpectedPage).map((s) => ({ seq: s.seq, ...s.unexpectedPage })),
     path: r.sigSequence,
     drift: recorded.drift.notCompared ? `not compared: ${recorded.drift.notCompared}`
@@ -273,7 +273,7 @@ server.registerTool('understudy_save', {
     ...(dropped.length ? { droppedAssertions: dropped, droppedWhy: 'these checks in the script were not kept, so the flow checks less than the script did' } : {}),
     ...(r ? {
       passed: r.ok,
-      failedSteps: r.steps.filter((s) => !s.ok).map((s) => ({ seq: s.seq, action: s.action, error: s.error })),
+      failedSteps: r.steps.filter((s) => !s.ok).map((s) => ({ seq: s.seq, action: s.action, error: s.error, ...(s.saw ? { saw: s.saw } : {}) })),
       signIn: out.proven!.signIn,
     } : { replayed: false }),
     ...(finished.get(a.app)?.droppedUploads ? { droppedUploads: finished.get(a.app)!.droppedUploads } : {}),

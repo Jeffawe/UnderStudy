@@ -20,12 +20,16 @@ export function stable(text: string): string {
     .replace(/(https?:\/\/[^\s'"?#]+)\?[^\s'"]*/g, '$1')
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid')
     // Not a port: `localhost:3000` is where the app is, not a varying id, and
-    // replacing it produced `localhost::n`.
-    .replace(/(?<![\w\]]:)\b\d{3,}\b/g, ':n')
+    // replacing it produced `localhost::n`. Not part of a dotted address or
+    // version either (127.0.0.1, 1.2.300): replacing those produced `:n.0.0.1`.
+    .replace(/(?<![\w\]]:)(?<![\d.])\d{3,}(?!\d|\.\d)/g, ':n')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 300);
 }
+
+/** For showing: whitespace squashed and cut, nothing rewritten. */
+const readable = (text: string) => text.replace(/\s+/g, ' ').trim().slice(0, 300);
 
 /** Route shape only: `https://x.com/orders/123?a=b` → `https://x.com/orders/:id`. */
 export function routeOf(url: string | undefined): string {
@@ -59,11 +63,14 @@ export function extractFindings(result: Pick<ReplayResult, 'signals' | 'steps'>,
         evidence: { url: s.url, status: s.status, body: s.body, duringStep: s.duringStep, goal },
         fingerprint: fingerprint(['network_error', s.status, route]),
       });
-    } else if (s.kind === 'console' || s.kind === 'pageerror') {
+    } else if ((s.kind === 'console' && s.level !== 'warning') || s.kind === 'pageerror') {
+      // console.warn is framework chatter far more often than a defect (Next.js
+      // image-size hints, React dev warnings): kept in the run, not a finding.
       add({
         kind: 'console_error',
         severity: s.kind === 'pageerror' ? 'high' : 'low',
-        statement: stable(s.text),
+        // Shown as it was; only the fingerprint is normalised.
+        statement: readable(s.text),
         evidence: { text: s.text, duringStep: s.duringStep, goal },
         fingerprint: fingerprint(['console_error', stable(s.text)]),
       });

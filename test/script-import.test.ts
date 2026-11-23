@@ -98,7 +98,7 @@ test('an imported script with placeholder lookups and assertions replays, and a 
   const bad = await parse(script('Nope'), shop.url);
   const failed = await replay(bad.recording, { values: { 'ENV.SHOP_PW': 'x' }, timeoutMs: 1500 });
   assert.equal(failed.ok, false);
-  assert.match(failed.steps.at(-1)!.error!, /title to be "Nope", got "Shop"/);
+  assert.match(failed.steps.at(-1)!.error!, /title to be "Nope" — saw "Shop"/);
 
   const missing = await parse(`
   await page.goto('/');

@@ -74,10 +74,45 @@ export interface StepOutcome {
    * matter how accurately the name was captured.
    */
   roleHadNoMatch?: { fellBackTo: string };
+  /** A failed assertion: what it actually found, e.g. the visible text near where the expected text should be. */
+  saw?: string;
+}
+
+/** An assertion that failed, carrying what it actually saw. */
+class AssertionFailed extends Error {
+  constructor(message: string, readonly saw?: string) {
+    super(message);
+  }
+}
+
+/**
+ * The part of a page's text worth showing next to an expected string that
+ * wasn't there: a window around the longest run of the expected words that IS
+ * there ("Total Transactions 9" for an expected "Total Transactions 10"), or
+ * the start of the text if none is. Pure; exported for tests.
+ */
+export function excerpt(actual: string, expected: string | undefined, width = 160): string {
+  const text = actual.replace(/\s+/g, ' ').trim();
+  if (text.length <= width) return text;
+  const words = (expected ?? '').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+  const lower = text.toLowerCase();
+  for (let k = words.length; k >= 1; k--) {
+    for (let start = 0; start + k <= words.length; start++) {
+      const phrase = words.slice(start, start + k).join(' ').toLowerCase();
+      if (phrase.length < 3) continue;
+      const at = lower.indexOf(phrase);
+      if (at < 0) continue;
+      const from = Math.max(0, Math.min(at - Math.floor(width / 3), text.length - width));
+      return `${from > 0 ? '…' : ''}${text.slice(from, from + width)}${from + width < text.length ? '…' : ''}`;
+    }
+  }
+  return `${text.slice(0, width)}…`;
 }
 
 export interface CapturedSignal {
   kind: 'console' | 'pageerror' | 'requestfailed' | 'http';
+  /** console only: console.error or console.warn. Warnings are kept as evidence but aren't findings. */
+  level?: 'error' | 'warning';
   /** Step this happened during — the correlation that makes signals useful. */
   duringStep: number;
   text: string;
@@ -452,14 +487,23 @@ async function checkAssert(page: Page, event: RawEvent, values: Record<string, s
   const shown = regex ? `/${expected}/` : `"${expected}"`;
 
   /** Poll `read` until `ok`, like expect's retrying; report the last value seen. */
-  const until = async (read: () => Promise<string | boolean | null>, ok: (v: string | boolean | null) => boolean, what: string) => {
+  const until = async (
+    read: () => Promise<string | boolean | null>,
+    ok: (v: string | boolean | null) => boolean,
+    what: string,
+    /** What to show as "saw" — e.g. the visible text, not textContent's scripts. */
+    shownAs?: () => Promise<string | null>,
+  ) => {
     const deadline = Date.now() + timeoutMs;
     let last: string | boolean | null = null;
     for (;;) {
       last = await read().catch(() => null);
       if (ok(last)) return;
       if (Date.now() >= deadline) {
-        throw new Error(`${what}${last === null ? '' : `, got ${typeof last === 'string' ? `"${squash(last).slice(0, 80)}"` : String(last)}`}`);
+        const visible = shownAs ? await shownAs().catch(() => null) : null;
+        const raw = visible ?? (typeof last === 'string' ? last : null);
+        const saw = raw !== null ? `"${excerpt(raw, expected)}"` : last === null ? 'nothing it could read' : String(last);
+        throw new AssertionFailed(`${what} — saw ${saw}`, saw);
       }
       await page.waitForTimeout(100);
     }
@@ -482,13 +526,19 @@ async function checkAssert(page: Page, event: RawEvent, values: Record<string, s
     case 'hidden':
       await target.waitFor({ state: kind, timeout: timeoutMs }).catch(async () => {
         const count = await locator.count().catch(() => 0);
-        throw new Error(`expected ${desc} to be ${kind}${kind === 'visible' && count === 0 ? ' — it matched no elements' : ''}`);
+        const saw = kind === 'visible'
+          ? (count === 0 ? 'it matched no elements' : `it matched ${count} element(s), none visible`)
+          : `it is still visible${count > 1 ? ` (${count} match)` : ''}`;
+        throw new AssertionFailed(`expected ${desc} to be ${kind} — ${saw}`, saw);
       });
       return;
     case 'text':
     case 'contains':
       return until(() => target.textContent({ timeout: 1000 }), (v) => typeof v === 'string' && matches(v),
-        `expected ${desc} to ${kind === 'text' ? 'have text' : 'contain text'} ${shown}`);
+        `expected ${desc} to ${kind === 'text' ? 'have text' : 'contain text'} ${shown}`,
+        // textContent includes <script> and hidden text (a JSON-LD blob on <body>);
+        // show what a person would see.
+        () => target.innerText({ timeout: 1000 }));
     case 'value':
       return until(() => target.inputValue({ timeout: 1000 }), (v) => typeof v === 'string' && matches(v),
         `expected ${desc} to have value ${event.valueRef ? `of ${event.valueRef}` : shown}`);
@@ -589,7 +639,7 @@ export async function replay(
 
   page.on('console', (msg) => {
     if (msg.type() !== 'error' && msg.type() !== 'warning') return;
-    signals.push({ kind: 'console', duringStep: currentStep, text: msg.text().slice(0, 500) });
+    signals.push({ kind: 'console', level: msg.type() === 'error' ? 'error' : 'warning', duringStep: currentStep, text: msg.text().slice(0, 500) });
   });
 
   page.on('pageerror', (err) => {
@@ -1019,7 +1069,15 @@ export async function replay(
         // every step regardless. Not comparing them meant execution could walk
         // into a page the plan had never seen and notice nothing until a locator
         // happened to miss.
-        if (event.expectedSig && event.expectedSig !== sig.sig) {
+        // A REDIRECT THAT LANDS A BEAT EARLY OR LATE IS NOT AN UNEXPECTED PAGE.
+        // Signing in submits, then the app routes to /auth/otp once its API
+        // answers — sometimes before this fingerprint, sometimes after. Seeing
+        // the page the previous step expected (not there yet) or the one the
+        // next step expects (there already) is the same path, a step out of
+        // phase. Never for the first step: that one detects a stale session.
+        const neighbours = i > 0 ? [walk[i - 1]?.event.expectedSig, walk[i + 1]?.event.expectedSig] : [];
+        const inPhase = neighbours.includes(sig.sig);
+        if (event.expectedSig && event.expectedSig !== sig.sig && !inPhase) {
           outcome.unexpectedPage = { expected: event.expectedSig, observed: sig.sig };
 
           // THE ESCALATION. An unexpected page is not automatically wrong — an
@@ -1045,7 +1103,13 @@ export async function replay(
           }
         }
       } catch (err) {
-        outcome.error = (err instanceof Error ? err.message : String(err)).split('\n')[0]!.slice(0, 200);
+        let message = (err instanceof Error ? err.message : String(err)).split('\n')[0]!;
+        // Playwright's first line ("locator.click: Timeout 5000ms exceeded.") leaves
+        // the locator to later lines; say which one, so the step can be found.
+        const desc = describeLocator(event);
+        if (desc !== '(no locator)' && !message.includes(desc)) message = `${desc}: ${message}`;
+        outcome.error = message.slice(0, 500);
+        if (err instanceof AssertionFailed && err.saw) outcome.saw = err.saw;
       }
 
       if (outcome.ok || attempt === maxAttempts) break;

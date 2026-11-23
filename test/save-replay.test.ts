@@ -221,3 +221,51 @@ test('on a tie, recall puts a proven flow ahead of an unproven one', async () =>
   assert.deepEqual(rank([m('shaky', 0.81, false), m('solid', 0.81, true), m('low', 0.5, true)]).map((x) => x.slug), ['solid', 'shaky', 'low']);
   assert.deepEqual(rank([m('shaky', 0.9, false), m('solid', 0.81, true)]).map((x) => x.slug), ['shaky', 'solid'], 'a clearly better match still wins');
 });
+
+test('a redirect caught a beat early or late is not an unexpected page; a real detour still is', { timeout: 120_000 }, async () => {
+  shop.set({ promo: false, broken: false });
+  const u = shop.url;
+  const steps = [
+    { seq: 0, ts: 0, action: 'goto', url: u, resolution: 'synthesized' },
+    { seq: 1, ts: 1, action: 'fill', role: 'textbox', name: 'Username', value: 'demo', url: u, resolution: 'accname' },
+    { seq: 2, ts: 2, action: 'fill', role: 'textbox', name: 'Password', valueRef: 'SECRET.password', url: u, resolution: 'accname' },
+    { seq: 3, ts: 3, action: 'click', role: 'button', name: 'Log in', url: u, resolution: 'accname' },
+    { seq: 4, ts: 4, action: 'assert', role: 'link', name: 'Cart', hints: { assert: 'visible' }, url: `${u}shop`, resolution: 'accname' },
+  ] as const;
+  const plain = buildRecording({ source: 'live', origin: 'test-phase', appSlug: 'shop', startUrl: u }, steps.map((s) => ({ ...s })));
+  const first = await replay(plain, { values });
+  assert.equal(first.ok, true);
+  const [login, shopPage] = [first.steps[2]!.sig!, first.steps[4]!.sig!];
+
+  // Saved while the sign-in redirect hadn't landed yet: step 3 expects the login page.
+  const early = { ...plain, events: plain.events.map((e) => ({ ...e, expectedSig: e.seq <= 3 ? login : shopPage })) };
+  const r = await replay(early, { values });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.steps.filter((s) => s.unexpectedPage), [], 'landing where the next step expects is the same path');
+
+  // A page nobody expected, before or after, is still flagged.
+  const detour = { ...plain, events: plain.events.map((e) => ({ ...e, expectedSig: e.seq === 3 ? '/somewhere-else#00000000' : e.seq < 3 ? login : '/also-not#00000000' })) };
+  const d = await replay(detour, { values });
+  assert.equal(d.steps.find((s) => s.seq === 3)?.unexpectedPage?.observed, shopPage);
+});
+
+test('a failed assertion names the locator and says what it saw — the visible text near the expected words', { timeout: 120_000 }, async () => {
+  const u = shop.url;
+  // A replay stops at its first failed step, so each check gets its own.
+  const failing = async (step: Record<string, unknown>) => {
+    const rec = buildRecording({ source: 'live', origin: 'test-saw', appSlug: 'shop', startUrl: u }, [
+      { seq: 0, ts: 0, action: 'goto', url: u, resolution: 'synthesized' },
+      { seq: 1, ts: 1, url: u, ...step } as never,
+    ]);
+    const r = await replay(rec, { values, timeoutMs: 1500 });
+    assert.equal(r.ok, false);
+    return r.steps.find((s) => s.seq === 1)!;
+  };
+  const text = await failing({ action: 'assert', css: 'body', value: 'Username: admin', hints: { assert: 'contains' }, resolution: 'css' });
+  assert.match(text.error!, /locator\('body'\)/, 'names the locator');
+  assert.match(text.saw!, /Username/, 'shows the text around the words it did find');
+  const visible = await failing({ action: 'assert', role: 'button', name: 'No such button', hints: { assert: 'visible' }, resolution: 'accname' });
+  assert.match(visible.saw!, /matched no elements/);
+  const click = await failing({ action: 'click', css: '#nothing-here', resolution: 'css' });
+  assert.match(click.error!, /#nothing-here/, 'a click that fails names its locator too');
+});
