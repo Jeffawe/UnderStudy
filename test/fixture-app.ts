@@ -32,7 +32,7 @@ export async function startFixtureApp(): Promise<FixtureApp> {
       return html(page('Shop — sign in', `
         <h1>Sign in</h1>
         <form method="post" action="/login">
-          <label>Username <input name="u"></label>
+          <label>Username <input name="u" placeholder="you@example.com"></label>
           <label>Password <input name="p" type="password"></label>
           <button type="submit">Log in</button>
         </form>`));

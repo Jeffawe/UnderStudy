@@ -30,13 +30,14 @@
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { Page } from 'playwright';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
+import { HOME } from '../store/settings.js';
 
 /** Gitignored: these are large, machine-local, and regenerable. */
-export const SHOTS_DIR = process.env.UNDERSTUDY_SHOTS_DIR ?? resolve('.understudy/shots');
+export const SHOTS_DIR = process.env.UNDERSTUDY_SHOTS_DIR ?? join(HOME, 'shots');
 
 /**
  * Below this fraction of changed pixels, say nothing.

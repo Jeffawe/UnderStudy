@@ -208,7 +208,8 @@ test('a failed replay is refused unless the caller keeps it — then it is unpro
   if (!kept.saved) return;
   assert.equal(kept.flow.proven, false);
   assert.match(kept.flow.unprovenBecause!, /replay failed/);
-  assert.equal(kept.run?.drift.firstRun, true, 'the failed run is still on record');
+  assert.equal(kept.run?.drift.firstRun, false, 'a failed run is not "the first run"');
+  assert.match(kept.run!.drift.notCompared!, /failed/);
   const { runs } = await collections();
   assert.equal((await runs.findOne({ app: 'shop', plan: ['broken'] }))?.status, 'failed');
 });

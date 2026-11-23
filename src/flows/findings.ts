@@ -19,7 +19,9 @@ export function stable(text: string): string {
   return text
     .replace(/(https?:\/\/[^\s'"?#]+)\?[^\s'"]*/g, '$1')
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid')
-    .replace(/\b\d{3,}\b/g, ':n')
+    // Not a port: `localhost:3000` is where the app is, not a varying id, and
+    // replacing it produced `localhost::n`.
+    .replace(/(?<![\w\]]:)\b\d{3,}\b/g, ':n')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 300);
@@ -121,6 +123,24 @@ export async function saveFindings(coll: Collection<Finding>, app: string, draft
       },
     })),
   );
+}
+
+const SEVERITY_RANK: Record<string, number> = { high: 3, medium: 2, low: 1 };
+
+/**
+ * Findings for an app, MOST SEVERE FIRST, then most frequent, then newest.
+ *
+ * Frequency alone put eight framework image warnings above the one real
+ * regression: a noisy console fires on every page, a broken route once.
+ * Sorted here rather than in the query because severity is a word, not a rank.
+ */
+export async function listFindings(coll: Collection<Finding>, app: string, opts: { all?: boolean; limit?: number } = {}): Promise<Finding[]> {
+  const rows = await coll.find(opts.all ? { app } : { app, status: 'open' }).toArray();
+  rows.sort((a, b) =>
+    (SEVERITY_RANK[b.severity] ?? 0) - (SEVERITY_RANK[a.severity] ?? 0)
+    || (b.occurrences ?? 0) - (a.occurrences ?? 0)
+    || +new Date(b.lastSeen) - +new Date(a.lastSeen));
+  return rows.slice(0, opts.limit ?? 40);
 }
 
 export type Verdict = 'issue' | 'lesson' | 'noise';

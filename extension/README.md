@@ -49,7 +49,7 @@ in the terminal to start recording from there.
      will start signed in too. Not sure? Leave it: Understudy copies the tab's
      sign-in anyway, then when you `save` it tries the flow without it first,
      and deletes the copy if it wasn't needed. Either way it's a file on your
-     machine (`.understudy/sessions/`, readable only by you), never sent
+     machine (`~/.understudy/sessions/`, readable only by you), never sent
      anywhere else.
 4. Use the page as normal. The icon shows **REC**.
 5. Click the icon → say what the flow does → **Stop**. With **Save as a flow

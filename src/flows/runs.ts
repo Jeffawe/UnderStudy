@@ -65,9 +65,9 @@ export async function recordRun(opts: {
     .toArray();
   // A failed run stops early; comparing its short path would report every
   // page it never reached as "gone", which is noise, not drift.
-  const drift = result.ok
+  const drift: Drift = result.ok
     ? compareToHistory(result.sigSequence, history.map((h) => h.sigSequence))
-    : compareToHistory([], []);
+    : { ...compareToHistory([], []), firstRun: false, notCompared: 'the run failed, so its path is incomplete' };
 
   // 2. Findings.
   const name = plan.join(' + ');

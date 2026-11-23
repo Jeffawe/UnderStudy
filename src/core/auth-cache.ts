@@ -23,11 +23,12 @@
 import { createHash } from 'node:crypto';
 import { chmod, mkdir, readFile, writeFile, unlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import type { BrowserContext } from 'playwright';
+import { HOME } from '../store/settings.js';
 
-export const SESSIONS_DIR =
-  process.env.UNDERSTUDY_SESSIONS_DIR ?? resolve('.understudy/sessions');
+/** Under ~/.understudy, not the current folder — see recording-store.ts. */
+export const SESSIONS_DIR = process.env.UNDERSTUDY_SESSIONS_DIR ?? join(HOME, 'sessions');
 
 /**
  * How long a saved session is worth trying at all.

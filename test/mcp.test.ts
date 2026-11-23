@@ -72,12 +72,10 @@ test('a bad remember batch comes back as a readable error, not a crash', async (
   assert.match(text(r), /trigger is empty/);
 });
 
-test('run without sub-goals asks the decompose question', async () => {
+test('a goal on an app with no flows says so, instead of asking how to plan it', async () => {
   const r = JSON.parse(text(await client.callTool({ name: 'understudy_run', arguments: { app: 'x', goal: 'buy a thing' } })));
-  assert.equal(r.status, 'waiting');
-  assert.equal(r.question.kind, 'decompose');
-  const next = JSON.parse(text(await client.callTool({ name: 'understudy_answer', arguments: { runId: r.runId, answer: { subGoals: ['buy a thing'] } } })));
-  assert.equal(next.status, 'blocked', 'nothing in memory does it — blocked, not guessed');
+  assert.equal(r.status, 'blocked');
+  assert.match(r.why, /no saved flows yet/);
 });
 
 test('ask the user to record, then save it — the whole path over MCP', { timeout: 120_000 }, async () => {
@@ -125,11 +123,16 @@ test('view the profile', async ({ page }) => {
   await page.getByRole('textbox', { name: 'Password' }).fill(process.env.AGENT_SHOP_PASSWORD!);
   await page.getByRole('button', { name: 'Log in' }).click();
   await page.getByRole('link', { name: 'Profile' }).click();
+  await expect(page.getByRole('heading', { name: 'Your profile' })).toBeVisible();
+  await expect(page.getByRole('list')).toHaveCount(2);
 });`);
     const saved = JSON.parse(text(await client.callTool({ name: 'understudy_save', arguments: { app: 'shop', name: 'View the profile', script: good } })));
     assert.equal(saved.saved, true, JSON.stringify(saved));
     assert.equal(saved.madeBy, 'agent');
-    assert.equal(saved.steps, 5);
+    assert.equal(saved.steps, 6, 'the visibility check is a step');
+    assert.ok((await import('node:fs')).existsSync(saved.recordingFile), 'says where the recording is');
+    assert.equal(saved.droppedAssertions.length, 1, 'the check it could not keep is reported');
+    assert.match(saved.droppedAssertions[0], /toHaveCount/);
 
     const recall = JSON.parse(text(await client.callTool({ name: 'understudy_recall', arguments: { app: 'shop', goal: 'view-the-profile' } })));
     assert.equal(recall.best.madeBy, 'agent');

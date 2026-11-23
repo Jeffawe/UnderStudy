@@ -61,6 +61,17 @@ To record, install the [Understudy recorder](https://chromewebstore.google.com/d
 Not using Chrome or another Chromium browser? See
 [extension/README.md](extension/README.md).
 
+**On Safari, or prefer a fresh browser over your own?** Record in a browser
+Understudy opens instead. It needs one extra download, the full Chromium
+browser (about 350 MB, once):
+
+```bash
+npx playwright install chromium
+understudy record myapp --new-browser --url https://your-app.example
+```
+
+Click through the flow in the window that opens, then close it to stop.
+
 | Setting | What it's for |
 |---|---|
 | `MONGODB_URI` | your Atlas `mongodb+srv://…` string, or local Community |
@@ -104,17 +115,6 @@ An unproven flow is marked as such in `flows` and recall; the first run of
 it that passes proves it. `understudy --help` lists everything. A flow that commits something real — a
 purchase, a deletion — is marked destructive and refused unless you pass
 `--allow-purchases`.
-
-**On Safari, or prefer a fresh browser over your own?** Record in a browser
-Understudy opens instead. It needs one extra download, the full Chromium
-browser (about 350 MB, once):
-
-```bash
-npx playwright install chromium
-understudy record myapp --new-browser --url https://your-app.example
-```
-
-Click through the flow in the window that opens, then close it to stop.
 
 ## Where your data goes
 

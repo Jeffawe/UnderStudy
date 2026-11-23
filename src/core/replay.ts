@@ -336,7 +336,16 @@ function locatorFor(root: Page | Frame, event: RawEvent): Locator | undefined {
       ...(event.exact ? { exact: true } : {}),
     });
   } else if (event.name) {
-    locator = base.getByText(name, event.exact ? { exact: true } : {});
+    // The lookup the source used. `getByPlaceholder('Email')` replayed as
+    // getByText can never match: an input has no text of its own.
+    const opts = event.exact ? { exact: true } : {};
+    switch (event.hints?.by) {
+      case 'placeholder': locator = base.getByPlaceholder(name, opts); break;
+      case 'label': locator = base.getByLabel(name, opts); break;
+      case 'title': locator = base.getByTitle(name, opts); break;
+      case 'alt': locator = base.getByAltText(name, opts); break;
+      default: locator = base.getByText(name, opts);
+    }
   } else if (event.role) {
     locator = base.getByRole(event.role as Parameters<Page['getByRole']>[0]);
   } else if (event.css) {
@@ -373,6 +382,122 @@ function locatorFor(root: Page | Frame, event: RawEvent): Locator | undefined {
   const nth = (event.hints?.nth as number | undefined) ?? undefined;
   if (nth !== undefined) locator = nth < 0 ? locator.last() : locator.nth(nth);
   return locator;
+}
+
+const NAME_LOOKUP_CALL: Record<string, string> = {
+  placeholder: 'getByPlaceholder', label: 'getByLabel', title: 'getByTitle', alt: 'getByAltText',
+};
+
+/**
+ * A step's locator as Playwright code, for error messages. "matched no
+ * elements" without saying WHICH locator sent people reading the source to find
+ * out what had been stored.
+ */
+export function describeLocator(event: RawEvent): string {
+  const q = (s: string) => `'${s.replace(/'/g, "\\'")}'`;
+  const name = event.name !== undefined
+    ? (event.hints?.nameRegex ? `/${event.name}/${String(event.hints.nameFlags ?? '')}` : q(event.name))
+    : undefined;
+  const exact = event.exact ? ', exact: true' : '';
+  let out: string;
+  if (event.role && name) out = `getByRole(${q(event.role)}, { name: ${name}${exact} })`;
+  else if (name) out = `${NAME_LOOKUP_CALL[String(event.hints?.by)] ?? 'getByText'}(${name}${exact ? ', { exact: true }' : ''})`;
+  else if (event.role) out = `getByRole(${q(event.role)})`;
+  else if (event.css) out = `locator(${q(event.css)})`;
+  else if (event.testId) out = `locator('[${event.testIdAttr ?? 'data-testid'}="${event.testId}"]')`;
+  else return '(no locator)';
+  const scope = Array.isArray(event.hints?.scope) ? (event.hints.scope as string[]).map((s) => `${s} >> `).join('') : '';
+  const hasText = typeof event.hints?.hasText === 'string' ? `.filter({ hasText: ${q(event.hints.hasText)} })` : '';
+  const nth = typeof event.hints?.nth === 'number' ? (event.hints.nth < 0 ? '.last()' : `.nth(${event.hints.nth})`) : '';
+  const frame = event.frameHint ? `frame *${event.frameHint} >> ` : '';
+  return `${frame}${scope}${out}${hasText}${nth}`;
+}
+
+/**
+ * A Playwright URL glob as a regex: `**` is anything, `*` anything but `/`.
+ * A glob with no scheme matches anywhere in the URL, as a path would.
+ */
+export function urlGlob(glob: string): RegExp {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i]!;
+    if (c === '*' && glob[i + 1] === '*') { re += '.*'; i++; }
+    else if (c === '*') re += '[^/]*';
+    else if (c === '?') re += '.';
+    else re += c.replace(/[.+^${}()|[\]\\/]/g, '\\$&');
+  }
+  return new RegExp(`${/^[a-z]+:/i.test(glob) || glob.startsWith('*') ? '^' : ''}${re}$`);
+}
+
+/** Whitespace-normalised, as Playwright's text assertions compare. */
+const squash = (s: string) => s.replace(/\s+/g, ' ').trim();
+
+/**
+ * Check an `assert` step, waiting up to the timeout for it to come true — the
+ * same patience Playwright's own `expect` has. Kinds: see script.ts AssertKind.
+ */
+async function checkAssert(page: Page, event: RawEvent, values: Record<string, string>, timeoutMs: number): Promise<void> {
+  const kind = String(event.hints?.assert ?? 'visible');
+  const expected = valueFor(event, values);
+  const valued = ['text', 'contains', 'value', 'title'].includes(kind);
+  if (valued && expected === undefined) {
+    throw new Error(`assert ${kind} has no expected value${event.valueRef ? ` — set ${event.valueRef}` : ''}`);
+  }
+  const regex = event.hints?.valueRegex ? new RegExp(expected!, String(event.hints.valueFlags ?? '')) : undefined;
+  const matches = (actual: string) =>
+    regex ? regex.test(actual)
+      : kind === 'contains' ? squash(actual).includes(squash(expected!))
+        : kind === 'value' ? actual === expected
+          : squash(actual) === squash(expected!);
+  const shown = regex ? `/${expected}/` : `"${expected}"`;
+
+  /** Poll `read` until `ok`, like expect's retrying; report the last value seen. */
+  const until = async (read: () => Promise<string | boolean | null>, ok: (v: string | boolean | null) => boolean, what: string) => {
+    const deadline = Date.now() + timeoutMs;
+    let last: string | boolean | null = null;
+    for (;;) {
+      last = await read().catch(() => null);
+      if (ok(last)) return;
+      if (Date.now() >= deadline) {
+        throw new Error(`${what}${last === null ? '' : `, got ${typeof last === 'string' ? `"${squash(last).slice(0, 80)}"` : String(last)}`}`);
+      }
+      await page.waitForTimeout(100);
+    }
+  };
+
+  if (kind === 'title') {
+    return until(() => page.title(), (v) => typeof v === 'string' && matches(v), `expected the page title to be ${shown}`);
+  }
+
+  const root: Page | Frame = event.frameHint
+    ? (page.frames().find((f) => f.url().includes(event.frameHint!) || f.name().endsWith(event.frameHint!)) ?? page)
+    : page;
+  const locator = locatorFor(root, event);
+  if (!locator) throw new Error('assert step has no usable locator (no role, name, css or testId)');
+  const target = locator.first();
+  const desc = describeLocator(event);
+
+  switch (kind) {
+    case 'visible':
+    case 'hidden':
+      await target.waitFor({ state: kind, timeout: timeoutMs }).catch(async () => {
+        const count = await locator.count().catch(() => 0);
+        throw new Error(`expected ${desc} to be ${kind}${kind === 'visible' && count === 0 ? ' — it matched no elements' : ''}`);
+      });
+      return;
+    case 'text':
+    case 'contains':
+      return until(() => target.textContent({ timeout: 1000 }), (v) => typeof v === 'string' && matches(v),
+        `expected ${desc} to ${kind === 'text' ? 'have text' : 'contain text'} ${shown}`);
+    case 'value':
+      return until(() => target.inputValue({ timeout: 1000 }), (v) => typeof v === 'string' && matches(v),
+        `expected ${desc} to have value ${event.valueRef ? `of ${event.valueRef}` : shown}`);
+    case 'checked':
+    case 'unchecked':
+      return until(() => target.isChecked({ timeout: 1000 }), (v) => v === (kind === 'checked'), `expected ${desc} to be ${kind}`);
+    default:
+      throw new Error(`replay does not implement assert '${kind}'`);
+  }
 }
 
 /**
@@ -598,11 +723,24 @@ export async function replay(
 
           if (event.action === 'wait_url') {
             // Substring, not equality: recordings carry concrete URLs while the
-            // thing worth waiting for is the route.
-            await page.waitForURL((u) => u.href.includes(expected), { timeout: timeoutMs });
+            // thing worth waiting for is the route. A script's own
+            // `waitForURL('**/dashboard')` or `toHaveURL(/done/)` keeps its
+            // glob or regex meaning.
+            const pattern = event.hints?.urlRegex
+              ? new RegExp(expected, String(event.hints.urlFlags ?? ''))
+              : expected.includes('*') ? urlGlob(expected) : undefined;
+            await page
+              .waitForURL((u) => (pattern ? pattern.test(u.href) : u.href.includes(expected)), { timeout: timeoutMs })
+              .catch(() => {
+                throw new Error(`the URL never matched ${pattern ? String(pattern) : `"${expected}"`} (it is ${page.url()})`);
+              });
           } else {
             await page.getByText(expected).first().waitFor({ state: 'visible', timeout: timeoutMs });
           }
+          outcome.ok = true;
+        } else if (event.action === 'assert') {
+          // A check, not an action: nothing is dispatched, so a retry is safe.
+          await checkAssert(page, event, values, timeoutMs);
           outcome.ok = true;
         } else if (event.action === 'snapshot') {
           // A checkpoint addresses no element — it is a moment, not a target.
@@ -747,7 +885,7 @@ export async function replay(
             }
           }
 
-          if (outcome.matched === 0) throw new Error('locator matched no elements');
+          if (outcome.matched === 0) throw new Error(`locator ${describeLocator(event)} matched no elements`);
           const target = outcome.matched > 1 ? locator.first() : locator;
 
           // Past this line the app may have been changed. Everything above is

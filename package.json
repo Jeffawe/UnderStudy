@@ -42,7 +42,7 @@
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && tsc",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node --import tsx --import ./test/setup.ts --test test/*.test.ts",
     "prepack": "npm run extension:package && npm run build",
     "understudy": "tsx src/entry/cli.ts",
     "mcp": "tsx src/entry/mcp.ts",

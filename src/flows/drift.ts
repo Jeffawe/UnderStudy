@@ -26,6 +26,12 @@ export interface DriftStep {
 export interface Drift {
   /** No earlier passed run to compare with — not drift, just the first time. */
   firstRun: boolean;
+  /**
+   * Why there was no comparison at all, when there wasn't one. A FAILED run
+   * stops early, so its path isn't compared — and it used to be reported as
+   * "first run", which read as "the passing run a minute ago never happened".
+   */
+  notCompared?: string;
   changed: boolean;
   /** Pages no recent run has ever visited. The interesting case. */
   added: string[];

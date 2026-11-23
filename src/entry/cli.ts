@@ -25,6 +25,8 @@ import { chromium } from 'playwright';
 import { emitFlow, type Framework } from '../flows/emit.js';
 import { recordingFrom, proveAndSave, proveByRun, type ProveAndSave } from '../flows/save.js';
 import { recordRun, type RecordedRun } from '../flows/runs.js';
+import { listFindings } from '../flows/findings.js';
+import { VERSION } from './version.js';
 import { recall, type Recall } from '../memory/recall.js';
 import { setPlaceholders, appPlaceholders } from '../memory/placeholders.js';
 import * as store from '../store/db.js';
@@ -40,6 +42,7 @@ const USAGE = `understudy — learn a web app, then test it by intent
 
 USAGE
   understudy <command> [options]
+  understudy --version
 
 COMMANDS
   config                where settings come from; set them, or point at an env file
@@ -54,7 +57,7 @@ COMMANDS
   flows <app>           list an app's saved flows and how each last ran
   replay <hash>         re-run a recording file headless
   replay <app> <flow>   re-run a saved flow; records the run, drift and findings
-  findings <app>        what looked broken, most frequent first
+  findings <app>        what looked broken, most severe first
   recall <app> "<goal>" what memory knows about a goal — nothing runs
   run <app> "<goal>"    find the flow that does the goal, and run it
   answer <runId> <json> answer a question a planned run stopped on
@@ -319,7 +322,9 @@ function waitForEnter(prompt: string): Promise<void> {
 function printEvents(recording: RawRecording) {
   for (const e of recording.events) {
     const value = e.value !== undefined ? ` = "${e.value}"` : e.valueRef ? ` = <${e.valueRef}>` : '';
-    console.log(`  ${String(e.seq).padStart(2)}  ${e.action.padEnd(7)} ${(e.role ?? '').padEnd(9)} ${e.name ?? ''}${value}`);
+    const check = e.action === 'assert' ? ` (${String(e.hints?.assert ?? 'visible')})` : '';
+    const by = typeof e.hints?.by === 'string' ? `[${e.hints.by}] ` : '';
+    console.log(`  ${String(e.seq).padStart(2)}  ${e.action.padEnd(7)} ${(e.role ?? '').padEnd(9)} ${by}${e.name ?? e.testId ?? e.css ?? ''}${value}${check}`);
   }
 }
 
@@ -490,7 +495,7 @@ async function cmdImport(positional: string[], flags: Flags) {
   // A script may rely on a baseURL from playwright.config, so goto('/') has no
   // origin. The app's remembered base URL fills that in.
   const fallback = str(flags.get('url')) ?? (await resolveBaseUrl(slug, undefined).catch(() => undefined));
-  const { recording: parsed, warnings } = await parseScript(file, slug, fallback);
+  const { recording: parsed, warnings, dropped } = await parseScript(file, slug, fallback);
 
   // --until keeps the proven prefix — e.g. everything before a real purchase.
   const until = str(flags.get('until'));
@@ -516,6 +521,11 @@ async function cmdImport(positional: string[], flags: Flags) {
   if (warnings.length) {
     console.log(`\n${warnings.length} call(s) could not be mapped:`);
     for (const w of warnings.slice(0, 10)) console.log(`  ${w}`);
+  }
+  // Not fatal — the flow still replays — but it checks less than the script.
+  if (dropped.length) {
+    console.log(`\n${dropped.length} assertion(s) not kept:`);
+    for (const d of dropped.slice(0, 10)) console.log(`  ${d}`);
   }
 
   const { path, existed } = await saveRecording(recording);
@@ -767,7 +777,8 @@ function printReplay(result: ReplayResult) {
 /** What recording the run added: drift against earlier runs, and findings. */
 function printRunReport(run: RecordedRun) {
   const { drift } = run;
-  if (drift.firstRun) console.log('\ndrift    first passed run — this path is now the baseline');
+  if (drift.notCompared) console.log(`\ndrift    not compared — ${drift.notCompared}`);
+  else if (drift.firstRun) console.log('\ndrift    first passed run of this plan — this path is now the baseline');
   else if (!drift.changed) console.log('\ndrift    same path as recent runs');
   else {
     console.log('\ndrift    PATH CHANGED');
@@ -965,8 +976,7 @@ async function cmdFlows(positional: string[]) {
 async function cmdFindings(positional: string[], flags: Flags) {
   const app = positional[0] ?? fail('findings needs an app name', 'understudy findings myapp');
   const { findings } = await store.collections();
-  const filter = flags.has('all') ? { app } : { app, status: 'open' as const };
-  const rows = await findings.find(filter).sort({ occurrences: -1, lastSeen: -1 }).limit(50).toArray();
+  const rows = await listFindings(findings, app, { all: flags.has('all'), limit: 50 });
   if (!rows.length) {
     console.log(flags.has('all') ? `no findings for '${app}'` : `no open findings for '${app}' (--all to include triaged ones)`);
     return;
@@ -1010,6 +1020,10 @@ async function cmdRecordings(positional: string[]) {
 async function main() {
   const { flags, positional } = parseArgs(process.argv.slice(2));
   const [command, ...rest] = positional;
+  if (flags.has('version') || flags.has('v') || command === 'version') {
+    console.log(VERSION);
+    return;
+  }
   if (!command || flags.has('help') || flags.has('h')) {
     console.log(USAGE);
     return;

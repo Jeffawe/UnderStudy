@@ -145,3 +145,15 @@ test('a missing login value stops the run before any browser opens', async () =>
   await assert.rejects(execute(recording), /nothing was run[\s\S]*UNDERSTUDY_SECRET_NOBODY_SETS_THIS/);
   assert.ok(Date.now() - t0 < 1000, 'refused at once — no browser was launched');
 });
+
+test('findings keep port numbers, and list the most severe first', async () => {
+  assert.equal(stable('GET http://localhost:3000/api/orders/12345 failed'), 'GET http://localhost:3000/api/orders/:n failed');
+  const { listFindings } = await import('../src/flows/findings.js');
+  const rows = [
+    { severity: 'low', occurrences: 8, lastSeen: new Date(2), statement: 'image warning' },
+    { severity: 'high', occurrences: 1, lastSeen: new Date(1), statement: 'regression' },
+    { severity: 'medium', occurrences: 3, lastSeen: new Date(1), statement: 'a 404' },
+  ];
+  const coll = { find: () => ({ toArray: async () => [...rows] }) } as never;
+  assert.deepEqual((await listFindings(coll, 'shop')).map((f) => f.statement), ['regression', 'a 404', 'image warning'], 'most severe first');
+});

@@ -48,7 +48,51 @@ type LocatorBit = {
   hasText?: TextMatch;
   /** A filter form the IR can't express, reported rather than dropped. */
   unsupported?: string;
+  /**
+   * Which Playwright lookup found the name, when it wasn't plain text.
+   * `getByPlaceholder('Email')` and `getByText('Email')` find different
+   * elements — an input has no text — so replay must use the same lookup.
+   */
+  by?: NameLookup;
 };
+
+/** The name-based lookups other than text, as stored in `hints.by`. */
+export type NameLookup = 'placeholder' | 'label' | 'title' | 'alt';
+
+const NAME_LOOKUPS: Record<string, NameLookup | undefined> = {
+  getByPlaceholder: 'placeholder',
+  getByLabel: 'label',
+  getByTitle: 'title',
+  getByAltText: 'alt',
+  getByText: undefined,
+};
+
+/**
+ * Playwright's assertions and waits that a recording keeps, and what each
+ * becomes. They are the point of an end-to-end test — without them a flow only
+ * checks that what it clicks exists — so they used to be dropped in silence,
+ * which was the worst outcome. One the IR can't express is now reported.
+ *
+ *   expect(page).toHaveURL(x) / page.waitForURL(x)   → wait_url
+ *   expect(page).toHaveTitle(x)                       → assert title
+ *   expect(locator).toBeVisible()                     → assert visible
+ *   expect(locator).toBeHidden() / not.toBeVisible()  → assert hidden
+ *   expect(locator).toHaveText(x)                     → assert text (whole text)
+ *   expect(locator).toContainText(x)                  → assert contains
+ *   expect(locator).toHaveValue(x)                    → assert value
+ *   expect(locator).toBeChecked() / not.toBeChecked() → assert checked / unchecked
+ *   page.waitForSelector(css)                         → assert visible
+ */
+export const KEPT_ASSERTIONS = [
+  'toHaveURL', 'toHaveTitle', 'toBeVisible', 'toBeHidden', 'toHaveText',
+  'toContainText', 'toHaveValue', 'toBeChecked', 'waitForURL', 'waitForSelector',
+] as const;
+
+/** What an `assert` step checks, in `hints.assert`. */
+export type AssertKind = 'visible' | 'hidden' | 'text' | 'contains' | 'value' | 'checked' | 'unchecked' | 'title';
+
+/** Waits that need nothing kept: replay already settles the page after every step. */
+const SETTLING_WAITS = new Set(['waitForLoadState', 'waitForNavigation']);
 
 /** Terminal calls that are actions rather than refinements. */
 const ACTIONS: Record<string, RecordedAction> = {
@@ -130,6 +174,12 @@ export interface ParsedScript {
   recording: RawRecording;
   /** Calls that looked like Playwright actions but could not be mapped. */
   warnings: string[];
+  /**
+   * Assertions and waits that were NOT kept. Not fatal — the flow still
+   * replays — but the flow checks less than the script did, and the caller
+   * must be told so rather than find out by opening the recording.
+   */
+  dropped: string[];
 }
 
 const text = (node: ts.Node): string | undefined =>
@@ -254,8 +304,9 @@ function locatorBit(method: string, args: readonly ts.Expression[]): LocatorBit 
       const { name, exact } = readOptions(args[1]);
       return role ? { role, ...(name !== undefined ? { name } : {}), ...(exact ? { exact } : {}) } : undefined;
     }
-    // Playwright's accname falls back to the placeholder, so a placeholder
-    // lookup and an accessible name are the same thing to us.
+    // The lookup is KEPT, not flattened to text: `getByPlaceholder('Email')`
+    // replayed as `getByText('Email')` can never match an input, which has no
+    // text. See LocatorBit.by.
     case 'getByPlaceholder':
     case 'getByLabel':
     case 'getByText':
@@ -263,7 +314,8 @@ function locatorBit(method: string, args: readonly ts.Expression[]): LocatorBit 
     case 'getByAltText': {
       const name = textMatch(first);
       const { exact } = readOptions(args[1]);
-      return name !== undefined ? { name, ...(exact ? { exact } : {}) } : undefined;
+      const by = NAME_LOOKUPS[method];
+      return name !== undefined ? { name, ...(exact ? { exact } : {}), ...(by ? { by } : {}) } : undefined;
     }
     case 'getByTestId': {
       const id = first ? text(first) : undefined;
@@ -343,6 +395,162 @@ function envVariable(arg: ts.Expression): string | undefined {
   return undefined;
 }
 
+/** Does this bit say WHICH element, rather than only narrowing one? */
+const addresses = (b: LocatorBit) =>
+  b.role !== undefined || b.name !== undefined || b.css !== undefined || b.testId !== undefined;
+
+/** A locator chain, read back to its root. */
+interface Target {
+  /** The chain starts at something page-like: `page`, `frame`, `this.page`. */
+  rooted: boolean;
+  /** The chain IS the page — `expect(page)`, not `expect(page.getByX())`. */
+  bare: boolean;
+  /** The element, with nth / frame / text filter applied. */
+  merged: LocatorBit;
+  scope?: string[];
+  /** A chain step that wasn't understood, kept as a hint. */
+  unknown?: string;
+  unsupported?: string;
+}
+
+/**
+ * Unwind `page.getByRole('navigation').getByText('Login').nth(1)` into one
+ * element. Shared by actions and assertions, which address the same way.
+ */
+function readTarget(expr: ts.Expression): Target {
+  const bits: LocatorBit[] = [];
+  let cursor = expr;
+  let unknown: string | undefined;
+  while (ts.isCallExpression(cursor) && ts.isPropertyAccessExpression(cursor.expression)) {
+    const bit = locatorBit(cursor.expression.name.text, cursor.arguments);
+    if (!bit) unknown ??= cursor.expression.name.text;
+    else bits.unshift(bit);
+    cursor = cursor.expression.expression;
+  }
+
+  // The root must be something page-like. `page`, `frame`, a page object's
+  // `this.page` — but NOT `expect(...)`, which is an assertion.
+  const rootText = cursor.getText();
+  const rooted = /(^|\.)page$|^frame$|^context$/.test(rootText);
+
+  // A CHAIN IS SCOPE + TARGET, NOT ONE MERGED ELEMENT.
+  //
+  // `page.getByRole('navigation').getByText('Login')` addresses the text
+  // "Login" *inside* the navigation landmark. Flattening the chain produced
+  // role=navigation name="Login" — an element that does not exist, and a
+  // locator that would never resolve on replay.
+  //
+  // So the TARGET is the last link that actually addresses something, and
+  // everything before it is scope, kept as a hint rather than folded into the
+  // element's own identity.
+  let targetIndex = -1;
+  for (let i = bits.length - 1; i >= 0; i--) {
+    if (addresses(bits[i]!)) {
+      targetIndex = i;
+      break;
+    }
+  }
+  const target: LocatorBit = targetIndex >= 0 ? bits[targetIndex]! : {};
+  const scopeBits = targetIndex > 0 ? bits.slice(0, targetIndex).filter(addresses) : [];
+
+  // nth, frameHint and hasText are positional/structural: they apply to the
+  // target wherever in the chain they were written. hasText takes the LAST
+  // one, matching nth — in practice a filter directly follows the locator it
+  // narrows.
+  const nth = [...bits].reverse().find((b) => b.nth !== undefined)?.nth;
+  const frameHint = bits.find((b) => b.frameHint !== undefined)?.frameHint;
+  const hasText = [...bits].reverse().find((b) => b.hasText !== undefined)?.hasText;
+  const unsupported = bits.find((b) => b.unsupported !== undefined)?.unsupported;
+
+  return {
+    rooted,
+    bare: bits.length === 0 && !unknown,
+    merged: {
+      ...target,
+      ...(nth !== undefined ? { nth } : {}),
+      ...(frameHint !== undefined ? { frameHint } : {}),
+      ...(hasText !== undefined ? { hasText } : {}),
+    },
+    ...(scopeBits.length
+      ? { scope: scopeBits.map((b) => (b.role ? `role=${b.role}` : b.css ? `css=${b.css}` : `name=${b.name?.source}`)) }
+      : {}),
+    ...(unknown ? { unknown } : {}),
+    ...(unsupported ? { unsupported } : {}),
+  };
+}
+
+/** The element's identity fields of an event. */
+function who(m: LocatorBit): Partial<RawEvent> {
+  return {
+    ...(m.role ? { role: m.role } : {}),
+    // `name` stays a plain string because sig(), selector dedupe and the
+    // embeddings all key on it. When the source was a regex, the string is its
+    // SOURCE and hints carry the regex-ness so replay can rebuild the real
+    // matcher — `exact` would be wrong here, a source like `Version 2\.5`
+    // never equals an accessible name.
+    ...(m.name !== undefined ? { name: m.name.source } : {}),
+    ...(m.exact ? { exact: m.exact } : {}),
+  };
+}
+
+/** The element's fallback addressing fields of an event. */
+function where(m: LocatorBit): Partial<RawEvent> {
+  return {
+    ...(m.css ? { css: m.css } : {}),
+    ...(m.testId ? { testId: m.testId } : {}),
+    ...(m.frameHint ? { frameHint: m.frameHint } : {}),
+  };
+}
+
+/** The hints an addressed event carries, plus any the caller adds. */
+function hintsOf(t: Target, extra: Record<string, unknown> = {}): { hints?: Record<string, unknown> } {
+  const m = t.merged;
+  const hints: Record<string, unknown> = {
+    ...(m.nth !== undefined ? { nth: m.nth } : {}),
+    ...(t.scope ? { scope: t.scope } : {}),
+    ...(t.unknown ? { unparsedChainStep: t.unknown } : {}),
+    ...(m.hasText
+      ? { hasText: m.hasText.source, ...(m.hasText.regex ? { hasTextRegex: true, hasTextFlags: m.hasText.flags } : {}) }
+      : {}),
+    ...(m.name?.regex ? { nameRegex: true, nameFlags: m.name.flags } : {}),
+    ...(m.by ? { by: m.by } : {}),
+    ...extra,
+  };
+  return Object.keys(hints).length ? { hints } : {};
+}
+
+/**
+ * `expect(x).toBeVisible()`, `expect.soft(x).not.toBeChecked()` → its parts.
+ * `poll` is reported as its own kind: it takes a function, not a locator.
+ */
+function expectCall(node: ts.CallExpression): { matcher: string; negated: boolean; subject?: ts.Expression; flavour: string } | undefined {
+  if (!ts.isPropertyAccessExpression(node.expression)) return undefined;
+  const matcher = node.expression.name.text;
+  let recv = node.expression.expression;
+  let negated = false;
+  if (ts.isPropertyAccessExpression(recv) && recv.name.text === 'not') {
+    negated = true;
+    recv = recv.expression;
+  }
+  if (!ts.isCallExpression(recv)) return undefined;
+  const callee = recv.expression;
+  const flavour = ts.isIdentifier(callee) && callee.text === 'expect'
+    ? 'expect'
+    : ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression) && callee.expression.text === 'expect'
+      ? `expect.${callee.name.text}`
+      : undefined;
+  if (!flavour) return undefined;
+  return { matcher, negated, flavour, ...(recv.arguments[0] ? { subject: recv.arguments[0] } : {}) };
+}
+
+/** Waits that sit in `Promise.all([...])` beside the action that triggers them. */
+const WAIT_METHODS = new Set(['waitForURL', 'waitForSelector', 'waitForLoadState', 'waitForNavigation', 'waitForResponse', 'waitForRequest', 'waitForEvent']);
+
+const isWaitCall = (e: ts.Expression): boolean => {
+  const x = ts.isAwaitExpression(e) ? e.expression : e;
+  return ts.isCallExpression(x) && ts.isPropertyAccessExpression(x.expression) && WAIT_METHODS.has(x.expression.name.text);
+};
+
 export async function parseScript(
   filePath: string,
   appSlug: string,
@@ -359,13 +567,114 @@ export async function parseScript(
 
   const events: RawEvent[] = [];
   const warnings: string[] = [];
+  const dropped: string[] = [];
 
   // A static read cannot know which page it is on, so the last goto stands in.
   // Anything before the first goto is attributed to the fallback URL.
   let currentUrl = fallbackUrl ?? '';
   let startUrl = fallbackUrl ?? '';
 
+  const snippet = (node: ts.Node) => node.getText().replace(/\s+/g, ' ').slice(0, 80);
+  const drop = (why: string, node: ts.Node) => dropped.push(`${why}: ${snippet(node)}`);
+
+  /** A URL wait, from `waitForURL(x)` or `expect(page).toHaveURL(x)`. */
+  const pushWaitUrl = (arg: ts.Expression | undefined, node: ts.Node) => {
+    const match = textMatch(arg);
+    if (!match) return drop('URL wait with a non-literal URL, not kept', node);
+    events.push({
+      seq: events.length,
+      ts: events.length,
+      action: 'wait_url',
+      value: match.source,
+      url: currentUrl,
+      resolution: 'script-literal',
+      ...(match.regex ? { hints: { urlRegex: true, urlFlags: match.flags } } : {}),
+    });
+  };
+
+  /** An `assert` step on an element (or, for `title`, the page). */
+  const pushAssert = (t: Target, kind: AssertKind, arg: ts.Expression | undefined, node: ts.Node) => {
+    const needsValue = kind === 'text' || kind === 'contains' || kind === 'value' || kind === 'title';
+    let valued: { value?: string; valueRef?: string } = {};
+    const extra: Record<string, unknown> = { assert: kind };
+    if (needsValue) {
+      const match = textMatch(arg);
+      if (match) {
+        valued = { value: match.source };
+        if (match.regex) Object.assign(extra, { valueRegex: true, valueFlags: match.flags });
+        // A literal password in an assertion is still a literal password.
+        if (kind === 'value' && !match.regex) {
+          const hint = t.merged.name?.source || t.merged.testId || t.merged.css || 'field';
+          valued = redactValue(hint, match.source, undefined, [t.merged.name?.source, t.merged.css, t.merged.testId].filter(Boolean).join(' '));
+        }
+      } else if (arg && !ts.isArrayLiteralExpression(arg)) {
+        valued = readArgument(arg);
+      } else {
+        return drop(`${kind} check with no single expected value, not kept`, node);
+      }
+    }
+    events.push({
+      seq: events.length,
+      ts: events.length,
+      action: 'assert',
+      ...who(t.merged),
+      ...valued,
+      ...where(t.merged),
+      url: currentUrl,
+      resolution: 'script-literal',
+      ...hintsOf(t, extra),
+    });
+  };
+
+  /** `expect(...)` — kept if the IR can say it, otherwise reported. */
+  const visitExpect = (node: ts.CallExpression, ex: NonNullable<ReturnType<typeof expectCall>>) => {
+    if (SNAPSHOT_CALLS.has(ex.matcher)) return; // a visual checkpoint, handled above
+    if (ex.flavour !== 'expect' && ex.flavour !== 'expect.soft') return drop(`${ex.flavour}() is not kept`, node);
+    if (!ex.subject) return drop('expect() with nothing to check, not kept', node);
+
+    const t = readTarget(ex.subject);
+    if (!t.rooted) {
+      return drop('assertion on a value or a locator held in a variable, not kept — write the locator inline, e.g. expect(page.getByRole(...))', node);
+    }
+    const arg = node.arguments[0];
+    const { matcher, negated } = ex;
+
+    if (t.bare) {
+      if (matcher === 'toHaveURL' && !negated) return pushWaitUrl(arg, node);
+      if (matcher === 'toHaveTitle' && !negated) return pushAssert(t, 'title', arg, node);
+      return drop(`page assertion ${negated ? 'not.' : ''}${matcher}() is not kept`, node);
+    }
+    if (!addresses(t.merged)) return drop('assertion on an element with no usable locator, not kept', node);
+    if (t.unsupported) warnings.push(`${t.unsupported} could not be represented: ${snippet(node)}`);
+
+    const kind: AssertKind | undefined =
+      matcher === 'toBeVisible' ? (negated ? 'hidden' : 'visible')
+      : matcher === 'toBeHidden' ? (negated ? 'visible' : 'hidden')
+      : matcher === 'toBeChecked' ? (negated ? 'unchecked' : 'checked')
+      : negated ? undefined
+      : matcher === 'toHaveText' ? 'text'
+      : matcher === 'toContainText' ? 'contains'
+      : matcher === 'toHaveValue' ? 'value'
+      : undefined;
+    if (!kind) return drop(`assertion ${negated ? 'not.' : ''}${matcher}() is not kept`, node);
+    pushAssert(t, kind, arg, node);
+  };
+
   const visit = (node: ts.Node): void => {
+    // `Promise.all([page.waitForURL(x), page.click(y)])` — the wait is written
+    // first but happens after the click it waits on. Replay is sequential, so
+    // the actions go first and the waits after them.
+    if (
+      ts.isArrayLiteralExpression(node) &&
+      ts.isCallExpression(node.parent) &&
+      /^Promise\.(all|allSettled|race)$/.test(node.parent.expression.getText()) &&
+      node.elements.some(isWaitCall)
+    ) {
+      for (const e of node.elements) if (!isWaitCall(e)) visit(e);
+      for (const e of node.elements) if (isWaitCall(e)) visit(e);
+      return;
+    }
+
     // VISUAL CHECKPOINTS, WHICH ARE NOT PAGE METHODS.
     //
     // `expect(page).toHaveScreenshot('x.png')` is a chain off expect(), and a
@@ -396,8 +705,17 @@ export async function parseScript(
             resolution: 'script-literal',
           });
         } else {
-          warnings.push(`visual checkpoint with no literal name: ${node.getText().slice(0, 70)}`);
+          warnings.push(`visual checkpoint with no literal name: ${snippet(node)}`);
         }
+      }
+
+      // ASSERTIONS. These used to vanish without a word, leaving a flow that
+      // only proved its buttons exist. See KEPT_ASSERTIONS.
+      const ex = expectCall(node);
+      if (ex) {
+        visitExpect(node, ex);
+        // The subject's own chain is addressing, not actions — don't walk it.
+        return;
       }
     }
 
@@ -421,76 +739,35 @@ export async function parseScript(
             resolution: 'unresolved',
           });
         } else {
-          warnings.push(`${method}() cannot be expressed by the IR, step DROPPED: ${node.getText().slice(0, 70)}`);
+          warnings.push(`${method}() cannot be expressed by the IR, step DROPPED: ${snippet(node)}`);
         }
       }
 
-      if (action) {
-        // Unwind the chain back to its root, collecting addressing bits.
-        const bits: LocatorBit[] = [];
-        let cursor: ts.Expression = node.expression.expression;
-        let rooted = false;
-        let unknown: string | undefined;
-
-        while (ts.isCallExpression(cursor) && ts.isPropertyAccessExpression(cursor.expression)) {
-          const bit = locatorBit(cursor.expression.name.text, cursor.arguments);
-          if (!bit) unknown ??= cursor.expression.name.text;
-          else bits.unshift(bit);
-          cursor = cursor.expression.expression;
+      // WAITS on the page.
+      if (!action && WAIT_METHODS.has(method) && readTarget(node.expression.expression).rooted) {
+        const arg = node.arguments[0];
+        if (method === 'waitForURL') pushWaitUrl(arg, node);
+        else if (method === 'waitForSelector') {
+          const css = arg ? text(arg) : undefined;
+          if (css === undefined) drop('waitForSelector with a non-literal selector, not kept', node);
+          else {
+            const state = readState(node.arguments[1]);
+            const kind: AssertKind = state === 'hidden' || state === 'detached' ? 'hidden' : 'visible';
+            pushAssert({ rooted: true, bare: false, merged: { css } }, kind, undefined, node);
+          }
+        } else if (!SETTLING_WAITS.has(method)) {
+          drop(`${method}() is not kept (replay can't wait on network events)`, node);
         }
+        // waitForLoadState / waitForNavigation: replay settles after every step anyway.
+      }
 
-        // The root must be something page-like. `page`, `frame`, a page object's
-        // `this.page` — but NOT `expect(...)`, which is an assertion.
-        const rootText = cursor.getText();
-        rooted = /(^|\.)page$|^frame$|^context$/.test(rootText) || rootText === 'page';
-
-        if (rooted) {
-          // A CHAIN IS SCOPE + TARGET, NOT ONE MERGED ELEMENT.
-          //
-          // `page.getByRole('navigation').getByText('Login')` addresses the
-          // text "Login" *inside* the navigation landmark. Flattening the chain
-          // produced role=navigation name="Login" — an element that does not
-          // exist, and a locator that would never resolve on replay.
-          //
-          // So the TARGET is the last link that actually addresses something,
-          // and everything before it is scope, kept as a hint rather than
-          // folded into the element's own identity.
-          const addresses = (b: LocatorBit) =>
-            b.role !== undefined || b.name !== undefined || b.css !== undefined || b.testId !== undefined;
-
-          let targetIndex = -1;
-          for (let i = bits.length - 1; i >= 0; i--) {
-            if (addresses(bits[i]!)) {
-              targetIndex = i;
-              break;
-            }
+      if (action) {
+        const t = readTarget(node.expression.expression);
+        if (t.rooted) {
+          const merged = t.merged;
+          if (t.unsupported) {
+            warnings.push(`${t.unsupported} could not be represented: ${snippet(node)}`);
           }
-
-          const target: LocatorBit = targetIndex >= 0 ? bits[targetIndex]! : {};
-          const scopeBits = targetIndex > 0 ? bits.slice(0, targetIndex).filter(addresses) : [];
-
-          // nth, frameHint and hasText are positional/structural: they apply to
-          // the target wherever in the chain they were written. hasText takes
-          // the LAST one, matching nth — in practice a filter directly follows
-          // the locator it narrows.
-          const nth = [...bits].reverse().find((b) => b.nth !== undefined)?.nth;
-          const frameHint = bits.find((b) => b.frameHint !== undefined)?.frameHint;
-          const hasText = [...bits].reverse().find((b) => b.hasText !== undefined)?.hasText;
-          const unsupported = bits.find((b) => b.unsupported !== undefined)?.unsupported;
-
-          if (unsupported) {
-            warnings.push(`${unsupported} could not be represented: ${node.getText().slice(0, 70)}`);
-          }
-
-          const merged: LocatorBit = {
-            ...target,
-            ...(nth !== undefined ? { nth } : {}),
-            ...(frameHint !== undefined ? { frameHint } : {}),
-            ...(hasText !== undefined ? { hasText } : {}),
-          };
-          const scope = scopeBits.length
-            ? scopeBits.map((b) => (b.role ? `role=${b.role}` : b.css ? `css=${b.css}` : `name=${b.name?.source}`))
-            : undefined;
 
           if (action === 'goto') {
             const urlArg = node.arguments[0];
@@ -513,10 +790,10 @@ export async function parseScript(
                 resolution: 'script-literal',
               });
             } else {
-              warnings.push(`goto with a non-literal URL: ${node.getText().slice(0, 70)}`);
+              warnings.push(`goto with a non-literal URL: ${snippet(node)}`);
             }
-          } else if (!merged.role && !merged.name && !merged.css && !merged.testId) {
-            warnings.push(`unaddressable ${action}: ${node.getText().slice(0, 70)}`);
+          } else if (!addresses(merged)) {
+            warnings.push(`unaddressable ${action}: ${snippet(node)}`);
           } else {
             const raw = readArgument(node.arguments[0]);
             const fieldHint = merged.name?.source || merged.testId || merged.css || 'field';
@@ -537,40 +814,12 @@ export async function parseScript(
               seq: events.length,
               ts: events.length,
               action,
-              ...(merged.role ? { role: merged.role } : {}),
-              // `name` stays a plain string because sig(), selector dedupe and
-              // the embeddings all key on it. When the source was a regex, the
-              // string is its SOURCE and hints carry the regex-ness so replay
-              // can rebuild the real matcher — `exact` would be wrong here, a
-              // source like `Version 2\.5` never equals an accessible name.
-              ...(merged.name !== undefined ? { name: merged.name.source } : {}),
-              ...(merged.exact ? { exact: merged.exact } : {}),
+              ...who(merged),
               ...valued,
-              ...(merged.css ? { css: merged.css } : {}),
-              ...(merged.testId ? { testId: merged.testId } : {}),
-              ...(merged.frameHint ? { frameHint: merged.frameHint } : {}),
+              ...where(merged),
               url: currentUrl,
               resolution: 'script-literal',
-              ...(merged.nth !== undefined || unknown || scope || merged.hasText || merged.name?.regex
-                ? {
-                    hints: {
-                      ...(merged.nth !== undefined ? { nth: merged.nth } : {}),
-                      ...(scope ? { scope } : {}),
-                      ...(unknown ? { unparsedChainStep: unknown } : {}),
-                      ...(merged.hasText
-                        ? {
-                            hasText: merged.hasText.source,
-                            ...(merged.hasText.regex
-                              ? { hasTextRegex: true, hasTextFlags: merged.hasText.flags }
-                              : {}),
-                          }
-                        : {}),
-                      ...(merged.name?.regex
-                        ? { nameRegex: true, nameFlags: merged.name.flags }
-                        : {}),
-                    },
-                  }
-                : {}),
+              ...hintsOf(t),
             });
           }
         }
@@ -587,5 +836,15 @@ export async function parseScript(
       events.map((e, i) => ({ ...e, seq: i })),
     ),
     warnings,
+    dropped,
   };
+}
+
+/** `{ state: 'hidden' }` → 'hidden'. */
+function readState(node: ts.Node | undefined): string | undefined {
+  if (!node || !ts.isObjectLiteralExpression(node)) return undefined;
+  for (const prop of node.properties) {
+    if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name) && prop.name.text === 'state') return text(prop.initializer);
+  }
+  return undefined;
 }

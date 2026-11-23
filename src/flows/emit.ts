@@ -48,13 +48,55 @@ function narrow(s: Step, loc: string, pw: boolean, warn: (w: string) => void): s
   return loc;
 }
 
+/** hints.by → the Playwright lookup that found the name (script.ts NameLookup). */
+const NAME_LOOKUP: Record<string, string> = {
+  placeholder: 'getByPlaceholder', label: 'getByLabel', title: 'getByTitle', alt: 'getByAltText',
+};
+
+/** A text matcher as source: a regex stays a regex. */
+const matcher = (s: Step, flag: 'valueRegex' | 'urlRegex', flags: 'valueFlags' | 'urlFlags') =>
+  s.hints?.[flag] ? `/${s.value ?? ''}/${String(s.hints[flags] ?? '')}` : quote(s.value ?? '');
+
+/** An assert step as `expect(...)`, or a Cypress `should`. */
+function assertion(s: Step, loc: string, value: string, pw: boolean, warn: (w: string) => void): string {
+  const kind = String(s.hints?.assert ?? 'visible');
+  const expected = s.valueRef ? value : matcher(s, 'valueRegex', 'valueFlags');
+  if (pw) {
+    switch (kind) {
+      case 'title': return `await expect(page).toHaveTitle(${expected});`;
+      case 'visible': return `await expect(${loc}).toBeVisible();`;
+      case 'hidden': return `await expect(${loc}).toBeHidden();`;
+      case 'text': return `await expect(${loc}).toHaveText(${expected});`;
+      case 'contains': return `await expect(${loc}).toContainText(${expected});`;
+      case 'value': return `await expect(${loc}).toHaveValue(${expected});`;
+      case 'checked': return `await expect(${loc}).toBeChecked();`;
+      case 'unchecked': return `await expect(${loc}).not.toBeChecked();`;
+    }
+  } else {
+    if (s.hints?.valueRegex) warn(`"${describe(s)}" checks a regex, which this Cypress output emits as a substring`);
+    const v = s.valueRef ? value : quote(s.value ?? '');
+    switch (kind) {
+      case 'title': return `cy.title().should('eq', ${v});`;
+      case 'visible': return `${loc}.should('be.visible');`;
+      case 'hidden': return `${loc}.should('not.be.visible');`;
+      case 'text': return `${loc}.invoke('text').should('eq', ${v});`;
+      case 'contains': return `${loc}.should('contain.text', ${v});`;
+      case 'value': return `${loc}.should('have.value', ${v});`;
+      case 'checked': return `${loc}.should('be.checked');`;
+      case 'unchecked': return `${loc}.should('not.be.checked');`;
+    }
+  }
+  warn(`"${describe(s)}" is an assertion of a kind this output doesn't know (${kind}); skipped`);
+  return `// TODO: assert ${kind}`;
+}
+
 /** Best locator first — the same order replay tries, so the code fails where replay would. */
 function playwrightLocator(s: Step, warn: (w: string) => void): string {
   const scope = s.frameHint ? `page.frameLocator(${quote(`[id$="${s.frameHint}"]`)})` : 'page';
   if (s.role && s.name) return `${scope}.getByRole(${quote(s.role)}, { name: ${quote(s.name)}${s.exact ? ', exact: true' : ''} })`;
   // Not getByTestId: it only looks at data-testid unless the project reconfigures it.
   if (s.testId) return `${scope}.locator(${quote(`[${s.testIdAttr ?? 'data-testid'}="${s.testId}"]`)})`;
-  if (s.name) return `${scope}.getByText(${quote(s.name)})`;
+  if (s.name) return `${scope}.${NAME_LOOKUP[String(s.hints?.by)] ?? 'getByText'}(${quote(s.name)}${s.exact ? ', { exact: true }' : ''})`;
   if (s.css) {
     warn(`"${describe(s)}" is addressed only by CSS — it breaks on any markup change`);
     return `${scope}.locator(${quote(s.css)})`;
@@ -86,8 +128,9 @@ export function emitFlow(flow: Flow, framework: Framework = 'playwright-ts'): Em
 
   const lines: string[] = [];
   for (const s of flow.steps) {
-    if (s.action === 'snapshot' || s.action === 'assert') continue;
-    const loc = s.action === 'goto' ? '' : narrow(s, pw ? playwrightLocator(s, warn) : cypressLocator(s, warn), pw, warn);
+    if (s.action === 'snapshot') continue;
+    const pageLevel = s.action === 'goto' || s.action === 'wait_url' || s.action === 'wait_text' || (s.action === 'assert' && s.hints?.assert === 'title');
+    const loc = pageLevel ? '' : narrow(s, pw ? playwrightLocator(s, warn) : cypressLocator(s, warn), pw, warn);
     const value = s.valueRef ? (required.add(s.valueRef), envName(s.valueRef).replace(/^UNDERSTUDY_/, '')) : quote(s.value ?? (s.action === 'goto' ? s.url : ''));
 
     switch (s.action) {
@@ -104,7 +147,12 @@ export function emitFlow(flow: Flow, framework: Framework = 'playwright-ts'): Em
             : `${loc}.scrollTo('${s.value}');`);
         } else lines.push(pw ? `await ${loc}.scrollIntoViewIfNeeded();` : `${loc}.scrollIntoView();`);
         break;
-      case 'wait_url': lines.push(pw ? `await page.waitForURL(new RegExp(${quote(s.value ?? '')}));` : `cy.url().should('include', ${value});`); break;
+      case 'wait_url':
+        lines.push(pw
+          ? `await page.waitForURL(${s.hints?.urlRegex ? matcher(s, 'urlRegex', 'urlFlags') : s.value?.includes('*') ? quote(s.value) : `(u) => u.href.includes(${value})`});`
+          : `cy.url().should('${s.hints?.urlRegex ? 'match' : 'include'}', ${s.hints?.urlRegex ? matcher(s, 'urlRegex', 'urlFlags') : value});`);
+        break;
+      case 'assert': lines.push(assertion(s, loc, value, pw, warn)); break;
       case 'wait_text': lines.push(pw ? `await page.getByText(${value}).waitFor();` : `cy.contains(${value});`); break;
       default: lines.push(pw ? `await ${loc}.click();` : `${loc}.click();`);
     }
@@ -116,7 +164,7 @@ export function emitFlow(flow: Flow, framework: Framework = 'playwright-ts'): Em
   const header = `// ${flow.intent}\n// Generated by understudy from flow "${flow.app}/${flow.slug}". Regenerate rather than edit.\n\n`;
   const body = (indent: string) => lines.map((l) => indent + l).join('\n');
   const code = pw
-    ? `import { test } from '@playwright/test';\n\n${header}${preamble}test(${quote(flow.title)}, async ({ page }) => {\n${body('  ')}\n});\n`
+    ? `import { test${lines.some((l) => l.includes('expect(')) ? ', expect' : ''} } from '@playwright/test';\n\n${header}${preamble}test(${quote(flow.title)}, async ({ page }) => {\n${body('  ')}\n});\n`
     : `${header}${preamble}describe(${quote(flow.title)}, () => {\n  it(${quote(flow.title)}, () => {\n${body('    ')}\n  });\n});\n`;
   return { framework, code, warnings, requiredValues: refs };
 }

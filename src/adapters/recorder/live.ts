@@ -23,7 +23,7 @@ import { type BrowserContext, type CDPSession, type Page } from 'playwright';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { basename, join, relative, resolve } from 'node:path';
+import { basename, join } from 'node:path';
 import { openLease, type BrowserLease } from '../../core/browser.js';
 import { computeSig, parseAria } from '../../core/sig.js';
 import type { StorageState } from '../../core/auth-cache.js';
@@ -36,6 +36,7 @@ import {
 import { INJECTED_LISTENER, STAMP_ATTR } from './injected.js';
 import { ACCNAME_BUNDLE } from './accname-bundle.js';
 import { toRawEvent, type WireEvent } from './wire.js';
+import { HOME } from '../../store/settings.js';
 
 
 export interface LiveRecordOptions {
@@ -143,7 +144,7 @@ async function resolveStamped(
 // Read per call, not once at import. A module-level constant would freeze the
 // override before any caller could set it, which is a footgun for anything that
 // wants its own directory — a check, or a run recording into a scratch corpus.
-const fixturesDir = () => process.env.UNDERSTUDY_FIXTURES_DIR ?? resolve('.understudy/fixtures');
+const fixturesDir = () => process.env.UNDERSTUDY_FIXTURES_DIR ?? join(HOME, 'fixtures');
 
 /**
  * One CDP session per page, reused.
@@ -224,9 +225,9 @@ async function stashFixture(absolute: string): Promise<string> {
   const target = join(dir, `${digest}-${basename(absolute)}`);
   await mkdir(dir, { recursive: true });
   if (!existsSync(target)) await writeFile(target, bytes);
-  // Relative, so the value means the same thing from the repo root whoever
-  // replays it.
-  return relative(process.cwd(), target);
+  // Absolute: the fixtures folder is under ~/.understudy, so the path means
+  // the same thing whichever folder replays it.
+  return target;
 }
 
 export async function recordLive(opts: LiveRecordOptions): Promise<RawRecording> {

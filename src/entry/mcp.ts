@@ -25,14 +25,15 @@ import { recall } from '../memory/recall.js';
 import { remember } from '../memory/notes.js';
 import { start, answer, runPlan, type PlanState } from '../plan/planner.js';
 import { distillRequest, saveDistilled } from '../flows/distill.js';
-import { triage } from '../flows/findings.js';
+import { triage, listFindings } from '../flows/findings.js';
 import { collections } from '../store/db.js';
 import { startExtensionRecorder, extensionDir, type ExtensionRecorder } from '../adapters/recorder/extension.js';
-import { saveRecording, loadRecording } from '../core/recording-store.js';
+import { saveRecording, loadRecording, recordingPath } from '../core/recording-store.js';
 import { proveAndSave } from '../flows/save.js';
 import { MissingValuesError } from '../flows/execute.js';
 import { parseScript } from '../adapters/recorder/script.js';
 import { setPlaceholders, appPlaceholders } from '../memory/placeholders.js';
+import { VERSION } from './version.js';
 
 /**
  * Sent to the agent when it connects — its copy of the contract, since an
@@ -47,7 +48,7 @@ const INSTRUCTIONS = `Understudy remembers the user's web-app flows and runs the
 - Ask the user before each distill. Gather facts, lessons and findings, get approval, then one understudy_remember.
 Full guide: REASONER.md in the package.`;
 
-const server = new McpServer({ name: 'understudy', version: '0.2.0' }, { instructions: INSTRUCTIONS });
+const server = new McpServer({ name: 'understudy', version: VERSION }, { instructions: INSTRUCTIONS });
 
 /** Credentials passed to `run`, kept in memory (never stored) until the run executes. */
 const valuesByRun = new Map<string, Record<string, string>>();
@@ -93,7 +94,8 @@ async function continueRun(state: PlanState, opts: { headed?: boolean }) {
     failedSteps: r.steps.filter((s) => !s.ok).map((s) => ({ seq: s.seq, action: s.action, error: s.error })),
     unexpectedPages: r.steps.filter((s) => s.unexpectedPage).map((s) => ({ seq: s.seq, ...s.unexpectedPage })),
     path: r.sigSequence,
-    drift: recorded.drift.firstRun ? 'first run' : recorded.drift.changed
+    drift: recorded.drift.notCompared ? `not compared: ${recorded.drift.notCompared}`
+      : recorded.drift.firstRun ? 'first passed run of this plan — now the baseline' : recorded.drift.changed
       ? { added: recorded.drift.added, removed: recorded.drift.removed, stateChanged: recorded.drift.stateChanged }
       : 'same path',
     findings: recorded.findings.map((f) => ({ kind: f.kind, severity: f.severity, statement: f.statement })),
@@ -167,7 +169,7 @@ server.registerTool('understudy_remember', {
 }))));
 
 server.registerTool('understudy_findings', {
-  description: 'Open findings for an app, most frequent first. Pass triage to route them: issue, lesson or noise.',
+  description: 'Open findings for an app, most severe first, then most frequent. Pass triage to route them: issue, lesson or noise.',
   inputSchema: {
     app: z.string(),
     triage: z.array(z.object({ fingerprint: z.string(), verdict: z.enum(['issue', 'lesson', 'noise']) })).optional(),
@@ -176,7 +178,7 @@ server.registerTool('understudy_findings', {
 }, ({ app, triage: items, all }) => wrap(async () => {
   const { findings } = await collections();
   const routed = items?.length ? await triage(findings, app, items) : undefined;
-  const rows = await findings.find(all ? { app } : { app, status: 'open' }).sort({ occurrences: -1, lastSeen: -1 }).limit(40).toArray();
+  const rows = await listFindings(findings, app, { ...(all ? { all } : {}), limit: 40 });
   return {
     ...(routed ? { triaged: routed } : {}),
     findings: rows.map((f) => ({ fingerprint: f.fingerprint, kind: f.kind, severity: f.severity, occurrences: f.occurrences, status: f.status, statement: f.statement })),
@@ -214,7 +216,13 @@ server.registerTool('understudy_record', {
 }));
 
 server.registerTool('understudy_save', {
-  description: 'Prove a flow by replaying it, and keep it only if every step passes: the user\'s latest recording, a recording hash, or a script of a flow you drove.',
+  description: [
+    'Prove a flow by replaying it, and keep it only if every step passes: the user\'s latest recording, a recording hash, or a script of a flow you drove.',
+    'A script is READ, not run: only literal page calls are kept, so no loops, no values computed at runtime, no reading logs or emails mid-flow.',
+    'Kept: goto, click, dblclick, fill, type, press, check, uncheck, selectOption, setInputFiles, scrollIntoViewIfNeeded; locators getByRole, getByText, getByLabel, getByPlaceholder, getByTitle, getByAltText, getByTestId, locator(css), frameLocator, filter({hasText}), first/last/nth;',
+    'assertions expect(page).toHaveURL/toHaveTitle, expect(locator).toBeVisible/toBeHidden/toHaveText/toContainText/toHaveValue/toBeChecked (and .not on visible/hidden/checked), page.waitForURL, page.waitForSelector.',
+    'Write locators inline in expect(...), not via a variable. Other assertions come back in droppedAssertions; calls that would change the steps (evaluate, hover, route…) refuse the save.',
+  ].join(' '),
   inputSchema: {
     app: z.string(), name: z.string().describe('What the flow does, as someone would ask for it.'),
     hash: z.string().optional(),
@@ -226,6 +234,7 @@ server.registerTool('understudy_save', {
 }, (a) => wrap(async () => {
   let rec;
   let madeBy: 'user' | 'agent' = 'user';
+  let dropped: string[] = [];
   if (a.script) {
     // A flow the agent drove: read its script into steps, exactly like `understudy import`.
     const { apps } = await collections();
@@ -234,6 +243,7 @@ server.registerTool('understudy_save', {
     if (!parsed.recording.events.length) throw new Error(`no Playwright actions found in ${a.script} — expected calls like page.getByRole(...).click()`);
     if (parsed.warnings.length) throw new Error(`these calls in the script can't be replayed, so it wasn't kept — rewrite them as plain Playwright actions:\n- ${parsed.warnings.slice(0, 10).join('\n- ')}`);
     rec = parsed.recording;
+    dropped = parsed.dropped;
     await saveRecording(rec);
     madeBy = 'agent';
   } else {
@@ -258,6 +268,9 @@ server.registerTool('understudy_save', {
   const r = out.proven?.result;
   const base = {
     recording: hash,
+    // Where the steps it read are, so a failure can be checked against them.
+    recordingFile: recordingPath(hash),
+    ...(dropped.length ? { droppedAssertions: dropped, droppedWhy: 'these checks in the script were not kept, so the flow checks less than the script did' } : {}),
     ...(r ? {
       passed: r.ok,
       failedSteps: r.steps.filter((s) => !s.ok).map((s) => ({ seq: s.seq, action: s.action, error: s.error })),

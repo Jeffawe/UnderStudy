@@ -124,6 +124,12 @@ async function advance(run: Run): Promise<PlanState> {
   const planning = (run.planning ??= {});
   const { flows } = await collections();
 
+  // 0. Nothing to plan with. Asking how to split a goal across flows that
+  // don't exist wastes a round trip and suggests memory knows something.
+  if (!(await flows.countDocuments({ app: run.app }, { limit: 1 }))) {
+    return block(run, `"${run.app}" has no saved flows yet — record one (understudy_record, then understudy_save), or drive it yourself and save the script (understudy_save with script)`);
+  }
+
   // 1. Split the goal.
   if (!planning.subGoals) {
     return ask(run, { kind: 'decompose', goal: run.goal, how: DECOMPOSE_HOW, vocabulary: await vocabulary(run.app) });
