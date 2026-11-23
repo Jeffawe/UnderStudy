@@ -1,6 +1,6 @@
 {
   "name": "@jeffawe/understudy",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "End-to-end tests for your own web apps: record a flow once, and Understudy remembers it, replays it, notices when the app changes, and runs goals you describe in words — on its own or as an MCP server for AI agents.",
   "type": "module",
   "license": "Apache-2.0",
