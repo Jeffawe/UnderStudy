@@ -106,13 +106,20 @@ understudy save <hash> "log in as a member" # prove it by replaying, then keep i
 understudy flows myapp                      # what it knows how to do
 understudy replay myapp log-in-as-a-member  # run one flow
 understudy run myapp "sign in"              # find the flow for a goal, and run it
-understudy findings myapp                   # what looked broken
+understudy import myapp login.spec.ts       # turn a Playwright script into a recording, then save it
+understudy findings myapp                   # what looked broken, most severe first
 understudy emit myapp log-in-as-a-member    # print it as a Playwright (or Cypress) test
 understudy app myapp --placeholder email    # keep email addresses out of memory (moves them to your env file)
 ```
 
+An imported script keeps its checks — `expect(...).toBeVisible()`,
+`toHaveText`, `toHaveURL`, `waitForURL` and the like — so a replay fails when
+the page is wrong, not just when a button is missing. A check it can't replay is
+listed when you import, never dropped silently.
+
 An unproven flow is marked as such in `flows` and recall; the first run of
-it that passes proves it. `understudy --help` lists everything. A flow that commits something real — a
+it that passes proves it. `understudy --help` lists everything, and
+`understudy --version` says which one you have. A flow that commits something real — a
 purchase, a deletion — is marked destructive and refused unless you pass
 `--allow-purchases`.
 
@@ -121,8 +128,11 @@ purchase, a deletion — is marked destructive and refused unless you pass
 Everything stays with you. Understudy has no server, no account and no
 telemetry.
 
-- **Recordings** are files on your machine. The Chrome extension sends what it
-  records only to Understudy on `127.0.0.1`.
+- **Recordings** are files on your machine, in `~/.understudy` (or
+  `UNDERSTUDY_HOME`) — the same place whichever folder you, or your agent, run
+  it from. The Chrome extension sends what it records only to Understudy on
+  `127.0.0.1`. Before 0.2.2 they went in a `.understudy` folder wherever it ran;
+  those still load.
 - **Saved flows, notes and findings** go to the MongoDB you configured.
 - **Your embedding model** (Voyage by default, if you set a key) receives only
   the short texts used for search — flow names and descriptions, facts and
