@@ -1,9 +1,19 @@
 # Understudy
 
+![Understudy — record a flow once, replay it as a test](https://understudy.jeffawe.dev/og.png)
+
+[![npm](https://img.shields.io/npm/v/@jeffawe/understudy)](https://www.npmjs.com/package/@jeffawe/understudy)
+
 End-to-end tests for your own web apps, without clicking through every flow by
 hand. Record a flow once; Understudy remembers it, replays it as a test, notices
 when the app changes, and can run goals you describe in words — including goals
 that need pieces of several recordings.
+
+It's an npm package, [`@jeffawe/understudy`](https://www.npmjs.com/package/@jeffawe/understudy):
+
+```sh
+npm install -g @jeffawe/understudy
+```
 
 It works on its own from the command line, and it plugs into an AI agent
 (Claude Code, Codex, Cursor) over MCP. The agent is optional; with one,
