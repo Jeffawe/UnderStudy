@@ -1,0 +1,60 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    width: 1280px; height: 640px; overflow: hidden;
+    font-family: -apple-system, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+    color: #fff;
+    background:
+      radial-gradient(900px 600px at 85% 20%, rgba(140,158,255,.35), transparent 60%),
+      radial-gradient(700px 500px at 0% 100%, rgba(20,30,120,.45), transparent 60%),
+      #3d5afe;
+    display: flex; align-items: center; padding: 0 80px; gap: 64px;
+  }
+  .left { flex: 1 1 0; }
+  .mark { width: 88px; height: 88px; border-radius: 22px; background: rgba(255,255,255,.14);
+    border: 2px solid rgba(255,255,255,.35); display: grid; place-items: center; margin-bottom: 36px; }
+  .mark i { width: 48px; height: 48px; border-radius: 50%; border: 6px solid #fff; display: grid; place-items: center; }
+  .mark i::after { content: ""; width: 22px; height: 22px; border-radius: 50%; background: #fff; }
+  h1 { font-size: 84px; line-height: 1; margin: 0 0 22px; letter-spacing: -0.035em; font-weight: 800; }
+  p { font-size: 30px; line-height: 1.3; margin: 0; color: rgba(255,255,255,.86); max-width: 520px; letter-spacing: -0.01em; }
+  .url { margin-top: 40px; font: 500 20px ui-monospace, "SF Mono", Menlo, monospace; color: rgba(255,255,255,.7); }
+
+  .card { width: 500px; background: #121211; border-radius: 18px; padding: 26px 28px 24px;
+    box-shadow: 0 30px 80px rgba(10,15,70,.55), 0 0 0 1px rgba(255,255,255,.08);
+    font: 19px/1.25 ui-monospace, "SF Mono", Menlo, monospace; color: #ecebe6; transform: rotate(-1.5deg); }
+  .dots { display: flex; gap: 8px; margin-bottom: 22px; }
+  .dots b { width: 12px; height: 12px; border-radius: 50%; background: #2f2f2b; }
+  .ask { color: #8c9eff; margin-bottom: 18px; font-size: 21px; }
+  .ask span { color: #ecebe6; }
+  .recall { color: #a3a29c; font-size: 16px; margin-bottom: 18px; }
+  .recall em { font-style: normal; color: #ecebe6; }
+  .step { display: flex; align-items: center; gap: 14px; padding: 7px 0; }
+  .ok { width: 24px; height: 24px; border-radius: 50%; background: #2fbf71; color: #0c1f14;
+    display: grid; place-items: center; font: 700 15px -apple-system, sans-serif; flex: none; }
+  .step .a { color: #a3a29c; width: 64px; flex: none; }
+  .foot { margin-top: 18px; padding-top: 16px; border-top: 1px solid #2a2a27; display: flex;
+    justify-content: space-between; font-size: 16px; color: #a3a29c; }
+  .pass { color: #2fbf71; font-weight: 700; }
+</style></head>
+<body>
+  <div class="left">
+    <div class="mark"><i></i></div>
+    <h1>Understudy</h1>
+    <p>Record a flow once. Say “test login” and it replays — forever.</p>
+    <div class="url">understudy.jeffawe.dev</div>
+  </div>
+  <div class="card">
+    <div class="dots"><b></b><b></b><b></b></div>
+    <div class="ask">› <span>test login</span></div>
+    <div class="recall">recalled <em>log-in-to-the-dashboard</em> · 0.91</div>
+    <div class="step"><span class="ok">✓</span><span class="a">goto</span>/login</div>
+    <div class="step"><span class="ok">✓</span><span class="a">fill</span>Email</div>
+    <div class="step"><span class="ok">✓</span><span class="a">fill</span>Password</div>
+    <div class="step"><span class="ok">✓</span><span class="a">click</span>Sign in</div>
+    <div class="step"><span class="ok">✓</span><span class="a">expect</span>“Dashboard”</div>
+    <div class="foot"><span>5 steps · 4.2s</span><span class="pass">PASSED</span></div>
+  </div>
+</body></html>
