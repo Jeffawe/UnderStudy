@@ -25,8 +25,8 @@ import { chromium } from 'playwright';
 import { emitFlow, type Framework } from '../flows/emit.js';
 import { editFlow, recordingFrom, proveAndSave, proveByRun, proveFlow, type ProveAndSave } from '../flows/save.js';
 import type { Flow } from '../store/types.js';
-import { recordRun, type RecordedRun } from '../flows/runs.js';
-import { listFindings } from '../flows/findings.js';
+import { acceptPaths, recordRun, type RecordedRun } from '../flows/runs.js';
+import { listFindings, triage, type Verdict } from '../flows/findings.js';
 import { VERSION } from './version.js';
 import { recall, type Recall } from '../memory/recall.js';
 import { setPlaceholders, appPlaceholders } from '../memory/placeholders.js';
@@ -102,6 +102,8 @@ SAVE
 
 FINDINGS
   --all                 include findings already triaged
+  --triage <fp>=<verdict>  route a finding: issue, lesson, noise — or expected,
+                        for a changed path the app made on purpose (repeatable)
 
 RUN
   --sub-goal <text>     plan across several flows, in this order (repeatable)
@@ -784,6 +786,7 @@ function printReplay(result: ReplayResult) {
 /** What recording the run added: drift against earlier runs, and findings. */
 function printRunReport(run: RecordedRun) {
   const { drift } = run;
+  if (run.pending) console.log('\npath     CHANGED, not accepted yet — it joins the history once you triage its finding: understudy findings <app> --triage <fp>=expected');
   if (drift.notCompared) console.log(`\ndrift    not compared — ${drift.notCompared}`);
   else if (drift.firstRun) console.log('\ndrift    first passed run of this plan — this path is now the baseline');
   else if (!drift.changed) console.log('\ndrift    same path as recent runs');
@@ -983,6 +986,11 @@ async function saveAndReport(recording: RawRecording, title: string, opts: Omit<
   if (flow.destructive) console.log(`         DESTRUCTIVE — ${flow.destructiveBecause}. Replays need --allow-purchases.`);
   const upTo = provenUpToNote(flow);
   if (upTo) console.log(`         ${upTo}`);
+  const ends = out.proven?.result.endChecks;
+  if (ends?.length) {
+    console.log(`\nhow it ended — add the ones that mean "it ended right" (nothing is added unless you do):`);
+    for (const step of ends) console.log(`  understudy edit ${flow.app} ${flow.slug} --before ${flow.steps.length} --step '${JSON.stringify(step).replace(/'/g, "'\\''")}'`);
+  }
   if (out.run) printRunReport(out.run);
   console.log(`\nreplay it any time:  understudy replay ${flow.app} ${flow.slug}`);
 }
@@ -1043,13 +1051,25 @@ async function cmdFlows(positional: string[]) {
 async function cmdFindings(positional: string[], flags: Flags) {
   const app = positional[0] ?? fail('findings needs an app name', 'understudy findings myapp');
   const { findings } = await store.collections();
+  // --triage <fingerprint>=<verdict>, repeatable.
+  const asked = (flags.get('triage') ?? []).filter((v): v is string => typeof v === 'string').map((v) => {
+    const [fingerprint, verdict] = v.split('=');
+    return { fingerprint: fingerprint ?? '', verdict: (verdict ?? '') as Verdict };
+  });
+  if (asked.length) {
+    const routed = await triage(findings, app, asked);
+    for (const p of routed.problems) console.error(`  ${p}`);
+    console.log(`triaged  ${routed.routed} finding(s)`);
+    const accepted = await acceptPaths(app, routed.expected);
+    if (accepted.runs) console.log(`accepted the new path: ${accepted.runs} run(s) join the history; ${accepted.flows.join(', ')} now expect it\n`);
+  }
   const rows = await listFindings(findings, app, { all: flags.has('all'), limit: 50 });
   if (!rows.length) {
     console.log(flags.has('all') ? `no findings for '${app}'` : `no open findings for '${app}' (--all to include triaged ones)`);
     return;
   }
   for (const f of rows) {
-    console.log(`  ${f.severity.padEnd(6)} ×${String(f.occurrences).padEnd(4)} ${f.kind.padEnd(14)} ${f.statement.slice(0, 110)}${f.evidence?.fromUnprovenFlow ? '  [from an unproven flow — may be the recording]' : ''}`);
+    console.log(`  ${f.fingerprint}  ${f.severity.padEnd(6)} ×${String(f.occurrences).padEnd(4)} ${f.kind.padEnd(14)} ${f.statement.slice(0, 110)}${f.evidence?.fromUnprovenFlow ? '  [from an unproven flow — may be the recording]' : ''}`);
   }
 }
 

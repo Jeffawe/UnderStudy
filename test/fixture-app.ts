@@ -87,7 +87,7 @@ export async function startFixtureApp(): Promise<FixtureApp> {
         </form>`));
     }
     if (path === '/book') {
-      return html(page('Shop — book', `<h1>Book a visit</h1><p id="state"></p>
+      return html(page('Shop — book', `<h1>Book a visit</h1><p id="state" role="status"></p>
         <button onclick="fetch('/api/visits', { method: 'POST' }).then(() => { document.getElementById('state').textContent = 'Booked'; })">Book</button>`));
     }
     if (path === '/api/visits' && req.method === 'POST') {

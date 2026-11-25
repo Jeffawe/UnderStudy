@@ -172,8 +172,12 @@ export interface Finding {
   occurrences: number;
   firstSeen: Date;
   lastSeen: Date;
-  /** open until someone triages it: a real bug (issue), a workaround (lesson), or noise. */
-  status: 'open' | 'issue' | 'lesson' | 'noise';
+  /**
+   * open until someone triages it: a real bug (issue), a workaround (lesson),
+   * noise, or — for a changed path — expected: the app changed on purpose, and
+   * the new path is the normal one from now on.
+   */
+  status: 'open' | 'issue' | 'lesson' | 'noise' | 'expected';
 }
 
 /**
@@ -202,6 +206,15 @@ export interface Run {
    * than doing it. Its path is partial, so it is never drift history.
    */
   stoppedBefore?: number;
+  /**
+   * false: it passed, but its path changed (new pages, or a step landing
+   * somewhere unexpected), and nobody has said that's right yet. Kept out of
+   * drift history until its finding is triaged `expected` — otherwise a wrong
+   * ending that passes becomes "normal" after a few runs. Missing = accepted.
+   */
+  accepted?: false;
+  /** Where each flow of `plan` starts in `steps`, so an accepted path can update each flow. */
+  starts?: number[];
   /**
    * waiting: planning paused on a question for the agent (`question` says what).
    * planned: a dry run — the plan is complete, nothing ran.

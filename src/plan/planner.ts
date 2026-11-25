@@ -307,7 +307,7 @@ export async function runPlan(runId: string, opts: Pick<ExecuteOptions, 'values'
   const executed = await execute(recording, { ...opts, useLessons: true });
   const recorded = await recordRun({
     app: run.app, flow: run.plan.join('+'), plan: run.plan, goal: run.goal, mode: 'run',
-    result: executed.result, steps, runId: run._id!, ...(unproven ? { unproven: true } : {}),
+    result: executed.result, steps, runId: run._id!, starts, ...(unproven ? { unproven: true } : {}),
   });
   // Each unproven flow in a plan that passed is proven now.
   const nowProven: string[] = [];

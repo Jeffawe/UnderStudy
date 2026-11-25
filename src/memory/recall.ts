@@ -149,9 +149,13 @@ const toMatch = (f: Flow & { score?: number }, score: number): FlowMatch => ({
 /** Scores this close are a tie. */
 const TIE = 0.005;
 
-/** Highest score first; on a tie, a proven flow ahead of an unproven one. */
+/**
+ * Highest score first; on a tie, a proven flow ahead of an unproven one, then
+ * one a person recorded ahead of one an agent made — a person's recording is
+ * the better word on how the app is meant to be used.
+ */
 export function rank(matches: FlowMatch[]): FlowMatch[] {
-  return [...matches].sort((a, b) => (Math.abs(a.score - b.score) <= TIE ? Number(b.proven) - Number(a.proven) || b.score - a.score : b.score - a.score));
+  return [...matches].sort((a, b) => (Math.abs(a.score - b.score) <= TIE ? Number(b.proven) - Number(a.proven) || Number(b.madeBy === 'user') - Number(a.madeBy === 'user') || b.score - a.score : b.score - a.score));
 }
 
 /** The verdict's reason, plus a warning when the flow it picked may not work. */

@@ -26,11 +26,13 @@ import { remember } from '../memory/notes.js';
 import { start, answer, runPlan, type PlanState } from '../plan/planner.js';
 import { distillRequest, saveDistilled } from '../flows/distill.js';
 import { triage, listFindings } from '../flows/findings.js';
+import { acceptPaths } from '../flows/runs.js';
 import { collections } from '../store/db.js';
 import { startExtensionRecorder, extensionDir, type ExtensionRecorder } from '../adapters/recorder/extension.js';
 import { saveRecording, loadRecording, recordingPath } from '../core/recording-store.js';
 import { editFlow, proveAndSave, proveFlow } from '../flows/save.js';
 import type { Flow } from '../store/types.js';
+import type { EndCheck } from '../core/replay.js';
 import { MissingValuesError } from '../flows/execute.js';
 import { parseScript } from '../adapters/recorder/script.js';
 import { setPlaceholders, appPlaceholders } from '../memory/placeholders.js';
@@ -183,7 +185,8 @@ function report(state: Extract<PlanState, { status: 'planned' }>, out: Awaited<R
       : recorded.drift.firstRun ? 'first passed run of this plan — now the baseline' : recorded.drift.changed
       ? { added: recorded.drift.added, removed: recorded.drift.removed, stateChanged: recorded.drift.stateChanged }
       : 'same path',
-    findings: recorded.findings.map((f) => ({ kind: f.kind, severity: f.severity, statement: f.statement })),
+    findings: recorded.findings.map((f) => ({ kind: f.kind, severity: f.severity, statement: f.statement, fingerprint: f.fingerprint })),
+    ...(recorded.pending ? { pathNotAccepted: 'it passed on a changed path, so it isn\'t history yet: ask the user if the change is right, then understudy_findings triage its flow_drift finding as expected (or issue)' } : {}),
     ...(executed.lessons?.fired ? { lessons: executed.lessons } : {}),
     ...(nowProven.length ? { nowProven } : {}),
     ...(executed.missingValues.length ? { missingValues: executed.missingValues } : {}),
@@ -263,18 +266,20 @@ server.registerTool('understudy_remember', {
 }))));
 
 server.registerTool('understudy_findings', {
-  description: 'Open findings for an app, most severe first, then most frequent. Pass triage to route them: issue, lesson or noise.',
+  description: 'Open findings for an app, most severe first, then most frequent. Pass triage to route them: issue, lesson, noise — or, for a changed path (flow_drift), expected: the app changed on purpose and the new path becomes the normal one. Ask the user before expected.',
   inputSchema: {
     app: z.string(),
-    triage: z.array(z.object({ fingerprint: z.string(), verdict: z.enum(['issue', 'lesson', 'noise']) })).optional(),
+    triage: z.array(z.object({ fingerprint: z.string(), verdict: z.enum(['issue', 'lesson', 'noise', 'expected']) })).optional(),
     all: z.boolean().optional().describe('Include already-triaged findings.'),
   },
 }, ({ app, triage: items, all }) => wrap(async () => {
   const { findings } = await collections();
   const routed = items?.length ? await triage(findings, app, items) : undefined;
+  const accepted = routed?.expected.length ? await acceptPaths(app, routed.expected) : undefined;
   const rows = await listFindings(findings, app, { ...(all ? { all } : {}), limit: 40 });
   return {
-    ...(routed ? { triaged: routed } : {}),
+    ...(routed ? { triaged: { routed: routed.routed, problems: routed.problems } } : {}),
+    ...(accepted ? { acceptedPath: accepted } : {}),
     findings: rows.map((f) => ({ fingerprint: f.fingerprint, kind: f.kind, severity: f.severity, occurrences: f.occurrences, status: f.status, statement: f.statement })),
   };
 }));
@@ -322,7 +327,7 @@ server.registerTool('understudy_save', {
     app: z.string(), name: z.string().optional().describe('What the flow does, as someone would ask for it. Needed unless flow is given.'),
     flow: z.string().optional().describe('A saved flow to prove where it stands (e.g. one kept with verify false), instead of saving a new one.'),
     add: z.array(z.object({ before: z.number().int(), step: z.record(z.string(), z.unknown()) })).optional()
-      .describe('With flow: steps to add first, each before step n. {"action":"human","value":"what they do","hints":{"untilText":"…"}}, or {"action":"wait_response","value":"/api/visits","hints":{"method":"POST","status":201,"field":"commission.amount","above":0}}; also wait_url, wait_text.'),
+      .describe('With flow: steps to add first, each before step n. {"action":"human","value":"what they do","hints":{"untilText":"…"}}, {"action":"wait_response","value":"/api/visits","hints":{"method":"POST","status":201,"field":"commission.amount","above":0}}, {"action":"assert","role":"checkbox","name":"…","hints":{"assert":"checked"}}; also wait_url, wait_text.'),
     hash: z.string().optional(),
     script: z.string().optional().describe('Path to a Playwright script of a flow you drove; read passwords from process.env.'),
     intent: z.string().optional(), slug: z.string().optional(), values,
@@ -392,6 +397,7 @@ server.registerTool('understudy_save', {
     } : {}),
     ...(out.flow.destructive ? { destructive: out.flow.destructiveBecause } : {}),
     ...provenUpTo(out.flow),
+    ...endChecks(out.flow, r?.endChecks),
     ...(out.run ? { findings: out.run.findings.map((f) => f.statement) } : {}),
     ...(out.placeholders.converted.length ? { placeholders: out.placeholders.converted } : {}),
   };
@@ -409,6 +415,24 @@ async function proveSaved(app: string, slug: string, a: { values?: Record<string
     ...(out.commit && !r.ok ? { wouldStopBefore: `step ${out.commit.index}: ${out.commit.reason}` } : {}),
     failedSteps: r.steps.filter((s) => !s.ok).map((s) => ({ seq: s.seq, action: s.action, error: s.error, ...(s.saw ? { saw: s.saw } : {}) })),
     findings: out.run.findings.map((f) => f.statement),
+  };
+}
+
+/**
+ * How the flow ended, offered as checks to add — never added unasked. A
+ * person's own recording is the best word on how it should end; an agent's
+ * may have taken a path the user wouldn't, so the user says either way.
+ */
+function endChecks(flow: Flow, checks: EndCheck[] | undefined) {
+  if (!checks?.length) return {};
+  return {
+    endChecks: {
+      suggest: checks.map((step) => ({ before: flow.steps.length, step })),
+      how: (flow.madeBy === 'agent'
+        ? 'You drove this, so ask the user how it should end: '
+        : 'From the user\'s own recording — ask them: ')
+        + 'which of these say it ended right? Add those with understudy_save { flow, add }. Without them the flow only checks that each step could be done.',
+    },
   };
 }
 

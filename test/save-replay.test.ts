@@ -326,7 +326,7 @@ test('editing a saved flow: a person\'s step or a wait goes in, it is unproven a
     segments: [{ slug: 'edit-me-start', title: 'Start', intent: 'start', stepRange: [0, 2] }, { slug: 'edit-me-end', title: 'End', intent: 'end', stepRange: [2, 4] }],
   });
 
-  await assert.rejects(editFlow('shop', 'edit-me', [{ before: 9, step: { action: 'click', value: 'x' } }]), /before must be a step index.*\n.*action must be one of human, wait_response/s);
+  await assert.rejects(editFlow('shop', 'edit-me', [{ before: 9, step: { action: 'click', value: 'x' } }]), /before must be a step index.*\n.*action must be one of human, assert, wait_response/s);
   await assert.rejects(editFlow('shop', 'edit-me', [{ before: 1, step: { action: 'human', value: 'x', hints: { force: true } } }]), /hints can't have force \(it can have untilText, untilUrl, untilResponse\)/);
 
   const flow = await editFlow('shop', 'edit-me', [
@@ -345,4 +345,46 @@ test('editing a saved flow: a person\'s step or a wait goes in, it is unproven a
   assert.equal(start.proven, false);
   assert.deepEqual(end.from!.steps, [3, 6]);
   assert.deepEqual(end.steps.map((s) => s.name ?? s.action), ['Two', 'wait_response', 'Three']);
+});
+
+test('a changed path that passes is not history until someone accepts it; accepted once, it is the new normal', { timeout: 180_000 }, async () => {
+  const { triage } = await import('../src/flows/findings.js');
+  const { acceptPaths } = await import('../src/flows/runs.js');
+  shop.set({ promo: false, broken: false });
+  const recording = recordingOfLoginAndCart();
+  const proof = await replay(recording, { values });
+  await saveFlow(recording, proof, { title: 'Cart for acceptance' });
+  await recordRun({ app: 'shop', flow: 'cart-for-acceptance', result: proof, steps: (await (await collections()).flows.findOne({ app: 'shop', slug: 'cart-for-acceptance' }))!.steps });
+
+  // The app adds a promo page. It passes — and waits.
+  shop.set({ promo: true });
+  const first = await replayFlow('cart-for-acceptance');
+  assert.equal(first.result.ok, true);
+  assert.equal(first.run.pending, true);
+  assert.equal(first.run.drift.changed, true);
+  // Again: still compared with the accepted path, so still flagged.
+  const second = await replayFlow('cart-for-acceptance');
+  assert.equal(second.run.drift.changed, true, 'an unaccepted run is not history');
+  assert.equal(second.run.pending, true);
+
+  // Accepted: someone says the promo page is on purpose.
+  const drift = first.run.findings.find((f) => f.kind === 'flow_drift' && f.statement.includes('different path'))!;
+  const { findings, runs, flows } = await collections();
+  const notDrift = (await findings.findOne({ app: 'shop', kind: { $ne: 'flow_drift' } }))?.fingerprint;
+  if (notDrift) assert.match((await triage(findings, 'shop', [{ fingerprint: notDrift, verdict: 'expected' }])).problems[0]!, /expected is for a changed path/);
+  const routed = await triage(findings, 'shop', [{ fingerprint: drift.fingerprint, verdict: 'expected' }]);
+  assert.deepEqual(routed.expected, [drift.fingerprint]);
+  const accepted = await acceptPaths('shop', routed.expected);
+  assert.equal(accepted.runs, 2, 'every run that took it');
+  assert.deepEqual(accepted.flows, ['cart-for-acceptance']);
+  assert.equal(await runs.countDocuments({ app: 'shop', plan: ['cart-for-acceptance'], accepted: false }), 0);
+  const flow = (await flows.findOne({ app: 'shop', slug: 'cart-for-acceptance' }))!;
+  assert.ok(flow.steps.at(-1)!.expectedSig?.startsWith('/promo'), 'the flow now expects the promo page');
+
+  // The new normal: same path, nothing flagged, nothing pending.
+  const third = await replayFlow('cart-for-acceptance');
+  assert.equal(third.run.drift.changed, false);
+  assert.equal(third.run.pending, undefined);
+  assert.ok(third.result.steps.every((s) => !s.unexpectedPage));
+  shop.set({ promo: false });
 });

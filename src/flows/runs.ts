@@ -27,6 +27,8 @@ export interface RecordedRun {
   runId: ObjectId;
   drift: Drift;
   findings: FindingDraft[];
+  /** It passed on a changed path: kept out of history until that's accepted. */
+  pending?: true;
 }
 
 export async function recordRun(opts: {
@@ -50,6 +52,8 @@ export async function recordRun(opts: {
   /** Fill in this existing run (one that was planned first) instead of adding a new one. */
   runId?: ObjectId;
   startedAt?: Date;
+  /** Where each flow of the plan starts in the steps. Defaults to [0]. */
+  starts?: number[];
 }): Promise<RecordedRun> {
   const { app, flow, result, steps } = opts;
   const plan = opts.plan ?? [flow];
@@ -59,7 +63,7 @@ export async function recordRun(opts: {
   // 1. Drift, against the most recent passed runs of this flow — however it
   // was started, it walked the same steps.
   const history = await c.runs
-    .find({ app, plan, mode: { $in: ['replay', 'run'] }, status: 'passed', stoppedBefore: { $exists: false }, ...(opts.runId ? { _id: { $ne: opts.runId } } : {}) }, { projection: { sigSequence: 1 } })
+    .find({ app, plan, mode: { $in: ['replay', 'run'] }, status: 'passed', stoppedBefore: { $exists: false }, accepted: { $ne: false }, ...(opts.runId ? { _id: { $ne: opts.runId } } : {}) }, { projection: { sigSequence: 1 } })
     .sort({ startedAt: -1 })
     .limit(LOOKBACK)
     .toArray();
@@ -101,7 +105,9 @@ export async function recordRun(opts: {
     prev = sig;
   }
 
-  // 4. The run.
+  // 4. The run. One whose path changed waits to be accepted before it
+  // counts as history — see Run.accepted.
+  const changedPath = result.ok && !drift.firstRun && (drift.changed || result.steps.some((s) => s.unexpectedPage));
   const run: Run = {
     app,
     goal: opts.goal ?? flow,
@@ -120,6 +126,8 @@ export async function recordRun(opts: {
     }),
     sigSequence: result.sigSequence,
     ...(result.stoppedBefore !== undefined ? { stoppedBefore: result.stoppedBefore } : {}),
+    ...(changedPath ? { accepted: false as const } : {}),
+    starts: opts.starts ?? [0],
     events: result.signals.slice(0, 200).map((s) => ({ ...s })),
     findings: drafts.map((d) => d.fingerprint),
     durationMs: result.durationMs,
@@ -129,8 +137,35 @@ export async function recordRun(opts: {
   if (opts.runId) {
     // A planned run: keep its question history and planning, add what happened.
     await c.runs.updateOne({ _id: opts.runId }, { $set: run, $unset: { question: '' } });
-    return { runId: opts.runId, drift, findings: drafts };
+    return { runId: opts.runId, drift, findings: drafts, ...(changedPath ? { pending: true as const } : {}) };
   }
   const { insertedId } = await c.runs.insertOne(run);
-  return { runId: insertedId, drift, findings: drafts };
+  return { runId: insertedId, drift, findings: drafts, ...(changedPath ? { pending: true as const } : {}) };
+}
+
+/**
+ * A changed path was triaged `expected`: the runs that took it join the
+ * history, and the newest one's pages become what each of its flows expects
+ * step by step — so the change is accepted once, not flagged on every run.
+ */
+export async function acceptPaths(app: string, fingerprints: string[]): Promise<{ runs: number; flows: string[] }> {
+  if (!fingerprints.length) return { runs: 0, flows: [] };
+  const c = await collections();
+  const pending = await c.runs.find({ app, accepted: false, findings: { $in: fingerprints } }).sort({ startedAt: 1 }).toArray();
+  if (!pending.length) return { runs: 0, flows: [] };
+  await c.runs.updateMany({ _id: { $in: pending.map((r) => r._id!) } }, { $unset: { accepted: '' } });
+
+  const newest = pending.at(-1)!;
+  const updated: string[] = [];
+  for (const [i, slug] of newest.plan.entries()) {
+    const flow = await c.flows.findOne({ app, slug });
+    if (!flow) continue;
+    const start = newest.starts?.[i] ?? 0;
+    const sigAt = new Map(newest.steps.filter((s) => s.sig).map((s) => [s.seq - start, s.sig!]));
+    const steps = flow.steps.map((s, j) => (sigAt.has(j) ? { ...s, expectedSig: sigAt.get(j)! } : s));
+    const last = sigAt.get(flow.steps.length - 1);
+    await c.flows.updateOne({ _id: flow._id! }, { $set: { steps, ...(last ? { endState: last } : {}), updatedAt: new Date() } });
+    updated.push(slug);
+  }
+  return { runs: pending.length, flows: updated };
 }

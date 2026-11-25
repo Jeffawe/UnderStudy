@@ -64,7 +64,11 @@ Then, mid-run, with the browser open:
   a **finding** says the app is broken.
   Reached a goal without `understudy_run`? Record it there as `reached`.
 - **Findings**: `understudy_findings` lists what looked broken; triage each as
-  `issue`, `lesson` or `noise`.
+  `issue`, `lesson` or `noise`. A run that passed on a changed path isn't
+  history until its `flow_drift` finding is triaged `expected` — ask the user.
+- **End checks**: a save offers checks of how the flow ended (headings, ticked
+  boxes, status messages). Ask the user which mean "it ended right"; add
+  those with `understudy_save { flow, add }`.
 - **Emails out of memory**: `understudy_app` with `placeholders: ["email"]`
   makes email fields placeholders and moves the addresses to the user's env file.
 

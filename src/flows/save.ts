@@ -202,7 +202,7 @@ export async function proveAndSave(recording: RawRecording, opts: ProveAndSave):
   const commit = await firstStop(recording.appSlug, stepsFrom(recording));
   const proven = await prove(recording, {
     ...(opts.values ? { values: opts.values } : {}), ...(opts.headed ? { headed: true } : {}),
-    ...(commit ? { stopBefore: recording.events[commit.index]!.seq } : {}),
+    ...(commit ? { stopBefore: recording.events[commit.index]!.seq } : { endChecks: true }),
   });
   let unproven = opts.unproven;
   if (!proven.result.ok) {
@@ -315,6 +315,9 @@ export async function proveFlow(app: string, slug: string, opts: { values?: Reco
  */
 const ADDABLE: Record<string, readonly string[]> = {
   human: ['untilText', 'untilUrl', 'untilResponse'],
+  // A check of what the page shows — how a flow should end. Addressed by
+  // role + name, which is a look, not a click.
+  assert: ['assert'],
   wait_response: ['method', 'status', 'field', 'equals', 'above'],
   wait_url: [],
   wait_text: [],
@@ -339,8 +342,16 @@ export function checkAdditions(flow: Pick<Flow, 'steps' | 'startUrl'>, adds: Ste
     }
     const allowed = typeof action === 'string' ? ADDABLE[action] : undefined;
     if (!allowed) return problems.push(`${at}.step.action must be one of ${Object.keys(ADDABLE).join(', ')}`);
-    if (typeof value !== 'string' || !value.trim()) {
-      problems.push(`${at}.step.value is required: ${action === 'human' ? 'what the person does' : action === 'wait_response' ? 'the address' : 'what to wait for'}`);
+    const { role, name } = (a.step ?? {}) as { role?: unknown; name?: unknown };
+    const kind = (hints as { assert?: unknown } | undefined)?.assert;
+    const isAssert = action === 'assert';
+    if (isAssert) {
+      if (typeof role !== 'string' || typeof name !== 'string' || !name.trim()) problems.push(`${at}.step: an assert needs role and name, e.g. {"role":"heading","name":"Visit booked"}`);
+      if (!['visible', 'hidden', 'checked', 'unchecked', 'text', 'contains'].includes(String(kind))) problems.push(`${at}.step.hints.assert must be visible, hidden, checked, unchecked, text or contains`);
+    }
+    const needsValue = !isAssert || kind === 'text' || kind === 'contains';
+    if (needsValue && (typeof value !== 'string' || !value.trim())) {
+      problems.push(`${at}.step.value is required: ${action === 'human' ? 'what the person does' : action === 'wait_response' ? 'the address' : isAssert ? 'the text to expect' : 'what to wait for'}`);
     }
     if (hints !== undefined && (typeof hints !== 'object' || hints === null || Array.isArray(hints))) problems.push(`${at}.step.hints must be an object`);
     const extra = Object.keys((hints as object | undefined) ?? {}).filter((k) => !allowed.includes(k));
@@ -349,7 +360,9 @@ export function checkAdditions(flow: Pick<Flow, 'steps' | 'startUrl'>, adds: Ste
     steps.push({
       before: a.before,
       step: {
-        action: action as Step['action'], value: String(value ?? '').trim(),
+        action: action as Step['action'],
+        ...(typeof value === 'string' && value.trim() ? { value: value.trim() } : {}),
+        ...(isAssert && typeof role === 'string' ? { role } : {}), ...(isAssert && typeof name === 'string' ? { name } : {}),
         url: prev?.url ?? flow.startUrl, resolution: 'synthesized',
         ...(hints && Object.keys(hints).length ? { hints: hints as Record<string, unknown> } : {}),
       },

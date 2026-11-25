@@ -325,3 +325,27 @@ test('a person\'s step can end on a server answer the page never shows', { timeo
     await lease.close();
   }
 });
+
+test('after a full pass, the last page is offered as checks of how it ended — headings, ticked boxes, status messages', { timeout: 60_000 }, async () => {
+  const { recording } = await parse(`
+  await page.goto('/checkout');
+  await page.getByLabel('I agree to the terms').check({ force: true });`, shop.url);
+  const result = await replay(recording, { endChecks: true });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.endChecks, [
+    { action: 'assert', role: 'heading', name: 'Checkout', hints: { assert: 'visible' } },
+    { action: 'assert', role: 'checkbox', name: 'I agree to the terms', hints: { assert: 'checked' } },
+  ]);
+
+  const { recording: book } = await parse(`
+  await page.goto('/book');
+  await page.getByRole('button', { name: 'Book' }).click();
+  await expect(page.getByRole('status')).toHaveText('Booked');`, shop.url);
+  const booked = await replay(book, { endChecks: true });
+  assert.ok(booked.endChecks?.some((c) => c.action === 'wait_text' && c.value === 'Booked'), JSON.stringify(booked.endChecks));
+  assert.equal((await replay(book, {})).endChecks, undefined, 'only when asked');
+
+  // Offered checks are ordinary steps: they replay.
+  const checked = { ...recording, events: [...recording.events, ...result.endChecks!.map((c, i) => ({ ...c, seq: 2 + i, ts: 2 + i, url: shop.url, resolution: 'synthesized' as const }))] };
+  assert.equal((await replay(checked)).ok, true);
+});

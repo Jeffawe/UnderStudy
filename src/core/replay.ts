@@ -176,6 +176,17 @@ export interface ReplayResult {
   handoffs: HandoffRecord[];
   /** Set when the replay stopped, as asked, before this step (see `stopBefore`). */
   stoppedBefore?: number;
+  /** With `endChecks`: what the last page showed, as steps that would check it. */
+  endChecks?: EndCheck[];
+}
+
+/** A check of how the flow ended, offered for someone to approve — never added by itself. */
+export interface EndCheck {
+  action: 'assert' | 'wait_text';
+  role?: string;
+  name?: string;
+  value?: string;
+  hints?: Record<string, unknown>;
 }
 
 export interface ReplayOptions {
@@ -276,6 +287,8 @@ export interface ReplayOptions {
   onHuman?: (request: HumanRequest, signal: AbortSignal) => Promise<HumanAnswer>;
   /** How long a human step waits, in ms. Default 15 minutes. */
   humanTimeoutMs?: number;
+  /** After a full pass, read the last page into `endChecks` — what "ended right" could mean. */
+  endChecks?: boolean;
   /**
    * Turn visual checkpoints on. Opt-in because it only means something when
    * the reasoner can actually look at an image — Bedrock's adapter answers
@@ -1540,9 +1553,13 @@ export async function replay(
     }
   }
 
+  const failed = steps.filter((s) => !s.ok);
+  const endChecks = opts.endChecks && !failed.length && stoppedBefore === undefined && steps.length === recording.events.length
+    ? await endChecksOf(page).catch(() => [])
+    : undefined;
+
   if (ownsLease) await lease.close();
 
-  const failed = steps.filter((s) => !s.ok);
 
   // A prelude that did not replay means the recording's own steps NEVER RAN.
   // Calling that `needsReview` would quarantine a recording nothing was learned
@@ -1568,5 +1585,33 @@ export async function replay(
     visualChecks,
     handoffs,
     ...(stoppedBefore !== undefined ? { stoppedBefore } : {}),
+    ...(endChecks?.length ? { endChecks } : {}),
   };
+}
+
+/**
+ * What the last page says about how the flow ended: its headings, the state of
+ * every named checkbox, radio and switch ("Extended care" ticked), and any
+ * status or alert message. Read from the accessibility tree, so it is what a
+ * person would read, not markup. Offered, never assumed: which of these mean
+ * "it ended right" is a person's call.
+ */
+async function endChecksOf(page: Page): Promise<EndCheck[]> {
+  const tree = await page.locator('body').ariaSnapshot({ timeout: 2000 });
+  const headings: EndCheck[] = [];
+  const states: EndCheck[] = [];
+  const messages: EndCheck[] = [];
+  for (const line of tree.split('\n')) {
+    const m = line.match(/^\s*- (heading|checkbox|radio|switch|status|alert)(?: "((?:[^"\\]|\\.)*)")?([^:]*)(?::\s*(.+))?$/);
+    if (!m) continue;
+    const [, role, rawName, flags = '', text] = m;
+    const name = rawName?.replace(/\\(.)/g, '$1');
+    if (role === 'heading' && name) headings.push({ action: 'assert', role, name, hints: { assert: 'visible' } });
+    else if ((role === 'checkbox' || role === 'radio' || role === 'switch') && name) {
+      states.push({ action: 'assert', role, name, hints: { assert: /\[checked(=true)?\]/.test(flags) ? 'checked' : 'unchecked' } });
+    } else if ((role === 'status' || role === 'alert') && (text ?? name)) {
+      messages.push({ action: 'wait_text', value: (text ?? name)!.trim() });
+    }
+  }
+  return [...headings.slice(0, 3), ...states.slice(0, 6), ...messages.slice(0, 2)];
 }

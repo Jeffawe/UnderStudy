@@ -71,6 +71,8 @@ export interface ExecuteOptions {
    * a window they can't see.
    */
   onStuck?: (stuck: StuckStep) => Promise<'done' | 'abort'>;
+  /** Read the last page into `result.endChecks`, after a full pass. */
+  endChecks?: boolean;
 }
 
 /** A step that failed, put to a person who can see the browser. */
@@ -142,6 +144,7 @@ export async function execute(recording: RawRecording, opts: ExecuteOptions = {}
     ...(storageState ? { storageState } : {}),
     ...(headed ? { headless: false } : {}),
     ...(opts.onHuman ? { onHuman: opts.onHuman } : {}),
+    ...(opts.endChecks ? { endChecks: true } : {}),
     ...(onStuck && headed
       ? {
           onHandoff: async (r) => {

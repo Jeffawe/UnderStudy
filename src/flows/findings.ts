@@ -150,12 +150,14 @@ export async function listFindings(coll: Collection<Finding>, app: string, opts:
   return rows.slice(0, opts.limit ?? 40);
 }
 
-export type Verdict = 'issue' | 'lesson' | 'noise';
+export type Verdict = 'issue' | 'lesson' | 'noise' | 'expected';
 
 /**
  * Route open findings. issue: the app is wrong and someone should fix it.
  * lesson: accepted — the agent works around it (pass the lesson to store).
  * noise: not a problem (third-party telemetry, framework warnings).
+ * expected: a changed path the app made on purpose — flow_drift only. The
+ * caller then accepts the runs that took it (runs.ts, acceptPaths).
  * Returns what couldn't be routed instead of throwing, so one bad item
  * doesn't lose the rest.
  */
@@ -163,17 +165,26 @@ export async function triage(
   coll: Collection<Finding>,
   app: string,
   items: { fingerprint: string; verdict: Verdict }[],
-): Promise<{ routed: number; problems: string[] }> {
+): Promise<{ routed: number; problems: string[]; expected: string[] }> {
   const problems: string[] = [];
+  const expected: string[] = [];
   let routed = 0;
   for (const [i, item] of items.entries()) {
-    if (!['issue', 'lesson', 'noise'].includes(item?.verdict)) {
-      problems.push(`triage[${i}].verdict must be issue, lesson or noise`);
+    if (!['issue', 'lesson', 'noise', 'expected'].includes(item?.verdict)) {
+      problems.push(`triage[${i}].verdict must be issue, lesson, noise or expected`);
       continue;
+    }
+    if (item.verdict === 'expected') {
+      const f = await coll.findOne({ app, fingerprint: item.fingerprint }, { projection: { kind: 1 } });
+      if (f && f.kind !== 'flow_drift') {
+        problems.push(`triage[${i}]: expected is for a changed path (flow_drift); this is ${f.kind} — use issue, lesson or noise`);
+        continue;
+      }
+      if (f) expected.push(item.fingerprint);
     }
     const { matchedCount } = await coll.updateOne({ app, fingerprint: item.fingerprint }, { $set: { status: item.verdict } });
     if (matchedCount) routed++;
     else problems.push(`triage[${i}]: no finding with fingerprint ${item.fingerprint}`);
   }
-  return { routed, problems };
+  return { routed, problems, expected };
 }

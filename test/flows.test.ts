@@ -197,3 +197,30 @@ test('findings keep port numbers, and list the most severe first', async () => {
   const coll = { find: () => ({ toArray: async () => [...rows] }) } as never;
   assert.deepEqual((await listFindings(coll, 'shop')).map((f) => f.statement), ['regression', 'a 404', 'image warning'], 'most severe first');
 });
+
+test('adding steps by hand: an end check needs role, name and a known kind; a person\'s step needs what they do', async () => {
+  const { checkAdditions } = await import('../src/flows/save.js');
+  const flow = { startUrl: url, steps: [{ action: 'goto', url, resolution: 'synthesized' }] } as Pick<Flow, 'steps' | 'startUrl'>;
+  const ok = checkAdditions(flow, [
+    { before: 1, step: { action: 'assert', role: 'checkbox', name: 'Extended care', hints: { assert: 'checked' } } },
+    { before: 1, step: { action: 'assert', role: 'status', name: 'Visit', value: 'Waiting', hints: { assert: 'contains' } } },
+  ]);
+  assert.deepEqual(ok.problems, []);
+  assert.deepEqual(ok.steps[0]!.step, { action: 'assert', role: 'checkbox', name: 'Extended care', url, resolution: 'synthesized', hints: { assert: 'checked' } });
+  const bad = checkAdditions(flow, [
+    { before: 1, step: { action: 'assert', hints: { assert: 'shiny' } } },
+    { before: 1, step: { action: 'assert', role: 'heading', name: 'Done', hints: { assert: 'text' } } },
+    { before: 1, step: { action: 'human' } },
+  ]);
+  assert.equal(bad.problems.length, 4, bad.problems.join('\n'));
+  assert.match(bad.problems.join('\n'), /needs role and name.*\n.*hints\.assert must be.*\n.*value is required: the text to expect.*\n.*value is required: what the person does/s);
+});
+
+test('recall: on a near tie, proven first, then a flow a person recorded ahead of one an agent made', async () => {
+  const { rank } = await import('../src/memory/recall.js');
+  const m = (slug: string, score: number, madeBy: 'user' | 'agent', proven = true) =>
+    ({ slug, title: slug, kind: 'recording', madeBy, proven, score, destructive: false, requiresSession: false }) as const;
+  assert.deepEqual(rank([m('agent', 0.801, 'agent'), m('user', 0.8, 'user')]).map((f) => f.slug), ['user', 'agent']);
+  assert.deepEqual(rank([m('user', 0.8, 'user', false), m('agent', 0.8, 'agent')]).map((f) => f.slug), ['agent', 'user'], 'proven still comes first');
+  assert.deepEqual(rank([m('agent', 0.9, 'agent'), m('user', 0.8, 'user')]).map((f) => f.slug), ['agent', 'user'], 'a clearly better match still wins');
+});
