@@ -124,10 +124,22 @@ ollama pull mxbai-embed-large
 understudy config set EMBED_URL=http://localhost:11434/v1/embeddings EMBED_MODEL=mxbai-embed-large EMBED_DIMS=1024
 ```
 
-Two things to know: one database holds one model's vectors, so switching later
-means `understudy reembed`; and the line between "a flow I know" and "close,
-but not it" was calibrated on Voyage — other models score differently, so check
-a few goals with `understudy recall` first.
+Two things to know. One database holds one model's vectors, so switching later
+means `understudy reembed`. And the line between "a flow I know" and "close,
+but not it" was set for Voyage. Other models score on their own scale: with
+the cutoffs set for Voyage, mxbai-embed-large called 12 of 14 goals an app didn't have
+"known", so the wrong flow would have run. Fit the line to your app and model:
+
+```bash
+understudy calibrate myapp --template > goals.json   # every flow, to reword
+# fill in 2–3 ways someone would ask for each flow, and 5+ goals that sound
+# like the app but that it has no flow for
+understudy calibrate myapp --goals goals.json
+```
+
+The goals are kept, so after any later `understudy reembed` the line is re-fit
+for the new model on its own. `recall` says when it's using cutoffs that
+weren't fitted for the model you have.
 
 ## Use it
 

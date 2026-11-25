@@ -48,7 +48,9 @@ USAGE
 COMMANDS
   config                where settings come from; set them, or point at an env file
   doctor                check the MongoDB connection, vector search and embedder
-  reembed               rebuild every vector with the model now configured
+  reembed               rebuild every vector with the model now configured, then
+                        re-fit each app's recall cutoffs from its kept goals
+  calibrate <app>       fit when recall calls a goal known, for this app and model
   record <app>          capture a flow in your own Chrome, with the extension
   extension             where the Chrome extension is, and how to load it
   app <app>             an app's settings, e.g. --placeholder email
@@ -114,6 +116,13 @@ RUN
 EMIT
   --framework <name>    playwright-ts (default) or cypress-js
   --out <file>          write to a file instead of printing
+
+CALIBRATE
+  --goals <file>        goals to fit on, kept for next time (reembed re-fits from them):
+                        {"known": {"<flow-slug>": ["how someone would ask", …]},
+                         "unknown": ["a goal that sounds like the app but isn't in it", …]}
+  --template            print a goals file to fill in, listing the app's flows
+  --dry-run             fit and show, keep nothing
 
 DISTILL
   --save <file>         store the agent's answer (validated first)
@@ -251,6 +260,66 @@ async function cmdReembed() {
   const { reembed } = await import('../store/reembed.js');
   const r = await reembed();
   console.log(`re-embedded ${r.flows} flows and ${r.notes} notes with ${r.model}`);
+
+  // A new model scores on a new scale: re-fit the cutoffs wherever there are goals to fit on.
+  const { recalibrateAll } = await import('../memory/calibrate.js');
+  const { refitted, withoutGoals } = await recalibrateAll();
+  for (const c of refitted) {
+    console.log(`calibrated ${c.app}: ${c.saved ? `${cutoffLine(c.after)} — ${c.after.correct}/${c.total} goals right` : `not saved — ${c.notes.join('; ')}`}`);
+  }
+  for (const app of withoutGoals) console.log(`not calibrated ${app}: no goals kept — run: understudy calibrate ${app} --template`);
+}
+
+const cutoffLine = (c: { strong: number; good: number; margin: number }) =>
+  `strong ${c.strong.toFixed(3)}, good ${c.good.toFixed(3)} + margin ${c.margin.toFixed(3)}`;
+
+/**
+ * understudy calibrate <app> [--goals file] [--dry-run]   fit recall's cutoffs
+ * understudy calibrate <app> --template                   a goals file to fill in
+ */
+async function cmdCalibrate(positional: string[], flags: Flags) {
+  const [app] = positional;
+  if (!app) fail('calibrate needs an app', 'understudy calibrate myapp --goals goals.json');
+  const { calibrate } = await import('../memory/calibrate.js');
+
+  if (flags.has('template')) {
+    const { flows } = await store.collections();
+    const list = await flows.find({ app }, { projection: { slug: 1, title: 1 } }).toArray();
+    if (!list.length) fail(`no flows for '${app}'`);
+    const known = Object.fromEntries(list.map((f) => [f.slug, [`<another way to say: ${f.title}>`]]));
+    console.log(JSON.stringify({ known, unknown: ['<a goal that sounds like this app, but that it has no flow for>'] }, null, 2));
+    return;
+  }
+
+  let goals: { known: { flow: string; goal: string }[]; unknown: string[] } | undefined;
+  const file = str(flags.get('goals'));
+  if (file) {
+    let raw: { known?: Record<string, string[]>; unknown?: string[] };
+    try { raw = JSON.parse(await readFile(file, 'utf8')); } catch (e) { fail(`can't read ${file}: ${(e as Error).message}`); }
+    const placeholder = (g: string) => /^<.*>$/.test(g.trim());
+    goals = {
+      known: Object.entries(raw.known ?? {}).flatMap(([flow, gs]) => (gs ?? []).filter((g) => !placeholder(g)).map((goal) => ({ flow, goal }))),
+      unknown: (raw.unknown ?? []).filter((g) => !placeholder(g)),
+    };
+  }
+
+  const c = await calibrate(app, { ...(goals ? { goals } : {}), ...(flags.has('dry-run') ? { dryRun: true } : {}) });
+  console.log(`${c.app} with ${c.model}: ${c.flows} flows, ${c.total} goals — ${c.goals.known} known + ${c.goals.fromRuns} from runs, ${c.goals.unknown} unknown + ${c.goals.leftOut} by leaving a flow out\n`);
+  console.log(`before  ${cutoffLine(c.before)}  (${c.before.source})  ${c.before.correct}/${c.total} right`);
+  console.log(`fitted  ${cutoffLine(c.after)}  ${c.after.correct}/${c.total} right`);
+  if (c.mistakes.length) {
+    console.log('\nstill wrong with the fitted cutoffs');
+    for (const m of c.mistakes) {
+      console.log(`  ${m.verdict === 'known' ? 'called known' : 'missed     '}  ${m.score.toFixed(3)}${m.next !== undefined ? ` (next ${m.next.toFixed(3)})` : ''}  "${m.goal}" → ${m.top ?? '-'}${m.expected ? `, wanted ${m.expected}` : ''}`);
+    }
+  }
+  if (c.misranked.length) {
+    console.log(`\n${c.model} ranked another flow first for ${c.misranked.length} known goal(s) — no cutoff fixes that:`);
+    for (const m of c.misranked) console.log(`  "${m.goal}" → ${m.top}, wanted ${m.expected}`);
+  }
+  for (const n of c.notes) console.log(`\nnote: ${n}`);
+  console.log(c.saved ? '\nsaved — recall uses these cutoffs for this app with this model' : flags.has('dry-run') ? '\ndry run — nothing kept' : '\nnot saved (goals kept) — add more and run again');
+  if (!c.saved && !flags.has('dry-run')) process.exitCode = 1;
 }
 
 // --- config ------------------------------------------------------------------
@@ -1122,6 +1191,7 @@ async function main() {
     case 'extension': return cmdExtension();
     case 'app': return cmdApp(rest, flags);
     case 'reembed': return cmdReembed();
+    case 'calibrate': return cmdCalibrate(rest, flags);
     case 'record': return cmdRecord(rest, flags);
     case 'import': return cmdImport(rest, flags);
     case 'recordings': return cmdRecordings(rest);

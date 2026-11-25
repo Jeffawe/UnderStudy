@@ -14,6 +14,7 @@
  *   understudy_record          wait for the user to record a flow in their Chrome
  *   understudy_save            prove a recording by replaying it, then keep it as a flow (or prove a saved one)
  *   understudy_app             an app's settings — e.g. keep email fields as placeholders
+ *   understudy_calibrate       fit when recall calls a goal known, for one app and embedding model
  *
  * Long-lived: reconnect (/mcp) after changing the source.
  */
@@ -36,6 +37,7 @@ import type { EndCheck } from '../core/replay.js';
 import { MissingValuesError } from '../flows/execute.js';
 import { parseScript } from '../adapters/recorder/script.js';
 import { setPlaceholders, appPlaceholders } from '../memory/placeholders.js';
+import { calibrate } from '../memory/calibrate.js';
 import { VERSION } from './version.js';
 
 /**
@@ -456,5 +458,18 @@ server.registerTool('understudy_app', {
   if (placeholders) return setPlaceholders(app, placeholders);
   return { app, placeholders: await appPlaceholders(app) };
 }));
+
+server.registerTool('understudy_calibrate', {
+  description: 'Fit when recall calls a goal "known", for this app and embedding model — needed after switching models, or when recall calls the wrong things known (its `cutoffs.source` says "uncalibrated"). Give 2–3 rewordings per flow (not its own title) and 5+ goals that sound like the app but that it has no flow for; they are kept, so later calls and `understudy reembed` re-fit from them. Tell the user the before/after and any mistakes.',
+  inputSchema: {
+    app: z.string(),
+    known: z.array(z.object({ flow: z.string().describe('the flow\'s slug'), goals: z.array(z.string()) })).optional(),
+    unknown: z.array(z.string()).optional(),
+    dryRun: z.boolean().optional().describe('fit and report, keep nothing'),
+  },
+}, ({ app, known, unknown, dryRun }) => wrap(() => calibrate(app, {
+  goals: { known: (known ?? []).flatMap((k) => k.goals.map((goal) => ({ flow: k.flow, goal }))), unknown: unknown ?? [] },
+  ...(dryRun ? { dryRun } : {}),
+})));
 
 await server.connect(new StdioServerTransport());

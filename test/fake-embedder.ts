@@ -28,7 +28,8 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
   return JSON.parse(s) as Record<string, unknown>;
 }
 
-export async function startFakeEmbedder(dims: number, opts: { returnDims?: number } = {}): Promise<FakeEmbedder> {
+/** `vectorFor`: the vector to return for a text, instead of one hashed axis. */
+export async function startFakeEmbedder(dims: number, opts: { returnDims?: number; vectorFor?: (text: string) => number[] | undefined } = {}): Promise<FakeEmbedder> {
   const requests: Record<string, unknown>[] = [];
   let limited = 0;
 
@@ -42,6 +43,8 @@ export async function startFakeEmbedder(dims: number, opts: { returnDims?: numbe
     }
     const n = opts.returnDims ?? dims;
     const data = (body.input as string[]).map((text, index) => {
+      const chosen = opts.vectorFor?.(text);
+      if (chosen) return { index, embedding: chosen };
       const v = new Array<number>(n).fill(0);
       v[axisFor(text, n)] = 1;
       return { index, embedding: v };

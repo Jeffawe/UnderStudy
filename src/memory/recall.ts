@@ -15,9 +15,9 @@
  * Either way, a goal that IS a flow's name or slug matches exactly.
  */
 
-import type { Flow, Note } from '../store/types.js';
+import type { Cutoffs, Flow, Note } from '../store/types.js';
 import { collections, vectorSearch } from '../store/db.js';
-import { embed, embedderConfig } from '../store/embed.js';
+import { embed, embedderConfig, VOYAGE_DEFAULT, type EmbedderConfig } from '../store/embed.js';
 import { valuesFromEnv, valueEnvNames } from '../store/settings.js';
 import { valueRefsOf } from '../core/recording.js';
 
@@ -87,17 +87,22 @@ export interface Recall {
   why: string;
   flows: FlowMatch[];
   notes: NoteMatch[];
+  /** Matching by meaning: the cutoffs the verdict used, and where they came from. */
+  cutoffs?: Cutoffs & { source: CutoffSource };
 }
 
 /**
- * When a match by MEANING is good enough to act on. Calibrated 2026-11-18 on
- * a real 28-flow corpus with voyage-4-lite (15 known goals, 14 plausible
- * unknown ones): no single score separates them, because a
+ * When a match by MEANING is good enough to act on — the built-in cutoffs, for
+ * voyage-4-lite. Set by hand 2026-11-18 on a real 28-flow corpus (15 known
+ * goals, 14 plausible unknown ones): no single score separates them, because a
  * goal the app doesn't have still lands near something. What does separate
- * them is how far the top match is ahead of the runner-up. A different
- * embedding model needs recalibrating.
+ * them is how far the top match is ahead of the runner-up.
+ *
+ * Other models score on other scales (mxbai-embed-large puts unrelated goals
+ * at 0.72–0.80), so `understudy calibrate` fits these per app and model, and
+ * recall uses the fitted ones when there are any (see cutoffsFor).
  */
-export const MEANING = {
+export const MEANING: Cutoffs = {
   /** At or above this, the top flow is the answer. */
   strong: 0.78,
   /** At or above this, the top flow is the answer IF it clearly beats the runner-up… */
@@ -107,23 +112,49 @@ export const MEANING = {
 };
 
 /** The same rule for word matching, where a score is the share of the goal's words a flow contains. */
-export const WORDS = { strong: 1, good: 0.6, margin: 0.2 };
+export const WORDS: Cutoffs = { strong: 1, good: 0.6, margin: 0.2 };
+
+/**
+ * Pure: is the top flow the answer? The whole rule, in one place — judge
+ * explains it, calibrate fits it. With only one flow there's no runner-up to
+ * beat, so only a strong match counts.
+ */
+export function isKnown(top: number, second: number | undefined, rule: Cutoffs): boolean {
+  if (top >= rule.strong) return true;
+  return top >= rule.good && second !== undefined && top - second >= rule.margin;
+}
 
 /** Pure: the verdict for a ranked list of scores. Exported for tests. */
-export function judge(scores: number[], rule: { strong: number; good: number; margin: number }): { verdict: Verdict; why: string } {
+export function judge(scores: number[], rule: Cutoffs): { verdict: Verdict; why: string } {
   const [top, second] = scores;
   if (top === undefined) return { verdict: 'unknown', why: 'this app has no flows yet' };
   const f = (n: number) => n.toFixed(2);
 
-  if (top >= rule.strong) return { verdict: 'known', why: `strong match (${f(top)})` };
+  if (isKnown(top, second, rule)) {
+    return { verdict: 'known', why: top >= rule.strong ? `strong match (${f(top)})` : `good match (${f(top)}), clearly ahead of the next (${f(second!)})` };
+  }
   if (top >= rule.good) {
-    // With only one flow there's no runner-up to beat, so only a strong match counts.
     if (second === undefined) return { verdict: 'unsure', why: `good match (${f(top)}), but only one flow to compare with` };
-    if (top - second >= rule.margin) return { verdict: 'known', why: `good match (${f(top)}), clearly ahead of the next (${f(second)})` };
     return { verdict: 'unsure', why: `good match (${f(top)}), but the next is close (${f(second)})` };
   }
   return { verdict: 'unknown', why: `nothing matches well (best ${f(top)})` };
 }
+
+/**
+ * Which cutoffs recall uses with this model: fitted for this app; else fitted
+ * for another app with the same model (better than another model's numbers);
+ * else the built-in ones, which were set for voyage-4-lite.
+ */
+export async function cutoffsFor(app: string, cfg: Pick<EmbedderConfig, 'model' | 'dims'>): Promise<Cutoffs & { source: CutoffSource }> {
+  const { apps } = await collections();
+  const same = { 'cutoffs.model': cfg.model, 'cutoffs.dims': cfg.dims };
+  const own = await apps.findOne({ slug: app, ...same }, { projection: { cutoffs: 1 } });
+  const fitted = own?.cutoffs ?? (await apps.findOne(same, { sort: { 'cutoffs.fittedAt': -1 }, projection: { cutoffs: 1 } }))?.cutoffs;
+  if (fitted) return { strong: fitted.strong, good: fitted.good, margin: fitted.margin, source: own ? 'this app' : 'another app' };
+  return { ...MEANING, source: cfg.model === VOYAGE_DEFAULT.model ? 'built-in' : 'uncalibrated' };
+}
+
+export type CutoffSource = 'this app' | 'another app' | 'built-in' | 'uncalibrated';
 
 const STOP = new Set(['a', 'an', 'the', 'to', 'my', 'of', 'for', 'and', 'in', 'on', 'as', 'i', 'me', 'it', 'is', 'with', 'at', 'up', 'out']);
 const words = (s: string) => new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w && !STOP.has(w)));
@@ -206,16 +237,24 @@ export async function recall(app: string, goal: string, opts: { limit?: number; 
   }
 
   // 2. By meaning, if there's a model.
-  if (embedderConfig()) {
-    const [vector] = await embed([goal], 'query');
-    const [flows, notes] = await Promise.all([
+  const cfg = embedderConfig();
+  if (cfg) {
+    const [vector] = await embed([goal], 'query', cfg);
+    const [flows, notes, rule] = await Promise.all([
       vectorSearch(c.flows, app, vector!, { limit }),
       vectorSearch(c.notes, app, vector!, { limit }),
+      cutoffsFor(app, cfg),
     ]);
     const matches = rank(flows.map((f) => toMatch(f, f.score)));
-    const { verdict, why } = judge(matches.map((m) => m.score), MEANING);
+    const judged = judge(matches.map((m) => m.score), rule);
+    const { verdict } = judged;
+    let why = verdict === 'known' ? withProven(judged.why, matches[0]) : judged.why;
+    if (rule.source === 'uncalibrated' && matches.length) {
+      why += ` (cutoffs not fitted for ${cfg.model} — run: understudy calibrate ${app})`;
+    }
+    const { source, ...cutoffs } = rule;
     return {
-      goal, method: 'meaning', verdict, why: verdict === 'known' ? withProven(why, matches[0]) : why, flows: matches,
+      goal, method: 'meaning', verdict, why, flows: matches, cutoffs: { ...cutoffs, source },
       ...(verdict === 'known' ? { best: matches[0]!, ...(opts.withSteps ? await plan(app, matches[0]!.slug) : {}) } : {}),
       notes: notes.map((n) => ({ kind: n.kind, text: n.text, score: n.score })),
     };

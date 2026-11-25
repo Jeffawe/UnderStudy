@@ -50,10 +50,10 @@ after(async () => {
 
 const text = (r: unknown) => ((r as { content: { text: string }[] }).content[0]!.text);
 
-test('ten tools and short instructions — every session pays for them', async () => {
+test('eleven tools and short instructions — every session pays for them', async () => {
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map((t) => t.name).sort(), [
-    'understudy_answer', 'understudy_app', 'understudy_distill', 'understudy_findings', 'understudy_recall', 'understudy_record',
+    'understudy_answer', 'understudy_app', 'understudy_calibrate', 'understudy_distill', 'understudy_findings', 'understudy_recall', 'understudy_record',
     'understudy_remember', 'understudy_run', 'understudy_save', 'understudy_save_distilled',
   ]);
   const total = tools.reduce((n, t) => n + (t.description?.length ?? 0) + JSON.stringify(t.inputSchema).length, 0);

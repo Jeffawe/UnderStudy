@@ -150,6 +150,16 @@ test('one embedding model per database, and reembed switches it', async () => {
     const login = await flows.findOne({ app: 'shop', slug: 'log-in' });
     assert.equal(login!.embedding![axisFor(login!.searchText, EMBED_DIMS)], 1, 'vector rebuilt from searchText');
     assert.equal(fake.requests.length, 1, 'all four flows embedded in one request');
+
+    // A model that fails leaves the database as it was: still model-b, with model-b's vectors.
+    process.env.EMBED_MODEL = 'model-c';
+    fake.rateLimitNext(10);
+    await assert.rejects(reembed(), /embedding request failed: 429/);
+    fake.rateLimitNext(0);
+    assert.equal((await meta.findOne({ _id: 'embedder' }))?.model, 'model-b', 'still recorded as the old model');
+    assert.deepEqual((await flows.findOne({ app: 'shop', slug: 'log-in' }))!.embedding, login!.embedding, 'old vectors untouched');
+    process.env.EMBED_MODEL = 'model-b';
+    await ensureSchema(); // and still usable with the old model
   } finally {
     await fake.close();
   }

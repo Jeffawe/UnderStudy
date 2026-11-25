@@ -38,7 +38,36 @@ export interface App {
    * value moves to the user's env file. See memory/placeholders.ts.
    */
   placeholders?: PlaceholderKind[];
+  /**
+   * Goals to fit recall's known/unknown cutoffs from (`understudy calibrate`).
+   * Kept so `reembed` can re-fit them for a new model without asking again.
+   */
+  calibrationGoals?: CalibrationGoals;
+  /** The cutoffs fitted from them, for one embedding model. Ignored when the model changes. */
+  cutoffs?: FittedCutoffs;
   createdAt: Date;
+}
+
+/** Goals labelled with the flow that does them; `unknown` ones the app doesn't have. */
+export interface CalibrationGoals {
+  known: { flow: string; goal: string }[];
+  unknown: string[];
+}
+
+/** recall's rule for "known": top ≥ strong, or top ≥ good and ≥ margin ahead of the next flow. */
+export interface Cutoffs {
+  strong: number;
+  good: number;
+  margin: number;
+}
+
+export interface FittedCutoffs extends Cutoffs {
+  model: string;
+  dims: number;
+  fittedAt: Date;
+  /** How many goals it was fitted on, and how many the cutoffs put on the right side. */
+  goals: { known: number; unknown: number };
+  correct: number;
 }
 
 export interface Flow {
