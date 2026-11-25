@@ -83,8 +83,9 @@ Then, mid-run, with the browser open:
 - **Purchases aren't replayed by saving.** A flow with a commit step ("Pay
   now", "Confirm & Submit") is proven only up to it: the control is checked,
   never pressed. Anything irreversible the words don't reveal still runs —
-  say so with a fact (`marksDestructive`) first. `understudy_save` with `flow`
-  does the same for one already saved with `verify: false`.
+  say so with a fact (`marksDestructive`) first — or save it without
+  replaying at all (`verify: false`, with a `note`). `understudy_save` with
+  `flow` proves one saved that way later, up to its commit.
 - **Logins are often rate-limited**; a missing login value stops a run before
   it opens a browser, so check `needs` from recall first. The answer names the
   env file line to add: ask the user to add it, then call again.
