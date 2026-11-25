@@ -12,16 +12,22 @@ import type { Vocabulary } from '../core/distill.js';
 export async function vocabulary(app: string): Promise<Vocabulary> {
   const { flows, notes } = await collections();
   const rows = await flows
-    .find({ app }, { projection: { slug: 1, title: 1, intent: 1, kind: 1, preconditions: 1, outcome: 1, steps: 1 } })
+    .find({ app }, { projection: { slug: 1, title: 1, intent: 1, kind: 1, preconditions: 1, outcome: 1, steps: 1, requires: 1, establishes: 1 } })
     .sort({ kind: -1, slug: 1 })
     .toArray();
   const facts = await notes.find({ app, kind: 'fact' }, { projection: { text: 1 } }).toArray();
+  const stateOf = (f: { requires?: string[]; establishes?: string[] }) => ({
+    ...(f.requires?.length ? { requires: f.requires } : {}),
+    ...(f.establishes?.length ? { establishes: f.establishes } : {}),
+  });
+  const states = [...new Set(rows.flatMap((f) => [...(f.requires ?? []), ...(f.establishes ?? [])]))].sort();
   return {
     segments: rows.filter((f) => f.kind === 'segment').map((f) => ({
       slug: f.slug, title: f.title, intent: f.intent, steps: f.steps.length,
-      preconditions: f.preconditions, outcome: f.outcome || null,
+      preconditions: f.preconditions, outcome: f.outcome || null, ...stateOf(f),
     })),
-    flows: rows.filter((f) => f.kind === 'recording').map((f) => ({ slug: f.slug, title: f.title, intent: f.intent })),
+    flows: rows.filter((f) => f.kind === 'recording').map((f) => ({ slug: f.slug, title: f.title, intent: f.intent, ...stateOf(f) })),
+    ...(states.length ? { states } : {}),
     facts: facts.map((n) => n.text),
   };
 }

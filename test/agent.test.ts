@@ -195,3 +195,51 @@ test('plan: a sub-goal nothing does blocks, with the closest flows', async () =>
   assert.equal(s.status, 'blocked');
   if (s.status === 'blocked') assert.match(s.why, /change my password/);
 });
+
+test('app state: a flow that needs one gets the flow that makes it true first, or the agent\'s word that it holds', { timeout: 60_000 }, async () => {
+  const u = shop.url;
+  const fake = { ok: true, steps: [], sigSequence: [], signals: [], durationMs: 0 } as unknown as Parameters<typeof saveFlow>[1];
+  const flowAt = (path: string, name: string) => buildRecording({ source: 'live', origin: `state-${path}`, appSlug: 'shop', startUrl: `${u}${path}` }, [
+    { seq: 0, ts: 0, action: 'goto', url: `${u}${path}`, resolution: 'synthesized' },
+    { seq: 1, ts: 1, action: 'click', role: 'button', name, url: `${u}${path}`, resolution: 'accname' },
+  ]);
+  await saveFlow(flowAt('bundles', 'Choose the bundle'), fake, { title: 'Get an individual bundle' });
+  await saveFlow(flowAt('visits', 'Start the visit'), fake, { title: 'Start a per visit consult' });
+
+  // Named by distilling, in the same words on both sides.
+  await assert.rejects(
+    saveDistilled('shop', 'start-a-per-visit-consult', { intent: 'start a visit', outcome: 'visit started', preconditions: [], requires: ['Has a bundle!'], segments: [] }),
+    /"Has a bundle!" must be a kebab-case state name/,
+  );
+  await saveDistilled('shop', 'start-a-per-visit-consult', { intent: 'start a per visit consult', outcome: 'visit started', preconditions: [], requires: ['member-has-active-bundle'], segments: [] });
+  await saveDistilled('shop', 'get-an-individual-bundle', { intent: 'get an individual bundle', outcome: 'member has a bundle', preconditions: [], establishes: ['member-has-active-bundle'], segments: [] });
+  assert.deepEqual((await distillRequest('shop', 'open-the-cart')).vocabulary.states, ['member-has-active-bundle'], 'the next distiller sees the word');
+
+  // 1. Not known to hold: asked, with the flows that make it true.
+  let s = await start({ app: 'shop', goal: 'start a visit', subGoals: ['start a per visit consult'], dryRun: true });
+  assert.equal(s.status, 'waiting');
+  if (s.status !== 'waiting') return;
+  assert.equal(s.question.kind, 'state');
+  assert.equal(s.question.state, 'member-has-active-bundle');
+  assert.deepEqual((s.question.establishedBy as { slug: string }[]).map((f) => f.slug), ['get-an-individual-bundle']);
+  await assert.rejects(answer(s.runId, { use: 'open-the-cart' }), /isn't a flow that establishes/);
+  await assert.rejects(answer(s.runId, { maybe: true }), /answer \{ "use"/);
+
+  // 2. Use the flow that makes it true: it runs first.
+  s = await answer(s.runId, { use: 'get-an-individual-bundle' });
+  assert.equal(s.status, 'planned', JSON.stringify(s));
+  if (s.status !== 'planned') return;
+  assert.deepEqual(s.plan, ['get-an-individual-bundle', 'start-a-per-visit-consult']);
+  assert.deepEqual(s.states, [{ state: 'member-has-active-bundle', how: 'made true by running get-an-individual-bundle first' }]);
+
+  // 3. Already true for this account: nothing added.
+  let t = await start({ app: 'shop', goal: 'start a visit', subGoals: ['start a per visit consult'], dryRun: true });
+  if (t.status !== 'waiting') assert.fail(JSON.stringify(t));
+  t = await answer(t.runId, { holds: true });
+  assert.equal(t.status, 'planned');
+  if (t.status === 'planned') assert.deepEqual(t.plan, ['start-a-per-visit-consult']);
+
+  // 4. Asked for in the goal itself: satisfied, no question.
+  const u2 = await start({ app: 'shop', goal: 'bundle, then a visit', subGoals: ['get an individual bundle', 'start a per visit consult'], dryRun: true });
+  assert.equal(u2.status, 'planned', JSON.stringify(u2));
+});

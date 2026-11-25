@@ -43,7 +43,16 @@ export type RecordedAction =
   // Carried by the schema's action CHECK from the start; nothing emitted it
   // until the parser learned to read the spec's own checkpoint calls.
   | 'snapshot'
-  | 'assert';
+  | 'assert'
+  // A step only a person can do: approve the visit in the provider's portal,
+  // solve the captcha, tap the code on their phone. `value` says what, in words
+  // to read to them; `hints.untilUrl` / `hints.untilText` say how the page shows
+  // it's done. The run pauses and asks — it never tries to do it itself.
+  | 'human'
+  // Wait for the app's server to answer: `value` is the address (substring, or
+  // a glob like wait_url), `hints` may add method, status, and one JSON field
+  // to check — what a page can't show, like a commission being recorded.
+  | 'wait_response';
 
 /**
  * How we came to believe an event's role and name — the honesty field.
@@ -281,3 +290,94 @@ export function redactValue(
   }
   return { value };
 }
+
+/**
+ * Actions that never take a value: their first argument in Playwright is an
+ * options object (`click({ force: true })`), not something typed or chosen.
+ */
+const VALUELESS_ACTIONS = new Set<RecordedAction>(['click', 'dispatch_click', 'check', 'uncheck']);
+
+/**
+ * The value references a recording really needs filled in — the login values
+ * a run asks for before it opens a browser.
+ *
+ * Only steps that take a value count. Script import used to store
+ * `click({ force: true })` as `valueRef: '{ force: true }'`, and every caller
+ * then demanded a login value by that name, stopping the run before it began.
+ */
+export function valueRefsOf(events: ReadonlyArray<Pick<RawEvent, 'action' | 'valueRef'>>): string[] {
+  const refs = events.filter((e) => e.valueRef && !VALUELESS_ACTIONS.has(e.action)).map((e) => e.valueRef!);
+  return [...new Set(refs)];
+}
+
+/**
+ * Should this step skip Playwright's actionability checks — `click({ force: true })`?
+ *
+ * Needed for controls the app hides behind a styled overlay, like custom
+ * checkboxes under their label. Kept as `hints.force`; flows saved before that
+ * carry it as the stringified options in `valueRef`, and are read the same way
+ * so they need no re-saving.
+ */
+export function forced(event: Pick<RawEvent, 'action' | 'valueRef' | 'hints'>): boolean {
+  if (event.hints?.force === true) return true;
+  return VALUELESS_ACTIONS.has(event.action) && /\bforce\s*:\s*true\b/.test(event.valueRef ?? '');
+}
+
+/**
+ * A response to wait for: `POST /api/visits` answered 201, and its JSON says
+ * `commission.amount` is above 0.
+ */
+export interface ResponseCheck {
+  /** Address: a substring, or a glob (`**\/api/visits`). */
+  url: string;
+  method?: string;
+  status?: number;
+  /** A dot path into the JSON body, e.g. "commission.amount" or "items.0.id". */
+  field?: string;
+  /** The field equals this. */
+  equals?: string | number | boolean;
+  /** The field is a number above this. */
+  above?: number;
+}
+
+/** Read a response check from a step's value + hints, or from a hints object of its own. */
+export function responseCheckOf(url: unknown, hints: Record<string, unknown> | undefined): ResponseCheck | undefined {
+  if (typeof url !== 'string' || !url) return undefined;
+  const h = hints ?? {};
+  const eq = h.equals;
+  return {
+    url,
+    ...(typeof h.method === 'string' ? { method: h.method.toUpperCase() } : {}),
+    ...(typeof h.status === 'number' ? { status: h.status } : {}),
+    ...(typeof h.field === 'string' ? { field: h.field } : {}),
+    ...(typeof eq === 'string' || typeof eq === 'number' || typeof eq === 'boolean' ? { equals: eq } : {}),
+    ...(typeof h.above === 'number' ? { above: h.above } : {}),
+  };
+}
+
+/** `POST /api/visits → 201, commission.amount > 0` */
+export function describeResponse(c: ResponseCheck): string {
+  const field = c.field ? `, ${c.field}${c.equals !== undefined ? ` = ${JSON.stringify(c.equals)}` : c.above !== undefined ? ` > ${c.above}` : ' present'}` : '';
+  return `${c.method ? `${c.method} ` : ''}${c.url}${c.status !== undefined ? ` → ${c.status}` : ''}${field}`;
+}
+
+/** How a human step shows it's done, if it says. */
+export interface HumanUntil {
+  /** The address contains this (or matches it as a glob, as in wait_url). */
+  url?: string;
+  /** This text appears on the page. */
+  text?: string;
+  /** The server answers like this — for a step done somewhere the page can't see. */
+  response?: ResponseCheck;
+}
+
+export const humanUntil = (event: Pick<RawEvent, 'hints'>): HumanUntil | undefined => {
+  const url = typeof event.hints?.untilUrl === 'string' ? event.hints.untilUrl : undefined;
+  const text = typeof event.hints?.untilText === 'string' ? event.hints.untilText : undefined;
+  // `untilResponse: '/api/visits'`, or `{ url, method, status, field, equals | above }`.
+  const raw = event.hints?.untilResponse;
+  const response = typeof raw === 'string'
+    ? responseCheckOf(raw, undefined)
+    : raw && typeof raw === 'object' ? responseCheckOf((raw as { url?: unknown }).url, raw as Record<string, unknown>) : undefined;
+  return url || text || response ? { ...(url ? { url } : {}), ...(text ? { text } : {}), ...(response ? { response } : {}) } : undefined;
+};

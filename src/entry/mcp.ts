@@ -12,7 +12,7 @@
  *   understudy_remember        store facts, lessons, findings, goals reached by other means
  *   understudy_findings        list open findings; triage them
  *   understudy_record          wait for the user to record a flow in their Chrome
- *   understudy_save            prove a recording by replaying it, then keep it as a flow
+ *   understudy_save            prove a recording by replaying it, then keep it as a flow (or prove a saved one)
  *   understudy_app             an app's settings — e.g. keep email fields as placeholders
  *
  * Long-lived: reconnect (/mcp) after changing the source.
@@ -29,24 +29,20 @@ import { triage, listFindings } from '../flows/findings.js';
 import { collections } from '../store/db.js';
 import { startExtensionRecorder, extensionDir, type ExtensionRecorder } from '../adapters/recorder/extension.js';
 import { saveRecording, loadRecording, recordingPath } from '../core/recording-store.js';
-import { proveAndSave } from '../flows/save.js';
+import { editFlow, proveAndSave, proveFlow } from '../flows/save.js';
+import type { Flow } from '../store/types.js';
 import { MissingValuesError } from '../flows/execute.js';
 import { parseScript } from '../adapters/recorder/script.js';
 import { setPlaceholders, appPlaceholders } from '../memory/placeholders.js';
 import { VERSION } from './version.js';
 
 /**
- * Sent to the agent when it connects — its copy of the contract, since an
- * agent that installed Understudy from npm never sees REASONER.md. Kept short:
- * every session pays for it.
+ * Sent to the agent when it connects. EVERY session pays for this, used or not,
+ * so it says only what Understudy is and where to start. Everything else lives
+ * on the tool it is about: a client that loads tools on demand pays for those
+ * words only when the tool is used.
  */
-const INSTRUCTIONS = `Understudy remembers the user's web-app flows and runs them as end-to-end tests. You supply judgement; it calls no model.
-- Recall first: free, runs nothing. A known flow comes with its steps and the login values it needs. Run it with understudy_run, or drive it yourself — say which.
-- Runs ask before a browser opens. decompose: subGoals in the order the app does them, in the words of its flows. seam: one click or goto, or [] unless you know — answers are reused forever. Start with dryRun.
-- Never ask for a password in chat. Values come from the user's settings (UNDERSTUDY_<NAME>), or pass ones you fetched yourself.
-- No flow for it? understudy_record (the user records) then understudy_save — or save a Playwright script of what you drove (understudy_save with script). Save what's worth testing again.
-- Ask the user before each distill. Gather facts, lessons and findings, get approval, then one understudy_remember.
-Full guide: REASONER.md in the package.`;
+const INSTRUCTIONS = `Understudy runs end-to-end tests of the user's web apps from flows it remembers; it calls no model. Start with understudy_recall.`;
 
 const server = new McpServer({ name: 'understudy', version: VERSION }, { instructions: INSTRUCTIONS });
 
@@ -79,19 +75,108 @@ const missingValues = (e: MissingValuesError, retry?: Record<string, unknown>) =
 /** Drop undefined fields: the zod types allow them, the functions here don't. */
 const defined = <T extends object>(o: T) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as { [K in keyof T]: Exclude<T[K], undefined> };
 
+/**
+ * A run that may stop mid-way to ask a person something, browser left open.
+ *
+ * Planning questions are asked before any browser opens and live on the run
+ * document. These can't: the browser is the state. So the run keeps going in
+ * this (long-lived) process, and `understudy_answer` reaches it here. If the
+ * server restarts, the run is lost — the agent starts it again.
+ */
+type LiveEvent =
+  | { kind: 'question'; seq: number; question: Record<string, unknown> }
+  | { kind: 'done'; result: unknown }
+  | { kind: 'error'; error: unknown };
+
+class LiveRun {
+  private queue: LiveEvent[] = [];
+  private waiter: ((e: LiveEvent) => void) | undefined;
+  /** The question waiting for an answer, if any. */
+  pending: { seq: number; resolve: (a: PersonSaid) => void } | undefined;
+  push(e: LiveEvent) {
+    const w = this.waiter;
+    if (w) { this.waiter = undefined; w(e); } else this.queue.push(e);
+  }
+  /** The page showed the step done: nobody needs to answer that question now. */
+  withdraw(seq: number) {
+    this.queue = this.queue.filter((e) => !(e.kind === 'question' && e.seq === seq));
+    if (this.pending?.seq === seq) this.pending = undefined;
+  }
+  next(): Promise<LiveEvent> {
+    const e = this.queue.shift();
+    return e ? Promise.resolve(e) : new Promise((r) => { this.waiter = r; });
+  }
+}
+type PersonSaid = { done: true } | { abort: string };
+const liveRuns = new Map<string, LiveRun>();
+
+const HUMAN_HOW = 'A step only a person can do. Tell the user exactly what to do, then answer {"done": true} when they say it is done, or {"abort": "why"}.';
+const STUCK_HOW = 'This step failed, and the run\'s browser is open on screen. Ask the user to do just this step by hand in that window, then answer {"done": true} — or {"abort": "why"}. Then suggest re-recording, so it works next time.';
+
+function personSaid(reply: unknown): PersonSaid {
+  const r = reply as { done?: unknown; abort?: unknown };
+  if (r?.done === true) return { done: true };
+  if (typeof r?.abort === 'string' && r.abort.trim()) return { abort: r.abort.trim() };
+  throw new Error('answer {"done": true} once they have done it, or {"abort": "why"}');
+}
+
+/** Wait for the live run's next question, or its result. */
+async function nextFrom(runId: string) {
+  const run = liveRuns.get(runId)!;
+  const e = await run.next();
+  if (e.kind === 'question') return { status: 'waiting', runId, question: e.question };
+  liveRuns.delete(runId);
+  valuesByRun.delete(runId);
+  if (e.kind === 'error') throw e.error;
+  return e.result;
+}
+
 /** After planning: run it now, unless it was a dry run or is waiting/blocked. */
 async function continueRun(state: PlanState, opts: { headed?: boolean }) {
   if (state.status !== 'planned' || state.dryRun) return state;
-  const values = valuesByRun.get(state.runId) ?? {};
-  const { executed, recorded, plan, nowProven } = await runPlan(state.runId, { values, ...opts });
-  valuesByRun.delete(state.runId);
+  const runId = state.runId;
+  const live = new LiveRun();
+  liveRuns.set(runId, live);
+  const ask = (seq: number, question: Record<string, unknown>) =>
+    new Promise<PersonSaid>((resolve) => {
+      live.pending = { seq, resolve };
+      live.push({ kind: 'question', seq, question });
+    });
+
+  runPlan(runId, {
+    values: valuesByRun.get(runId) ?? {}, ...opts,
+    onHuman: async (req, signal) => {
+      signal.addEventListener('abort', () => live.withdraw(req.seq));
+      const said = await ask(req.seq, {
+        kind: 'human', step: req.seq, ask: req.instruction, page: req.url,
+        ...(req.until ? { doneWhen: req.until, carriesOnWhen: 'the page shows doneWhen — it checks that after your answer too' } : {}),
+        how: HUMAN_HOW,
+      });
+      return 'done' in said ? { action: 'done' } : { action: 'abort', reason: said.abort };
+    },
+    onStuck: async (stuck) => {
+      const said = await ask(stuck.seq, { kind: 'handoff', step: stuck.seq, failed: { action: stuck.action, target: stuck.target, error: stuck.error }, page: stuck.url, how: STUCK_HOW });
+      return 'done' in said ? 'done' : 'abort';
+    },
+  }).then(
+    (out) => live.push({ kind: 'done', result: report(state, out) }),
+    (error) => live.push({ kind: 'error', error }),
+  );
+  return nextFrom(runId);
+}
+
+/** What a finished run tells the agent. */
+function report(state: Extract<PlanState, { status: 'planned' }>, out: Awaited<ReturnType<typeof runPlan>>) {
+  const { executed, recorded, plan, nowProven } = out;
   const r = executed.result;
+  const byPerson = r.steps.filter((s) => s.viaHuman || s.viaHandoff);
   return {
     status: r.ok ? 'passed' : 'failed',
     runId: state.runId,
     plan,
     seams: state.seams,
     failedSteps: r.steps.filter((s) => !s.ok).map((s) => ({ seq: s.seq, action: s.action, error: s.error, ...(s.saw ? { saw: s.saw } : {}) })),
+    ...(byPerson.length ? { doneByAPerson: byPerson.map((s) => ({ seq: s.seq, how: s.viaHuman ? `human step, ${s.viaHuman === 'page' ? 'the page showed it done' : 'they said it was done'}` : 'a failed step they did by hand' })) } : {}),
     unexpectedPages: r.steps.filter((s) => s.unexpectedPage).map((s) => ({ seq: s.seq, ...s.unexpectedPage })),
     path: r.sigSequence,
     drift: recorded.drift.notCompared ? `not compared: ${recorded.drift.notCompared}`
@@ -107,15 +192,15 @@ async function continueRun(state: PlanState, opts: { headed?: boolean }) {
 }
 
 const values = z.record(z.string(), z.string()).optional()
-  .describe('Login values you fetched yourself, e.g. {"SECRET.password":"…"}; otherwise read from settings. Never stored.');
+  .describe('Login values you fetched yourself, e.g. {"SECRET.password":"…"}; otherwise read from the user\'s settings. Never stored. Never ask the user to paste one into chat.');
 
 server.registerTool('understudy_recall', {
-  description: 'What memory knows about a goal: closest flows and notes, and a verdict. A known flow comes with its steps and needed login values. Free; nothing runs.',
+  description: 'Call first: what memory knows about a goal — closest flows, notes, a verdict. Free; nothing runs. A known flow comes with its steps and needed login values: run it with understudy_run or drive it yourself, and tell the user which. Unknown: the user records it (understudy_record), or you drive it and save the script (understudy_save).',
   inputSchema: { app: z.string(), goal: z.string(), limit: z.number().int().positive().optional() },
 }, ({ app, goal, limit }) => wrap(() => recall(app, goal, { withSteps: true, ...(limit ? { limit } : {}) })));
 
 server.registerTool('understudy_run', {
-  description: 'Plan a goal and run it headless. Returns a question to answer with understudy_answer, "blocked" with why, or the result.',
+  description: 'Plan a goal and run it headless (visible when a step needs a person). Start with dryRun. Returns a question for understudy_answer, "blocked" with why, or the result.',
   inputSchema: {
     app: z.string(), goal: z.string(),
     subGoals: z.array(z.string()).optional().describe('Skip the decompose question.'),
@@ -135,9 +220,18 @@ server.registerTool('understudy_run', {
 }));
 
 server.registerTool('understudy_answer', {
-  description: 'Answer a waiting run\'s question; returns the next one, or the result. decompose: {"subGoals":[…]}. seam: {"steps":[…]}, or {"steps":[]} unless you know.',
+  description: 'Answer a waiting run\'s question, as its "how" says. Returns the next question, or the result.',
   inputSchema: { runId: z.string(), answer: z.record(z.string(), z.unknown()), values, headed: z.boolean().optional() },
 }, (a) => wrap(async () => {
+  // A run waiting on a person, browser open: answer it where it is.
+  const live = liveRuns.get(a.runId);
+  if (live) {
+    const said = personSaid(a.answer);
+    const waiting = live.pending;
+    live.pending = undefined;
+    waiting?.resolve(said); // none: the page showed it done, and it carried on
+    return nextFrom(a.runId);
+  }
   if (a.values) valuesByRun.set(a.runId, a.values);
   return continueRun(await answer(a.runId, a.answer), a.headed ? { headed: true } : {});
 }));
@@ -153,7 +247,7 @@ server.registerTool('understudy_save_distilled', {
 }, ({ app, flow, distilled }) => wrap(() => saveDistilled(app, flow, distilled)));
 
 server.registerTool('understudy_remember', {
-  description: 'Store what you learned, as one approved batch: facts, lessons (trigger never empty), findings, and goals you reached without understudy_run.',
+  description: 'Store what you learned, as one batch the user has approved: facts (change plans), lessons (change one step; trigger never empty), findings (the app is broken), and goals you reached without understudy_run.',
   inputSchema: {
     app: z.string(),
     facts: z.array(z.object({ text: z.string(), marksDestructive: z.string().optional() })).optional(),
@@ -217,21 +311,32 @@ server.registerTool('understudy_record', {
 
 server.registerTool('understudy_save', {
   description: [
-    'Prove a flow by replaying it, and keep it only if every step passes: the user\'s latest recording, a recording hash, or a script of a flow you drove.',
-    'A script is READ, not run: only literal page calls are kept, so no loops, no values computed at runtime, no reading logs or emails mid-flow.',
-    'Kept: goto, click, dblclick, fill, type, press, check, uncheck, selectOption, setInputFiles, scrollIntoViewIfNeeded; locators getByRole, getByText, getByLabel, getByPlaceholder, getByTitle, getByAltText, getByTestId, locator(css), frameLocator, filter({hasText}), first/last/nth;',
-    'assertions expect(page).toHaveURL/toHaveTitle, expect(locator).toBeVisible/toBeHidden/toHaveText/toContainText/toHaveValue/toBeChecked (and .not on visible/hidden/checked), page.waitForURL, page.waitForSelector.',
-    'Write locators inline in expect(...), not via a variable. Other assertions come back in droppedAssertions; calls that would change the steps (evaluate, hover, route…) refuse the save.',
+    'Keep a flow, proven by replaying it: the user\'s latest recording, a recording hash, or a Playwright script of a flow you drove.',
+    'A script is read, not run — literal page calls only: no loops, no values computed at runtime (a code from an email is a human step).',
+    'Understood: goto, click, dblclick, fill, type, press, check, uncheck, selectOption, setInputFiles, scrollIntoViewIfNeeded; getBy* locators, locator(css), frameLocator, filter({hasText}), first/last/nth;',
+    'inline expect(page | locator) checks of URL, title, visible, hidden, text, value, checked; page.waitForURL, waitForSelector, waitForResponse.',
+    'Other checks come back in droppedAssertions; calls that change the steps (evaluate, hover, route…) refuse the save.',
+    'Where only a person can act: human(\'what they do\', { untilText | untilUrl | untilResponse }).',
   ].join(' '),
   inputSchema: {
-    app: z.string(), name: z.string().describe('What the flow does, as someone would ask for it.'),
+    app: z.string(), name: z.string().optional().describe('What the flow does, as someone would ask for it. Needed unless flow is given.'),
+    flow: z.string().optional().describe('A saved flow to prove where it stands (e.g. one kept with verify false), instead of saving a new one.'),
+    add: z.array(z.object({ before: z.number().int(), step: z.record(z.string(), z.unknown()) })).optional()
+      .describe('With flow: steps to add first, each before step n. {"action":"human","value":"what they do","hints":{"untilText":"…"}}, or {"action":"wait_response","value":"/api/visits","hints":{"method":"POST","status":201,"field":"commission.amount","above":0}}; also wait_url, wait_text.'),
     hash: z.string().optional(),
     script: z.string().optional().describe('Path to a Playwright script of a flow you drove; read passwords from process.env.'),
     intent: z.string().optional(), slug: z.string().optional(), values,
-    verify: z.boolean().optional().describe('false: keep it without replaying (e.g. it ends in a real purchase). Saved as unproven until a run passes.'),
+    verify: z.boolean().optional().describe('A flow that commits something real (a purchase, a submission) is replayed only up to that step, which is checked and never pressed. false: keep it without replaying at all; saved as unproven until a run passes.'),
     note: z.string().optional().describe('With verify false: why, e.g. what you checked yourself.'),
   },
 }, (a) => wrap(async () => {
+  if (a.flow) {
+    const edited = a.add?.length ? await editFlow(a.app, a.flow, a.add) : undefined;
+    if (edited && a.verify === false) return { flow: edited.slug, steps: edited.steps.length, unproven: edited.unprovenBecause };
+    return { ...(edited ? { added: a.add!.length } : {}), ...(await proveSaved(a.app, a.flow, a)) };
+  }
+  if (!a.name) throw new Error('name is required — what the flow does, as someone would ask for it (or pass flow to prove a saved one)');
+  const name = a.name;
   let rec;
   let madeBy: 'user' | 'agent' = 'user';
   let dropped: string[] = [];
@@ -256,13 +361,13 @@ server.registerTool('understudy_save', {
   let out;
   try {
     out = await proveAndSave(rec, {
-      title: a.name, madeBy,
+      title: name, madeBy,
       ...(a.verify === false ? { verify: false, unproven: a.note ? `saved by an agent without a replay: ${a.note}` : 'saved by an agent without a replay' } : {}),
       ...(a.values ? { values: a.values } : {}), ...(a.intent ? { intent: a.intent } : {}), ...(a.slug ? { slug: a.slug } : {}),
     });
   } catch (e) {
     // The recording is kept; saving it again by hash needs nothing re-recorded.
-    if (e instanceof MissingValuesError) return { saved: false, ...missingValues(e, { tool: 'understudy_save', hash, name: a.name }) };
+    if (e instanceof MissingValuesError) return { saved: false, ...missingValues(e, { tool: 'understudy_save', hash, name }) };
     throw e;
   }
   const r = out.proven?.result;
@@ -286,10 +391,36 @@ server.registerTool('understudy_save', {
       proveIt: `when it should pass: understudy_run with subGoals ["${out.flow.slug}"] — a passing run proves it`,
     } : {}),
     ...(out.flow.destructive ? { destructive: out.flow.destructiveBecause } : {}),
+    ...provenUpTo(out.flow),
     ...(out.run ? { findings: out.run.findings.map((f) => f.statement) } : {}),
     ...(out.placeholders.converted.length ? { placeholders: out.placeholders.converted } : {}),
   };
 }));
+
+/** understudy_save with `flow`: prove a saved flow — up to its commit, if it has one. Records the run. */
+async function proveSaved(app: string, slug: string, a: { values?: Record<string, string> | undefined }) {
+  const out = await proveFlow(app, slug, a.values ? { values: a.values } : {});
+  const r = out.result;
+  return {
+    flow: out.flow.slug, passed: r.ok, newlyProven: out.newlyProven,
+    proven: out.flow.proven !== false,
+    ...(out.flow.proven === false ? { unproven: out.flow.unprovenBecause } : {}),
+    ...provenUpTo(out.flow),
+    ...(out.commit && !r.ok ? { wouldStopBefore: `step ${out.commit.index}: ${out.commit.reason}` } : {}),
+    failedSteps: r.steps.filter((s) => !s.ok).map((s) => ({ seq: s.seq, action: s.action, error: s.error, ...(s.saw ? { saw: s.saw } : {}) })),
+    findings: out.run.findings.map((f) => f.statement),
+  };
+}
+
+/** What "proven up to its commit" means, for a flow that is. */
+function provenUpTo(flow: Flow) {
+  if (flow.provenUpTo === undefined) return {};
+  const s = flow.steps[flow.provenUpTo];
+  return {
+    provenUpTo: flow.provenUpTo,
+    stoppedBefore: `step ${flow.provenUpTo}${s?.name ? ` ("${s.name}")` : ''}, its commit: the control was there and ready, and was not pressed — nothing after it has run`,
+  };
+}
 
 server.registerTool('understudy_app', {
   description: 'An app\'s settings. placeholders ["email"] keeps email addresses out of memory: they become placeholders, and the values move to the user\'s env file.',

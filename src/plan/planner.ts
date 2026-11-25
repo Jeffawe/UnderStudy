@@ -13,6 +13,7 @@
  * Questions:
  *   decompose  { subGoals: ["log in as a member", "open the cart"] }
  *   seam       { steps: [{ action: "click", role: "link", name: "Cart" }] }  — or [] if unknown
+ *   state      { use: "buy-a-bundle" } — run that flow first — or { holds: true }
  */
 
 import { ObjectId } from 'mongodb';
@@ -23,7 +24,7 @@ import { vocabulary } from '../memory/vocabulary.js';
 import { destructiveControls } from '../memory/notes.js';
 import { resolveSeam, acceptSeamAnswer } from './seams.js';
 import type { RawRecording } from '../core/recording.js';
-import { execute } from '../flows/execute.js';
+import { execute, type ExecuteOptions } from '../flows/execute.js';
 import { recordRun } from '../flows/runs.js';
 import { proveByRun } from '../flows/save.js';
 
@@ -39,14 +40,42 @@ export interface PlanRequest {
 export type PlanState =
   | { status: 'waiting'; runId: string; question: Record<string, unknown> }
   | { status: 'blocked'; runId: string; why: string; detail?: unknown }
-  | { status: 'planned'; runId: string; plan: string[]; seams: { before: string; how: string }[]; dryRun: boolean };
+  | {
+      status: 'planned'; runId: string; plan: string[]; seams: { before: string; how: string }[];
+      /** App states the plan needed, and how each was made true. */
+      states?: { state: string; how: string }[];
+      dryRun: boolean;
+    };
 
 const DECOMPOSE_HOW = [
   'Split the goal into the things that must HAPPEN, in the order the app does them.',
   'Phrase each sub-goal in the words of a flow listed below — near-verbatim where one does the thing. Each sub-goal is a search.',
   'Include prerequisites the goal leaves implicit (e.g. log in first, if the next flow needs it).',
   'If one recorded flow already covers the whole goal, one sub-goal naming it beats several naming its parts.',
+  'Answer { "subGoals": ["…", "…"] }, and tell the user what they are.',
 ].join(' ');
+
+const STATE_HOW = [
+  'The flow in neededBy only works when this app state is already true.',
+  'Answer { "use": "<slug>" } to run a flow from establishedBy first, or { "holds": true } if it is already true for the account this run uses.',
+  'Ask the user if you don\'t know: "holds" on a guess sends the run to a page it doesn\'t expect. Answers last for this run only — the account can change.',
+].join(' ');
+
+/**
+ * The first state a flow in the chain needs that nothing before it makes
+ * true, and that hasn't been declared already true.
+ */
+function unmet(chain: Flow[], states: NonNullable<Run['planning']>['states'] = {}): { state: string; at: number; neededBy: string } | undefined {
+  const made = new Set<string>();
+  for (const [at, flow] of chain.entries()) {
+    for (const state of flow.requires ?? []) {
+      const said = states[state];
+      if (!made.has(state) && !(said && 'holds' in said)) return { state, at, neededBy: flow.slug };
+    }
+    for (const state of flow.establishes ?? []) made.add(state);
+  }
+  return undefined;
+}
 
 const SEAM_HOW = [
   'How do you get from where the first flow ends to where the next begins?',
@@ -86,6 +115,19 @@ export async function answer(runId: string, reply: unknown): Promise<PlanState> 
       throw new Error('answer must be { "subGoals": ["…", "…"] } — at least one, in order');
     }
     planning.subGoals = subGoals.map((g: string) => g.trim());
+  } else if (q.kind === 'state') {
+    const state = (q as unknown as { state: string }).state;
+    const r = reply as { use?: unknown; holds?: unknown };
+    if (r?.holds === true) {
+      planning.states = { ...planning.states, [state]: { holds: true } };
+    } else if (typeof r?.use === 'string') {
+      if (!(await flows.findOne({ app: run.app, slug: r.use, establishes: state }))) {
+        throw new Error(`"${r.use}" isn't a flow that establishes "${state}" — pick one from establishedBy, or answer { "holds": true }`);
+      }
+      planning.states = { ...planning.states, [state]: { use: r.use } };
+    } else {
+      throw new Error('answer { "use": "<slug>" } (a flow from establishedBy, run first) or { "holds": true } (already true for this account)');
+    }
   } else if (q.kind === 'seam') {
     const i = q.before!;
     const [from, to] = await Promise.all([
@@ -150,9 +192,37 @@ async function advance(run: Run): Promise<PlanState> {
     planning.bound = bound;
   }
 
-  const plan = await Promise.all(planning.bound.map((slug) => flows.findOne({ app: run.app, slug })));
-  if (plan.some((f) => !f)) return block(run, 'a bound flow no longer exists — plan again');
-  const chain = plan as Flow[];
+  const load = async () => {
+    const found = await Promise.all(planning.bound!.map((slug) => flows.findOne({ app: run.app, slug })));
+    return found.some((f) => !f) ? undefined : (found as Flow[]);
+  };
+  let chain = await load();
+  if (!chain) return block(run, 'a bound flow no longer exists — plan again');
+
+  // 2b. App state. A flow that needs "member-has-active-bundle" gets a flow
+  // that makes it true run before it — the one the agent chose — or the
+  // agent's word that it already holds. Never guessed: the wrong choice either
+  // buys something nobody asked for, or lands on a page the flow doesn't expect.
+  for (let added = 0; ; added++) {
+    const need = unmet(chain, planning.states);
+    if (!need) break;
+    if (added >= 8) return block(run, `satisfying app states keeps adding flows — check the requires/establishes names around "${need.state}" for a loop`);
+    const chosen = planning.states?.[need.state];
+    if (chosen && 'use' in chosen) {
+      planning.bound.splice(need.at, 0, chosen.use);
+      chain = await load();
+      if (!chain) return block(run, `"${chosen.use}" no longer exists — plan again`);
+      continue;
+    }
+    const makers = await flows
+      .find({ app: run.app, establishes: need.state }, { projection: { slug: 1, title: 1, destructive: 1, proven: 1 } })
+      .toArray();
+    return ask(run, {
+      kind: 'state', state: need.state, neededBy: need.neededBy,
+      establishedBy: makers.map((f) => ({ slug: f.slug, title: f.title, ...(f.destructive ? { destructive: true } : {}), ...(f.proven === false ? { unproven: true } : {}) })),
+      how: STATE_HOW,
+    });
+  }
 
   // 3. Safety: refuse anything that commits something real, unless allowed.
   if (!planning.allowPurchases) {
@@ -190,6 +260,9 @@ async function advance(run: Run): Promise<PlanState> {
     runId: run._id!.toHexString(),
     plan: planning.bound,
     seams: Object.entries(planning.seams).map(([i, s]) => ({ before: planning.bound![Number(i)]!, how: s.how })),
+    ...(planning.states && Object.keys(planning.states).length
+      ? { states: Object.entries(planning.states).map(([state, h]) => ({ state, how: 'holds' in h ? 'already true, the agent said' : `made true by running ${h.use} first` })) }
+      : {}),
     dryRun: Boolean(planning.dryRun),
   };
 }
@@ -229,7 +302,7 @@ export async function recordingForPlan(runId: string): Promise<{ run: Run; recor
  * Run a planned run: one recording for the whole plan, with lessons, and the
  * outcome written onto the same run document.
  */
-export async function runPlan(runId: string, opts: { values?: Record<string, string>; headed?: boolean } = {}) {
+export async function runPlan(runId: string, opts: Pick<ExecuteOptions, 'values' | 'headed' | 'onHuman' | 'onStuck'> = {}) {
   const { run, recording, steps, starts, unproven } = await recordingForPlan(runId);
   const executed = await execute(recording, { ...opts, useLessons: true });
   const recorded = await recordRun({

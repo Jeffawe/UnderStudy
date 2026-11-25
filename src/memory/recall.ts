@@ -19,6 +19,7 @@ import type { Flow, Note } from '../store/types.js';
 import { collections, vectorSearch } from '../store/db.js';
 import { embed, embedderConfig } from '../store/embed.js';
 import { valuesFromEnv, valueEnvNames } from '../store/settings.js';
+import { valueRefsOf } from '../core/recording.js';
 
 export interface FlowMatch {
   slug: string;
@@ -29,6 +30,11 @@ export interface FlowMatch {
   proven: boolean;
   /** Why it's unproven, when it is. */
   unprovenBecause?: string;
+  /** Proven only up to this step, its commit: found ready, never pressed. */
+  provenUpTo?: number;
+  /** App states it needs first, and ones it makes true. */
+  requires?: string[];
+  establishes?: string[];
   score: number;
   destructive: boolean;
   requiresSession: boolean;
@@ -134,7 +140,9 @@ export function wordScore(goal: string, flow: Pick<Flow, 'slug' | 'title' | 'int
 
 const toMatch = (f: Flow & { score?: number }, score: number): FlowMatch => ({
   slug: f.slug, title: f.title, kind: f.kind, madeBy: f.madeBy ?? 'user', proven: f.proven !== false,
-  ...(f.proven === false && f.unprovenBecause ? { unprovenBecause: f.unprovenBecause } : {}), score,
+  ...(f.proven === false && f.unprovenBecause ? { unprovenBecause: f.unprovenBecause } : {}),
+  ...(f.provenUpTo !== undefined ? { provenUpTo: f.provenUpTo } : {}),
+  ...(f.requires?.length ? { requires: f.requires } : {}), ...(f.establishes?.length ? { establishes: f.establishes } : {}), score,
   destructive: f.destructive, requiresSession: f.requiresSession,
 });
 
@@ -167,7 +175,7 @@ async function plan(app: string, slug: string): Promise<Pick<Recall, 'steps' | '
       ...(s.valueRef ? { placeholder: s.valueRef } : s.value !== undefined ? { value: s.value } : s.action === 'goto' ? { value: s.url } : {}),
     };
   });
-  const refs = [...new Set(flow.steps.map((s) => s.valueRef).filter((r): r is string => Boolean(r)))];
+  const refs = valueRefsOf(flow.steps);
   const found = valuesFromEnv(refs, app);
   const needs = refs.map((placeholder) => ({ placeholder, readFrom: valueEnvNames(placeholder, app), set: placeholder in found }));
   return { steps, ...(needs.length ? { needs } : {}) };
@@ -210,7 +218,7 @@ export async function recall(app: string, goal: string, opts: { limit?: number; 
   }
 
   // 3. By words, with no model. Corpora are small, so scoring every flow is fine.
-  const all = await c.flows.find({ app }, { projection: { slug: 1, title: 1, intent: 1, kind: 1, madeBy: 1, proven: 1, unprovenBecause: 1, destructive: 1, requiresSession: 1 } }).toArray();
+  const all = await c.flows.find({ app }, { projection: { slug: 1, title: 1, intent: 1, kind: 1, madeBy: 1, proven: 1, unprovenBecause: 1, provenUpTo: 1, requires: 1, establishes: 1, destructive: 1, requiresSession: 1 } }).toArray();
   const matches = all
     .map((f) => toMatch(f as Flow, wordScore(goal, f as Flow)))
     .filter((m) => m.score > 0);

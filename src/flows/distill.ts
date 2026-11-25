@@ -68,6 +68,7 @@ export async function saveDistilled(app: string, slug: string, answer: unknown):
     {
       $set: {
         intent: d.intent, outcome: d.outcome, preconditions: d.preconditions as Precondition[],
+        requires: d.requires ?? [], establishes: d.establishes ?? [],
         corrections: (d.corrections ?? []).map((x) => `${x.rule}: ${x.detail}${x.stepIndex !== undefined ? ` (step ${x.stepIndex})` : ''}`),
         searchText: parentText, ...(vectors[0] ? { embedding: vectors[0] } : {}), updatedAt: now,
       },
@@ -116,6 +117,7 @@ function segmentFrom(parent: Flow, s: Distilled['segments'][number]): Omit<Flow,
     madeBy: parent.madeBy ?? 'user',
     from: { flow: parent.slug, steps: [start, end] },
     preconditions: (s.preconditions ?? []) as Precondition[],
+    requires: s.requires ?? [], establishes: s.establishes ?? [],
     outcome: s.outcome ?? '',
     destructive: Boolean(why), ...(why ? { destructiveBecause: why } : {}),
     corrections: [], recording: parent.recording,

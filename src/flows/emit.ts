@@ -13,6 +13,8 @@
  */
 
 import type { Flow, Step } from '../store/types.js';
+import { forced, humanUntil, responseCheckOf, valueRefsOf, type ResponseCheck } from '../core/recording.js';
+import { urlGlob } from '../core/replay.js';
 import { valueEnvName } from '../store/settings.js';
 
 export type Framework = 'playwright-ts' | 'cypress-js';
@@ -90,6 +92,35 @@ function assertion(s: Step, loc: string, value: string, pw: boolean, warn: (w: s
   return `// TODO: assert ${kind}`;
 }
 
+/** `r => r.url().includes('/api/visits') && r.request().method() === 'POST' && r.status() === 201` */
+function responsePredicate(c: ResponseCheck): string {
+  const url = c.url.includes('*') ? `/${urlGlob(c.url).source}/.test(r.url())` : `r.url().includes(${quote(c.url)})`;
+  return `(r) => ${[url, c.method && `r.request().method() === ${quote(c.method)}`, c.status !== undefined && `r.status() === ${c.status}`].filter(Boolean).join(' && ')}`;
+}
+
+/** `body.items[0].id` as optional chaining, so a missing field fails the expect, not the line. */
+const fieldPath = (root: string, path: string) =>
+  root + path.split('.').map((k) => (/^\d+$/.test(k) ? `?.[${k}]` : `?.${k}`)).join('');
+
+function playwrightResponseCheck(c: ResponseCheck, name: string): string[] {
+  if (!c.field) return [`await ${name};`];
+  const v = fieldPath(`(await (await ${name}).json())`, c.field);
+  return [`expect(${v})${c.equals !== undefined ? `.toBe(${JSON.stringify(c.equals)})` : c.above !== undefined ? `.toBeGreaterThan(${c.above})` : '.toBeDefined()'};`];
+}
+
+function cypressIntercept(c: ResponseCheck, name: string): string {
+  const url = c.url.includes('*') ? quote(c.url) : `new RegExp(${quote(c.url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))})`;
+  return `cy.intercept({ ${c.method ? `method: ${quote(c.method)}, ` : ''}url: ${url} }).as(${quote(name)});`;
+}
+
+function cypressResponseCheck(c: ResponseCheck, name: string): string[] {
+  const checks = [
+    c.status !== undefined && `expect(response?.statusCode).to.eq(${c.status});`,
+    c.field && `expect(${fieldPath('response?.body', c.field)})${c.equals !== undefined ? `.to.eq(${JSON.stringify(c.equals)})` : c.above !== undefined ? '.to.be.greaterThan(' + c.above + ')' : '.to.exist'};`,
+  ].filter(Boolean);
+  return checks.length ? [`cy.wait(${quote('@' + name)}).then(({ response }) => { ${checks.join(' ')} });`] : [`cy.wait(${quote('@' + name)});`];
+}
+
 /** Best locator first — the same order replay tries, so the code fails where replay would. */
 function playwrightLocator(s: Step, warn: (w: string) => void): string {
   const scope = s.frameHint ? `page.frameLocator(${quote(`[id$="${s.frameHint}"]`)})` : 'page';
@@ -127,17 +158,25 @@ export function emitFlow(flow: Flow, framework: Framework = 'playwright-ts'): Em
   if (flow.requiresSession) warnings.push('this flow starts signed in; the generated test starts signed out — add a login first');
 
   const lines: string[] = [];
-  for (const s of flow.steps) {
+  /** Where the last action's code starts: a response wait is set up just before it. */
+  let lastActionAt = -1;
+  for (const [i, s] of flow.steps.entries()) {
     if (s.action === 'snapshot') continue;
-    const pageLevel = s.action === 'goto' || s.action === 'wait_url' || s.action === 'wait_text' || (s.action === 'assert' && s.hints?.assert === 'title');
+    const startsAt = lines.length;
+    const pageLevel = ['goto', 'wait_url', 'wait_text', 'wait_response', 'human'].includes(s.action) || (s.action === 'assert' && s.hints?.assert === 'title');
     const loc = pageLevel ? '' : narrow(s, pw ? playwrightLocator(s, warn) : cypressLocator(s, warn), pw, warn);
-    const value = s.valueRef ? (required.add(s.valueRef), envName(s.valueRef).replace(/^UNDERSTUDY_/, '')) : quote(s.value ?? (s.action === 'goto' ? s.url : ''));
+    const ref = valueRefsOf([s])[0];
+    const value = ref ? (required.add(ref), envName(ref).replace(/^UNDERSTUDY_/, '')) : quote(s.value ?? (s.action === 'goto' ? s.url : ''));
+
+    // Both frameworks spell it the same way.
+    const force = forced(s) ? '{ force: true }' : '';
 
     switch (s.action) {
       case 'goto': lines.push(pw ? `await page.goto(${value});` : `cy.visit(${value});`); break;
       case 'fill': lines.push(pw ? `await ${loc}.fill(${value});` : `${loc}.type(${value});`); break;
       case 'select': lines.push(pw ? `await ${loc}.selectOption(${value});` : `${loc}.select(${value});`); break;
-      case 'check': lines.push(pw ? `await ${loc}.check();` : `${loc}.check();`); break;
+      case 'check': lines.push(pw ? `await ${loc}.check(${force});` : `${loc}.check(${force});`); break;
+      case 'uncheck': lines.push(pw ? `await ${loc}.uncheck(${force});` : `${loc}.uncheck(${force});`); break;
       case 'press': lines.push(pw ? `await ${loc}.press(${value});` : `${loc}.type(${value});`); break;
       case 'upload': lines.push(pw ? `await ${loc}.setInputFiles(${value});` : `${loc}.selectFile(${value});`); break;
       case 'scroll_container':
@@ -153,9 +192,45 @@ export function emitFlow(flow: Flow, framework: Framework = 'playwright-ts'): Em
           : `cy.url().should('${s.hints?.urlRegex ? 'match' : 'include'}', ${s.hints?.urlRegex ? matcher(s, 'urlRegex', 'urlFlags') : value});`);
         break;
       case 'assert': lines.push(assertion(s, loc, value, pw, warn)); break;
+      case 'human': {
+        // A person's step: say what, then wait for its sign — or pause.
+        lines.push(`// A PERSON DOES THIS: ${(s.value ?? '').replace(/\n/g, ' ')}`);
+        const t = typeof s.hints?.untilText === 'string' ? s.hints.untilText : undefined;
+        const u = typeof s.hints?.untilUrl === 'string' ? s.hints.untilUrl : undefined;
+        const r = humanUntil(s)?.response;
+        if (r) {
+          // The person acts after this line, so waiting here misses nothing.
+          if (pw) lines.push(`const response${i} = page.waitForResponse(${responsePredicate(r)}, { timeout: 15 * 60_000 });`, ...playwrightResponseCheck(r, `response${i}`));
+          else lines.push(cypressIntercept(r, `response${i}`), ...cypressResponseCheck(r, `response${i}`).map((l) => l.replace(/\)\.then/, ', { timeout: 15 * 60_000 }).then')));
+        }
+        if (pw) {
+          if (u) lines.push(`await page.waitForURL(${u.includes('*') ? quote(u) : `(u) => u.href.includes(${quote(u)})`}, { timeout: 15 * 60_000 });`);
+          if (t) lines.push(`await page.getByText(${quote(t)}).first().waitFor({ timeout: 15 * 60_000 });`);
+          if (!u && !t && !r) lines.push('await page.pause();');
+        } else {
+          if (u) lines.push(`cy.url({ timeout: 15 * 60_000 }).should('include', ${quote(u)});`);
+          if (t) lines.push(`cy.contains(${quote(t)}, { timeout: 15 * 60_000 });`);
+          if (!u && !t && !r) lines.push('cy.pause();');
+        }
+        warn(`step "${s.value ?? 'human'}" needs a person — run this test headed, with someone there`);
+        break;
+      }
       case 'wait_text': lines.push(pw ? `await page.getByText(${value}).waitFor();` : `cy.contains(${value});`); break;
-      default: lines.push(pw ? `await ${loc}.click();` : `${loc}.click();`);
+      case 'wait_response': {
+        const check = responseCheckOf(s.value, s.hints);
+        if (!check) break;
+        // Set up BEFORE the action that triggers it, or a fast answer is missed.
+        const name = `response${i}`;
+        const setup = pw ? `const ${name} = page.waitForResponse(${responsePredicate(check)});` : cypressIntercept(check, name);
+        const at = lastActionAt >= 0 ? lastActionAt : lines.length;
+        lines.splice(at, 0, setup);
+        if (lastActionAt >= 0) lastActionAt++;
+        lines.push(...(pw ? playwrightResponseCheck(check, name) : cypressResponseCheck(check, name)));
+        break;
+      }
+      default: lines.push(pw ? `await ${loc}.click(${force});` : `${loc}.click(${force});`);
     }
+    if (!['wait_url', 'wait_text', 'wait_response', 'assert', 'human'].includes(s.action)) lastActionAt = startsAt;
   }
 
   const refs = [...required];

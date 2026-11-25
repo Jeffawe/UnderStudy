@@ -14,7 +14,7 @@ import { listRecordings, loadRecording, saveRecording } from '../core/recording-
 import { loadSession, saveSession } from '../core/auth-cache.js';
 import { buildRecording, type RawRecording } from '../core/recording.js';
 import type { ReplayResult } from '../core/replay.js';
-import { execute, prove, MissingValuesError } from '../flows/execute.js';
+import { execute, prove, MissingValuesError, type ExecuteOptions } from '../flows/execute.js';
 import { destructiveControls, remember } from '../memory/notes.js';
 import { start, answer, runPlan, type PlanState } from '../plan/planner.js';
 import { distillRequest, saveDistilled } from '../flows/distill.js';
@@ -23,7 +23,8 @@ import { join, resolve as resolvePath } from 'node:path';
 import { existsSync } from 'node:fs';
 import { chromium } from 'playwright';
 import { emitFlow, type Framework } from '../flows/emit.js';
-import { recordingFrom, proveAndSave, proveByRun, type ProveAndSave } from '../flows/save.js';
+import { editFlow, recordingFrom, proveAndSave, proveByRun, proveFlow, type ProveAndSave } from '../flows/save.js';
+import type { Flow } from '../store/types.js';
 import { recordRun, type RecordedRun } from '../flows/runs.js';
 import { listFindings } from '../flows/findings.js';
 import { VERSION } from './version.js';
@@ -57,6 +58,11 @@ COMMANDS
   flows <app>           list an app's saved flows and how each last ran
   replay <hash>         re-run a recording file headless
   replay <app> <flow>   re-run a saved flow; records the run, drift and findings
+  prove <app> <flow>    prove a saved flow where it stands; one that buys something
+                        is replayed up to that step, checked, and never pressed
+  edit <app> <flow> --before <n> --step '<json>'
+                        add a step to a saved flow: a person's step or a wait, e.g.
+                        '{"action":"human","value":"Accept the visit","hints":{"untilText":"Accepted"}}'
   findings <app>        what looked broken, most severe first
   recall <app> "<goal>" what memory knows about a goal — nothing runs
   run <app> "<goal>"    find the flow that does the goal, and run it
@@ -541,7 +547,7 @@ async function cmdImport(positional: string[], flags: Flags) {
  */
 async function executeWithReport(recording: RawRecording, flags: Flags, opts: { useLessons: boolean }): Promise<ReplayResult> {
   const values = valuesFromFlags(flags);
-  const x = await withLoginValues(values, (v) => execute(recording, { values: v, headed: flags.has('headed'), useLessons: opts.useLessons }))
+  const x = await withLoginValues(values, (v) => execute(recording, { values: v, headed: flags.has('headed'), useLessons: opts.useLessons, ...personAtTerminal() }))
     .catch((e: Error) => fail(e.message));
   if (x.sessionRestoredFrom) console.log(`session: restored (saved ${x.sessionRestoredFrom})`);
   if (x.staleSession) {
@@ -706,7 +712,7 @@ async function reportPlan(state: PlanState, flags: Flags) {
   }
   console.log();
   const values = valuesFromFlags(flags);
-  const { executed, recorded, nowProven } = await withLoginValues(values, (v) => runPlan(state.runId, { values: v, headed: flags.has('headed') }))
+  const { executed, recorded, nowProven } = await withLoginValues(values, (v) => runPlan(state.runId, { values: v, headed: flags.has('headed'), ...personAtTerminal() }))
     .catch((e: Error) => fail(e.message));
   if (executed.lessons?.fired) console.log(`lessons  ${executed.lessons.fired} fired, ${executed.lessons.helped} on steps that have failed before\n`);
   printReplay(executed.result);
@@ -760,6 +766,7 @@ function printReplay(result: ReplayResult) {
       s.ambiguousByName && `ambiguous: ${s.ambiguousByName.matched} by name, resolved via ${s.ambiguousByName.disambiguatedBy}`,
       s.roleHadNoMatch && `role matched nothing, fell back to ${s.roleHadNoMatch.fellBackTo}`,
       s.roundTripMismatch && `value did not survive: wrote "${s.roundTripMismatch.expected}", read "${s.roundTripMismatch.actual}"`,
+      s.held && 'stopped here: its commit — found ready, not pressed',
       s.error,
     ].filter(Boolean).join('; ');
     console.log(`  ${String(s.seq).padStart(2)}  ${s.ok ? 'ok  ' : 'FAIL'}  ${s.action.padEnd(7)} ${(s.sig ?? '').padEnd(28)} ${notes}`);
@@ -826,15 +833,37 @@ async function askYesNo(question: string, byDefault = false): Promise<boolean> {
   return answer ? /^y(es)?$/i.test(answer) : byDefault;
 }
 
-/** Ask for a line in the terminal. */
-async function ask(question: string): Promise<string> {
+/** Ask for a line in the terminal. A `signal` withdraws the question. */
+async function ask(question: string, signal?: AbortSignal): Promise<string> {
   const { createInterface } = await import('node:readline/promises');
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
-    return await rl.question(question);
+    return await rl.question(question, signal ? { signal } : {});
   } finally {
     rl.close();
   }
+}
+
+/**
+ * The terminal as the person a run asks: at a human step, and — in a visible
+ * browser — at a step that failed. Nothing to ask without a terminal.
+ */
+function personAtTerminal(): Pick<ExecuteOptions, 'onHuman' | 'onStuck'> {
+  if (!process.stdin.isTTY) return {};
+  return {
+    onHuman: async (req, signal) => {
+      console.log(`\nyour turn  step ${req.seq}: ${req.instruction}`);
+      if (req.until) console.log(`           it carries on by itself once the page shows ${req.until.text ? `"${req.until.text}"` : req.until.url}`);
+      const line = await ask('           press Enter when it is done, or type "abort": ', signal).catch(() => '');
+      if (signal.aborted) console.log('\n           the page shows it done — carrying on');
+      return /^abort$/i.test(line.trim()) ? { action: 'abort', reason: 'aborted at the terminal' } : { action: 'done' };
+    },
+    onStuck: async (st) => {
+      console.log(`\nstuck      step ${st.seq} (${st.action}${st.target ? ` "${st.target}"` : ''}) failed: ${st.error}`);
+      const yes = await askYesNo('           do it by hand in the browser window, then carry on?');
+      return yes ? 'done' : 'abort';
+    },
+  };
 }
 
 /** Ask for a line without showing it (a password): each key shows as *. */
@@ -952,8 +981,46 @@ async function saveAndReport(recording: RawRecording, title: string, opts: Omit<
   console.log(`\nsaved    ${flow.app}/${flow.slug}  (${flow.steps.length} steps${flow.embedding ? ', searchable by meaning' : ''})`);
   if (flow.proven === false) console.log(`         UNPROVEN — ${flow.unprovenBecause}. The first run that passes proves it.`);
   if (flow.destructive) console.log(`         DESTRUCTIVE — ${flow.destructiveBecause}. Replays need --allow-purchases.`);
+  const upTo = provenUpToNote(flow);
+  if (upTo) console.log(`         ${upTo}`);
   if (out.run) printRunReport(out.run);
   console.log(`\nreplay it any time:  understudy replay ${flow.app} ${flow.slug}`);
+}
+
+/** "PROVEN UP TO step 2 ("Confirm & Submit")…", for a flow proven only to its commit. */
+function provenUpToNote(flow: Flow): string | undefined {
+  if (flow.provenUpTo === undefined) return undefined;
+  const s = flow.steps[flow.provenUpTo];
+  return `PROVEN UP TO step ${flow.provenUpTo}${s?.name ? ` ("${s.name}")` : ''}, its commit — found ready, not pressed. ` +
+    'A full run with --allow-purchases proves the rest.';
+}
+
+/** `edit <app> <flow> --before n --step '{…}'`: add a person's step or a wait to a saved flow. */
+async function cmdEdit(positional: string[], flags: Flags) {
+  const app = positional[0] ?? fail('edit needs an app and a flow', `understudy edit myapp book-a-visit --before 3 --step '{"action":"human","value":"…"}'`);
+  const slug = positional[1] ?? fail('edit needs a flow', `understudy flows ${app}`);
+  const before = Number(str(flags.get('before')) ?? fail('edit needs --before <step index>'));
+  const raw = str(flags.get('step')) ?? fail(`edit needs --step '<json>'`);
+  let step: Record<string, unknown>;
+  try { step = JSON.parse(raw); } catch { fail(`--step isn't JSON: ${raw}`); }
+  const flow = await editFlow(app, slug, [{ before, step: step! }]).catch((e: Error) => fail(e.message));
+  console.log(`added    step ${before} to ${app}/${slug} (${flow.steps.length} steps now)`);
+  console.log(`         UNPROVEN until a run passes — understudy prove ${app} ${slug}`);
+}
+
+/** `prove <app> <flow>`: prove a saved flow without committing anything. */
+async function cmdProve(positional: string[], flags: Flags) {
+  const app = positional[0] ?? fail('prove needs an app and a flow', 'understudy prove myapp book-a-visit');
+  const slug = positional[1] ?? fail('prove needs a flow', `understudy flows ${app}`);
+  const out = await withLoginValues(valuesFromFlags(flags), (values) => proveFlow(app, slug, { values, headed: flags.has('headed') }))
+    .catch((e: Error) => fail(e.message));
+  if (out.commit) console.log(`stopping before step ${out.commit.index}: ${out.commit.reason}\n`);
+  printReplay(out.result);
+  printRunReport(out.run);
+  const upTo = provenUpToNote(out.flow);
+  if (out.newlyProven) console.log(`\nproven   '${slug}'${upTo ? ` — ${upTo}` : ''}`);
+  else if (out.result.ok) console.log(`\npassed   '${slug}' was already proven this far`);
+  if (!out.result.ok) process.exitCode = 3;
 }
 
 async function cmdFlows(positional: string[]) {
@@ -967,7 +1034,7 @@ async function cmdFlows(positional: string[]) {
   for (const f of rows) {
     const last = await runs.find({ app, plan: [f.slug] }).sort({ startedAt: -1 }).limit(1).next();
     const status = last ? `${last.status} ${last.startedAt.toISOString().slice(0, 16).replace('T', ' ')}` : 'never run';
-    const marks = [f.proven === false && 'UNPROVEN', f.destructive && 'DESTRUCTIVE', f.requiresSession && 'needs session', f.kind === 'segment' && 'segment', f.madeBy === 'agent' && 'made by an agent']
+    const marks = [f.proven === false && 'UNPROVEN', f.provenUpTo !== undefined && `proven to step ${f.provenUpTo}`, f.destructive && 'DESTRUCTIVE', f.requiresSession && 'needs session', f.kind === 'segment' && 'segment', f.madeBy === 'agent' && 'made by an agent']
       .filter(Boolean).join(', ');
     console.log(`  ${f.slug.padEnd(32)} ${status.padEnd(24)} ${f.title}${marks ? `  [${marks}]` : ''}`);
   }
@@ -1039,6 +1106,8 @@ async function main() {
     case 'import': return cmdImport(rest, flags);
     case 'recordings': return cmdRecordings(rest);
     case 'replay': return cmdReplay(rest, flags);
+    case 'prove': return cmdProve(rest, flags);
+    case 'edit': return cmdEdit(rest, flags);
     case 'save': return cmdSave(rest, flags);
     case 'flows': return cmdFlows(rest);
     case 'findings': return cmdFindings(rest, flags);

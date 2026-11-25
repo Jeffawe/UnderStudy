@@ -64,9 +64,29 @@ export interface Flow {
   proven?: boolean;
   /** Why it's unproven, e.g. "saved without a replay". */
   unprovenBecause?: string;
+  /**
+   * Proven only UP TO this step: the first that commits something real (a
+   * purchase, a submission) or that only a person can do. Every step before it replayed and passed, and its
+   * control was found ready — but it was never pressed, so nothing after it has
+   * run. Missing = proven all the way (or not at all: see `proven`). A full run
+   * that passes (with purchases allowed) clears it.
+   */
+  provenUpTo?: number;
   /** Segments only: the flow it was cut from, and which of its steps ([start, end)). */
   from?: { flow: string; steps: [number, number] };
   preconditions: Precondition[];
+  /**
+   * App states this flow needs before it can run, e.g. "member-has-active-bundle".
+   * The page it expects depends on them — the same button leads somewhere else
+   * without. A plan satisfies each with an earlier flow that `establishes` it,
+   * or with the agent's word that it already holds.
+   *
+   * Names are kebab-case and belong to the app: reuse an existing one rather
+   * than coin a synonym, or the planner never connects the two.
+   */
+  requires?: string[];
+  /** App states this flow makes true, e.g. buying a bundle establishes "member-has-active-bundle". */
+  establishes?: string[];
   outcome: string;
   /** True if running it commits something real (a purchase, a submission). */
   destructive: boolean;
@@ -178,6 +198,11 @@ export interface Run {
    */
   mode: 'run' | 'replay' | 'attributed';
   /**
+   * The run stopped, as asked, before this step — the flow's commit — rather
+   * than doing it. Its path is partial, so it is never drift history.
+   */
+  stoppedBefore?: number;
+  /**
    * waiting: planning paused on a question for the agent (`question` says what).
    * planned: a dry run — the plan is complete, nothing ran.
    * blocked: the plan can't be completed (a sub-goal with no flow, a gap between flows).
@@ -205,6 +230,8 @@ export interface Run {
     bound?: string[];
     /** Steps to insert BEFORE plan[i], for i ≥ 1. Missing entry = not resolved yet. */
     seams?: Record<string, { steps: Step[]; how: string }>;
+    /** How each required state was satisfied: by running a flow first, or because it already holds. */
+    states?: Record<string, { use: string } | { holds: true }>;
     dryRun?: boolean;
     allowPurchases?: boolean;
   };

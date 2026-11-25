@@ -17,7 +17,7 @@ remembers. You supply the judgement; it never calls a model.
 - **Destructive flows** (purchases, deletions) are refused unless
   `allowPurchases`. Start runs with `dryRun: true`.
 
-## The two questions a run can ask
+## The questions a run can ask
 
 Runs plan before any browser opens.
 
@@ -29,6 +29,18 @@ Runs plan before any browser opens.
 - **seam** → `{"steps": [one click or goto]}` to get from one flow to the next,
   or `{"steps": []}` **unless you actually know** — an answer is saved and
   reused forever.
+- **state** → a flow needs an app state ("member-has-active-bundle") nothing
+  before it makes true: `{"use": "<slug>"}` from `establishedBy` to run it
+  first, or `{"holds": true}` if it's already true for the account. Ask the
+  user rather than guess; it lasts for this run only.
+
+Then, mid-run, with the browser open:
+
+- **human** → a step only a person can do. Tell the user `ask`; answer
+  `{"done": true}` when they say so (the run checks `doneWhen` itself, and
+  carries on once the page shows it), or `{"abort": "why"}`.
+- **handoff** → a step failed in a visible browser (`headed`). Same answers;
+  they do just that step by hand.
 
 ## Growing memory
 
@@ -42,7 +54,8 @@ Runs plan before any browser opens.
 - **Distilling** names a flow and splits it into reusable segments. **Ask the
   user before each one**; any flow may be distilled. Refer to steps by index
   only; preconditions are exactly `"authenticated"` or `"not authenticated"`;
-  reuse existing segment slugs rather than inventing synonyms.
+  other app state goes in `requires` / `establishes` (kebab-case, reusing
+  `vocabulary.states`); reuse existing segment slugs rather than inventing synonyms.
 - **Learned something?** Keep a list and put it to the user at a natural pause,
   then write the approved items in one `understudy_remember`:
   a **fact** changes plans ("order history is at `/past-invoices`");
@@ -58,7 +71,16 @@ Runs plan before any browser opens.
 ## Traps
 
 - **File uploads can't be recorded** — write a Playwright script instead.
-- **Don't save anything irreversible** (a real order): saving replays it.
+- **A step only a person can do** (approval elsewhere, a code on a phone):
+  in a saved script, `human('what they do', { untilText | untilUrl | untilResponse })`.
+- **What only the server shows** (a commission recorded): `page.waitForResponse`
+  in a script, or a `wait_response` step with `field` and `equals` / `above`.
+- **An older flow missing one of these:** `understudy_save` with `flow` and `add`.
+- **Purchases aren't replayed by saving.** A flow with a commit step ("Pay
+  now", "Confirm & Submit") is proven only up to it: the control is checked,
+  never pressed. Anything irreversible the words don't reveal still runs —
+  say so with a fact (`marksDestructive`) first. `understudy_save` with `flow`
+  does the same for one already saved with `verify: false`.
 - **Logins are often rate-limited**; a missing login value stops a run before
   it opens a browser, so check `needs` from recall first. The answer names the
   env file line to add: ask the user to add it, then call again.

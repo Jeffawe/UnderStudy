@@ -20,6 +20,46 @@ test('destructive: only a committing action on a committing control', () => {
   assert.match(flowDestructiveReason([{ action: 'click', name: 'Log in', url }, { action: 'click', name: 'Buy now', url }])!, /^step 1:/);
 });
 
+test('destructive: every commit step is named, and facts count toward the first', async () => {
+  const { commitSteps } = await import('../src/flows/destructive.js');
+  const steps = [
+    { action: 'click', name: 'Book', url },
+    { action: 'click', name: 'Confirm & Submit', url },
+    { action: 'click', name: 'Pay Now', url },
+  ];
+  assert.equal(flowDestructiveReason(steps), 'step 1: commit-shaped control "Confirm & Submit"; step 2: commit-shaped control "Pay Now"');
+  assert.deepEqual(commitSteps(steps).map((c) => c.index), [1, 2]);
+  const facts = new Map([['book', 'booking reserves a real appointment slot']]);
+  assert.deepEqual(commitSteps(steps, facts).map((c) => c.index), [0, 1, 2], 'a fact makes "Book" the first');
+});
+
+test('a click option stored as a value by older imports: no login value is asked for, and it still forces', async () => {
+  const { valueRefsOf, forced } = await import('../src/core/recording.js');
+  const legacy = [
+    { action: 'check' as const, valueRef: '{ force: true }' },
+    { action: 'fill' as const, valueRef: 'SECRET.password' },
+  ];
+  assert.deepEqual(valueRefsOf(legacy), ['SECRET.password']);
+  assert.equal(forced(legacy[0]!), true);
+  assert.equal(forced({ action: 'fill', valueRef: '{ force: true }' }), false, 'only actions that never take a value');
+  assert.equal(forced({ action: 'click', hints: { force: true } }), true);
+
+  const { emitFlow } = await import('../src/flows/emit.js');
+  const now = new Date();
+  const flow = {
+    app: 'shop', slug: 'agree', title: 'Agree', intent: 'agree', kind: 'recording', preconditions: [], outcome: '',
+    destructive: false, corrections: [], recording: 'x', startUrl: url, requiresSession: false, searchText: '', createdAt: now, updatedAt: now,
+    steps: [
+      { action: 'check', role: 'checkbox', name: 'I agree', valueRef: '{ force: true }', url, resolution: 'script-literal' },
+      { action: 'uncheck', role: 'checkbox', name: 'News', hints: { force: true }, url, resolution: 'script-literal' },
+    ],
+  } as unknown as Flow;
+  const pw = emitFlow(flow);
+  assert.match(pw.code, /name: 'I agree' \}\)\.check\(\{ force: true \}\)/);
+  assert.match(pw.code, /name: 'News' \}\)\.uncheck\(\{ force: true \}\)/, 'uncheck is no longer emitted as a click');
+  assert.deepEqual(pw.requiredValues, []);
+});
+
 test('drift: first run, same path, a new page, and alternating paths', () => {
   const base = ['/login#a', '/shop#b', '/cart#c'];
   assert.equal(compareToHistory(base, []).firstRun, true);

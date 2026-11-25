@@ -11,8 +11,8 @@
  */
 
 import { loadSession, forgetSession, loadSessionById, forgetSessionById } from '../core/auth-cache.js';
-import type { RawRecording } from '../core/recording.js';
-import { replay, type ReplayResult } from '../core/replay.js';
+import { valueRefsOf, type RawRecording } from '../core/recording.js';
+import { replay, type ReplayOptions, type ReplayResult } from '../core/replay.js';
 import { foldLessons, lessonsFor } from '../memory/notes.js';
 import { valuesFromEnv, valueEnvNames, reloadEnvFiles, writableEnvFile } from '../store/settings.js';
 
@@ -47,7 +47,7 @@ export class MissingValuesError extends Error {
 /** The login values this recording needs that neither `given` nor the environment supply. */
 export function missingValuesFor(recording: RawRecording, given: Record<string, string> = {}): MissingValue[] {
   reloadEnvFiles();
-  const refs = new Set(recording.events.map((e) => e.valueRef).filter((r): r is string => Boolean(r)));
+  const refs = new Set(valueRefsOf(recording.events));
   const found = { ...valuesFromEnv(refs, recording.appSlug), ...given };
   return [...refs].filter((r) => !(r in found)).map((r) => ({ placeholder: r, setOneOf: valueEnvNames(r, recording.appSlug) }));
 }
@@ -61,6 +61,25 @@ export interface ExecuteOptions {
    * what gets saved is what the recording does on its own.
    */
   useLessons?: boolean;
+  /** Stop before this step: look at its control, don't use it (see replay's `stopBefore`). */
+  stopBefore?: number;
+  /** Someone to ask at a `human` step. Without it, a flow with one fails there. */
+  onHuman?: ReplayOptions['onHuman'];
+  /**
+   * Someone to ask when a step fails: do it by hand in the open browser, then
+   * say so. Only offered when the browser is visible — nobody can do a step in
+   * a window they can't see.
+   */
+  onStuck?: (stuck: StuckStep) => Promise<'done' | 'abort'>;
+}
+
+/** A step that failed, put to a person who can see the browser. */
+export interface StuckStep {
+  seq: number;
+  action: string;
+  target?: string;
+  error: string;
+  url: string;
 }
 
 export interface Executed {
@@ -83,7 +102,7 @@ export async function execute(recording: RawRecording, opts: ExecuteOptions = {}
   // Login values: given explicitly, else from UNDERSTUDY_<REF> in the environment
   // (env files re-read, so one just added is seen).
   reloadEnvFiles();
-  const refs = new Set(recording.events.map((e) => e.valueRef).filter((r): r is string => Boolean(r)));
+  const refs = new Set(valueRefsOf(recording.events));
   const values = { ...valuesFromEnv(refs, recording.appSlug), ...(opts.values ?? {}) };
   const missingValues = [...refs].filter((r) => !(r in values));
   // Checked BEFORE a browser opens: a run that reached the password step
@@ -114,11 +133,25 @@ export async function execute(recording: RawRecording, opts: ExecuteOptions = {}
   }
 
   const app = recording.appSlug;
+  // A person's step needs a browser they can see — unless told otherwise (CI).
+  const forPerson = Boolean(opts.onHuman) && recording.events.some((e) => e.action === 'human') && process.env.UNDERSTUDY_HEADLESS !== '1';
+  const headed = Boolean(opts.headed) || forPerson;
+  const onStuck = opts.onStuck;
   const result = await replay(recording, {
     values,
     ...(storageState ? { storageState } : {}),
-    ...(opts.headed ? { headless: false } : {}),
+    ...(headed ? { headless: false } : {}),
+    ...(opts.onHuman ? { onHuman: opts.onHuman } : {}),
+    ...(onStuck && headed
+      ? {
+          onHandoff: async (r) => {
+            const said = await onStuck({ seq: r.seq, action: r.failed?.action ?? 'step', ...(r.failed?.target ? { target: r.failed.target } : {}), error: r.reason, url: r.url });
+            return said === 'done' ? { action: 'continue' as const } : { action: 'abort' as const, reason: 'declined at the handoff' };
+          },
+        }
+      : {}),
     ...(opts.useLessons ? { lessonsFor: (ctx) => lessonsFor(app, ctx) } : {}),
+    ...(opts.stopBefore !== undefined ? { stopBefore: opts.stopBefore } : {}),
   });
 
   const out: Executed = { result, missingValues, ...(sessionRestoredFrom ? { sessionRestoredFrom } : {}) };

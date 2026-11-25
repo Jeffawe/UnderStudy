@@ -156,6 +156,45 @@ test('a destructive flow is marked on save', { timeout: 60_000 }, async () => {
   assert.match(flow.destructiveBecause!, /Place order/);
 });
 
+test('a flow that buys something is proven up to its commit, and nothing is bought', { timeout: 120_000 }, async () => {
+  const { proveAndSave, proveFlow } = await import('../src/flows/save.js');
+  const checkout = `${shop.url}checkout`;
+  // As a script import leaves it: every step stamped with the last goto.
+  const rec = buildRecording({ source: 'script', origin: 'test', appSlug: 'shop', startUrl: checkout }, [
+    { seq: 0, ts: 0, action: 'goto', value: checkout, url: checkout, resolution: 'script-literal' },
+    { seq: 1, ts: 1, action: 'check', role: 'checkbox', name: 'I agree to the terms', hints: { force: true }, url: checkout, resolution: 'script-literal' },
+    { seq: 2, ts: 2, action: 'click', role: 'button', name: 'Confirm & Submit', url: checkout, resolution: 'script-literal' },
+    { seq: 3, ts: 3, action: 'click', role: 'button', name: 'Pay Now', url: checkout, resolution: 'script-literal' },
+  ]);
+  const before = shop.committed();
+
+  const out = await proveAndSave(rec, { title: 'Check out' });
+  assert.equal(out.saved, true, JSON.stringify(out.proven?.result.steps));
+  if (!out.saved) return;
+  assert.equal(out.verified, true);
+  assert.equal(out.flow.proven, undefined, 'proven — as far as it can be without buying');
+  assert.equal(out.flow.provenUpTo, 2, 'up to its first commit');
+  assert.match(out.flow.destructiveBecause!, /Confirm & Submit.*Pay Now/, 'both commits are named');
+  assert.equal(out.flow.endState, undefined, 'it never saw where the flow ends');
+  assert.deepEqual(shop.committed(), before, 'nothing was submitted or paid');
+  assert.match(out.run!.drift.notCompared!, /stopped before step 2/);
+  const { runs } = await collections();
+  assert.equal((await runs.findOne({ _id: out.run!.runId }))!.stoppedBefore, 2, 'kept out of drift history');
+
+  // Kept earlier with verify: false: proving it where it stands gets it as far.
+  const later = await proveAndSave(rec, { title: 'Check out later', verify: false });
+  assert.equal(later.saved && later.flow.proven, false);
+  const proved = await proveFlow('shop', 'check-out-later');
+  assert.equal(proved.result.ok, true, JSON.stringify(proved.result.steps.filter((s) => !s.ok)));
+  assert.equal(proved.newlyProven, true);
+  assert.equal(proved.commit?.index, 2);
+  assert.equal(proved.flow.proven, undefined);
+  assert.equal(proved.flow.provenUpTo, 2);
+  assert.ok(proved.flow.steps.slice(1, 2).every((s) => s.expectedSig), 'the steps before the commit know their pages');
+  assert.deepEqual(shop.committed(), before, 'still nothing bought');
+  assert.equal((await proveFlow('shop', 'check-out-later')).newlyProven, false, 'proven this far already');
+});
+
 test('saving without a replay: kept as unproven; the first passing run proves it and fills in the pages', { timeout: 120_000 }, async () => {
   shop.set({ promo: false, broken: false });
   const { proveAndSave, proveByRun } = await import('../src/flows/save.js');
@@ -268,4 +307,42 @@ test('a failed assertion names the locator and says what it saw — the visible 
   assert.match(visible.saw!, /matched no elements/);
   const click = await failing({ action: 'click', css: '#nothing-here', resolution: 'css' });
   assert.match(click.error!, /#nothing-here/, 'a click that fails names its locator too');
+});
+
+test('editing a saved flow: a person\'s step or a wait goes in, it is unproven again, and its segments keep their steps', { timeout: 60_000 }, async () => {
+  const { editFlow } = await import('../src/flows/save.js');
+  const u = shop.url;
+  const rec = buildRecording({ source: 'live', origin: 'edit', appSlug: 'shop', startUrl: u }, [
+    { seq: 0, ts: 0, action: 'goto', url: u, resolution: 'synthesized' },
+    { seq: 1, ts: 1, action: 'click', role: 'button', name: 'One', url: u, resolution: 'accname' },
+    { seq: 2, ts: 2, action: 'click', role: 'button', name: 'Two', url: u, resolution: 'accname' },
+    { seq: 3, ts: 3, action: 'click', role: 'button', name: 'Three', url: u, resolution: 'accname' },
+  ]);
+  const fake = { ok: true, steps: [], sigSequence: [], signals: [], durationMs: 0 } as unknown as Parameters<typeof saveFlow>[1];
+  await saveFlow(rec, fake, { title: 'Edit me' });
+  const { saveDistilled } = await import('../src/flows/distill.js');
+  await saveDistilled('shop', 'edit-me', {
+    intent: 'edit me', outcome: 'edited', preconditions: [],
+    segments: [{ slug: 'edit-me-start', title: 'Start', intent: 'start', stepRange: [0, 2] }, { slug: 'edit-me-end', title: 'End', intent: 'end', stepRange: [2, 4] }],
+  });
+
+  await assert.rejects(editFlow('shop', 'edit-me', [{ before: 9, step: { action: 'click', value: 'x' } }]), /before must be a step index.*\n.*action must be one of human, wait_response/s);
+  await assert.rejects(editFlow('shop', 'edit-me', [{ before: 1, step: { action: 'human', value: 'x', hints: { force: true } } }]), /hints can't have force \(it can have untilText, untilUrl, untilResponse\)/);
+
+  const flow = await editFlow('shop', 'edit-me', [
+    { before: 1, step: { action: 'human', value: 'Approve it', hints: { untilText: 'Approved' } } },
+    { before: 3, step: { action: 'wait_response', value: '/api/visits', hints: { status: 201 } } },
+  ]);
+  assert.deepEqual(flow.steps.map((s) => s.name ?? s.action), ['goto', 'human', 'One', 'Two', 'wait_response', 'Three']);
+  assert.equal(flow.proven, false);
+  assert.match(flow.unprovenBecause!, /edited: 2 step\(s\) added/);
+
+  const { flows } = await collections();
+  const start = (await flows.findOne({ app: 'shop', slug: 'edit-me-start' }))!;
+  const end = (await flows.findOne({ app: 'shop', slug: 'edit-me-end' }))!;
+  assert.deepEqual(start.from!.steps, [0, 3], 'the person\'s step landed inside it');
+  assert.deepEqual(start.steps.map((s) => s.name ?? s.action), ['goto', 'human', 'One']);
+  assert.equal(start.proven, false);
+  assert.deepEqual(end.from!.steps, [3, 6]);
+  assert.deepEqual(end.steps.map((s) => s.name ?? s.action), ['Two', 'wait_response', 'Three']);
 });

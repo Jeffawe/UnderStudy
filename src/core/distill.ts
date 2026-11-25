@@ -31,9 +31,13 @@ export interface Vocabulary {
     steps: number;
     preconditions: string[];
     outcome: string | null;
+    requires?: string[];
+    establishes?: string[];
   }>;
   /** Whole recorded flows, for coarser matches. */
-  flows: Array<{ slug: string; title: string; intent: string }>;
+  flows: Array<{ slug: string; title: string; intent: string; requires?: string[]; establishes?: string[] }>;
+  /** App states already named by some flow's requires/establishes — reuse these words. */
+  states?: string[];
   /** What is known to be true about the app, phrased as the corpus phrases it. */
   facts: string[];
 }
@@ -75,6 +79,8 @@ export interface Distilled {
   intent: string;
   preconditions: string[];
   outcome: string;
+  requires?: string[];
+  establishes?: string[];
   segments: Array<{
     slug: string;
     title: string;
@@ -83,6 +89,8 @@ export interface Distilled {
     stepRange: [number, number];
     preconditions?: string[];
     outcome?: string;
+    requires?: string[];
+    establishes?: string[];
   }>;
   candidateLessons?: Array<{ kind: string; title: string; body: string; trigger: Record<string, unknown> }>;
   corrections?: Array<{ rule: string; detail: string; stepIndex?: number }>;
@@ -95,6 +103,8 @@ const SCHEMA: Record<string, unknown> = {
     intent: { type: 'string', description: 'What this whole flow is FOR, in the user\'s language. Not a list of steps.' },
     preconditions: { type: 'array', items: { type: 'string', enum: ['authenticated', 'not authenticated'] }, description: 'Exactly "authenticated" or "not authenticated" — nothing else. Empty if neither matters.' },
     outcome: { type: 'string', description: 'The state the app is in afterwards.' },
+    requires: { type: 'array', items: { type: 'string', pattern: '^[a-z0-9]+(-[a-z0-9]+)*$' }, description: 'App states that must already be true for this to work, kebab-case ("member-has-active-bundle"). Reuse vocabulary.states.' },
+    establishes: { type: 'array', items: { type: 'string', pattern: '^[a-z0-9]+(-[a-z0-9]+)*$' }, description: 'App states this makes true, in the same words a flow that needs them would use.' },
     segments: {
       type: 'array',
       description: 'Reusable chunks. A segment belongs to the APP, not to this recording — a login block cut from a checkout recording must be reusable by every future flow.',
@@ -108,6 +118,8 @@ const SCHEMA: Record<string, unknown> = {
           stepRange: { type: 'array', items: { type: 'integer' }, minItems: 2, maxItems: 2, description: '[start, end) indices into the steps given. Never invent steps.' },
           preconditions: { type: 'array', items: { type: 'string', enum: ['authenticated', 'not authenticated'] } },
           outcome: { type: 'string' },
+          requires: { type: 'array', items: { type: 'string' } },
+          establishes: { type: 'array', items: { type: 'string' } },
         },
       },
     },
@@ -124,38 +136,11 @@ const SCHEMA: Record<string, unknown> = {
   },
 };
 
-const INSTRUCTIONS = `You are distilling a VERIFIED browser recording into reusable memory.
-
-The steps below were captured from a real session and every one of them was
-replayed successfully. They are ground truth.
-
-YOUR JOB IS TO ANNOTATE AND PARTITION, NOT TO AUTHOR.
-  · Do NOT restate, reorder, or invent steps. Reference them by index only.
-  · Segments are [start, end) ranges over the step list given.
-  · Segments should cut on MEANINGFUL boundaries — a change of page state
-    (see sigAfter) is usually one.
-
-What matters most:
-  · intent — what this flow is FOR, phrased the way someone would ASK for it
-    ("log in as a standard user"), never a description of the mechanics
-    ("fill two textboxes and click a button").
-  · segments — a segment belongs to the APP, not to this recording. A login
-    block cut out of a checkout recording must be reusable by every future
-    flow, so name and scope it accordingly.
-  · preconditions — EXACTLY "authenticated" or "not authenticated", or empty.
-    Not "authenticated as a member": the planner checks whole strings, so any
-    other wording silently never matches.
-
-USE THE APP'S EXISTING VOCABULARY.
-The request includes every segment this app already has. If a block of steps
-here does the same thing as one of those, REUSE its exact slug and phrasing
-rather than inventing a synonym. "Sign in to the app" and "Authenticate as a
-member" as two separate segments is a corpus defect: they compete for the same
-bind slot, and a planner searching for one will not find the other.
-Only invent new wording when the thing genuinely is new.
-
-Only report a lesson or a correction if the recording actually shows one.
-Inventing them is worse than leaving the arrays empty.`;
+const INSTRUCTIONS = `Name this recording and cut it into reusable segments. Every step below replayed; refer to steps by index only — never add, change or reorder them.
+- intent: what it is FOR, as someone would ask ("log in as a member"), not the mechanics.
+- segments: [start, end) ranges, cut where the page changes (sigAfter). A segment belongs to the app: if one in vocabulary does the same thing, reuse its slug.
+- preconditions: exactly "authenticated" or "not authenticated", or none. Other app state goes in requires / establishes, kebab-case, reusing vocabulary.states.
+- candidateLessons, corrections: only if the recording shows one. Empty beats invented.`;
 
 /**
  * Build the payload handed to whoever is distilling.
@@ -195,6 +180,9 @@ export function buildDistillRequest(
   };
 }
 
+/** A state name: kebab-case, short enough to be a name rather than a sentence. */
+export const STATE_NAME = /^(?=.{2,60}$)[a-z0-9]+(-[a-z0-9]+)*$/;
+
 export interface ValidationResult {
   ok: boolean;
   errors: string[];
@@ -228,6 +216,15 @@ export function validateDistilled(input: unknown, stepCount: number): Validation
   };
   if (!Array.isArray(d.preconditions)) push('preconditions must be an array');
   else preconditionProblem('preconditions', d.preconditions);
+  const stateProblem = (at: string, v: unknown) => {
+    if (v === undefined) return;
+    if (!Array.isArray(v)) return push(`${at} must be an array of state names`);
+    for (const x of v) {
+      if (typeof x !== 'string' || !STATE_NAME.test(x)) push(`${at}: "${String(x)}" must be a kebab-case state name, e.g. "member-has-active-bundle"`);
+    }
+  };
+  stateProblem('requires', d.requires);
+  stateProblem('establishes', d.establishes);
 
   if (!Array.isArray(d.segments)) {
     push('segments must be an array');
@@ -252,6 +249,8 @@ export function validateDistilled(input: unknown, stepCount: number): Validation
     // honest: a range outside the verified steps would let the model reference
     // something that was never recorded or never replayed.
     preconditionProblem(`${at}.preconditions`, s.preconditions);
+    stateProblem(`${at}.requires`, s.requires);
+    stateProblem(`${at}.establishes`, s.establishes);
     const range = s.stepRange;
     if (!Array.isArray(range) || range.length !== 2 || !range.every((n) => Number.isInteger(n))) {
       push(`${at}.stepRange must be [start, end) integers`);

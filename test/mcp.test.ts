@@ -31,6 +31,8 @@ before(async () => {
       UNDERSTUDY_SECRET_PASSWORD: 'not-a-real-password',
       // An agent's own script reads its own variable; that works too.
       AGENT_SHOP_PASSWORD: 'also-not-real',
+      // A run with a step for a person opens a visible browser; not in a test.
+      UNDERSTUDY_HEADLESS: '1',
     } as Record<string, string>,
   }));
 });
@@ -57,8 +59,8 @@ test('ten tools and short instructions — every session pays for them', async (
   const total = tools.reduce((n, t) => n + (t.description?.length ?? 0) + JSON.stringify(t.inputSchema).length, 0);
   assert.ok(total < 11000, `tool definitions are ${total} chars — keep them lean`);
   const instructions = client.getInstructions() ?? '';
-  assert.match(instructions, /Recall first/, 'an npm-installed agent gets the contract on connect');
-  assert.ok(instructions.length < 1400, `instructions are ${instructions.length} chars — keep them short`);
+  assert.match(instructions, /Start with understudy_recall/, 'an agent is told where to start');
+  assert.ok(instructions.length < 300, `instructions are ${instructions.length} chars — every session pays for them; put the rest on a tool`);
 });
 
 test('recall on an empty app says it does not know', async () => {
@@ -262,6 +264,41 @@ test('see the cart', async ({ page }) => {
     const recall = JSON.parse(text(await client.callTool({ name: 'understudy_recall', arguments: { app: 'shop', goal: 'see-the-cart' } })));
     assert.equal(recall.best.proven, true);
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a step only a person can do: saved from human(), the run asks mid-way, and finishes once they say it is done', { timeout: 120_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'understudy-agent-human-'));
+  shop.set({ approved: false });
+  try {
+    const { writeFile } = await import('node:fs/promises');
+    const script = join(dir, 'visit.spec.ts');
+    await writeFile(script, `import { test, expect } from '@playwright/test';
+test('wait for the visit', async ({ page }) => {
+  await page.goto('${shop.url}approval');
+  human('Accept the visit in the provider portal', { untilText: 'Visit accepted' });
+  await expect(page.getByRole('heading', { name: 'Visit accepted' })).toBeVisible();
+});`);
+    const saved = JSON.parse(text(await client.callTool({ name: 'understudy_save', arguments: { app: 'shop', name: 'Have the provider accept the visit', script } })));
+    assert.equal(saved.saved, true, JSON.stringify(saved));
+    assert.equal(saved.provenUpTo, 1, 'proven up to the person\'s step; nobody was asked while saving');
+
+    const ran = JSON.parse(text(await client.callTool({ name: 'understudy_run', arguments: { app: 'shop', goal: 'visit accepted', subGoals: ['have-the-provider-accept-the-visit'] } })));
+    assert.equal(ran.status, 'waiting', JSON.stringify(ran));
+    assert.equal(ran.question.kind, 'human');
+    assert.equal(ran.question.ask, 'Accept the visit in the provider portal');
+
+    const bad = await client.callTool({ name: 'understudy_answer', arguments: { runId: ran.runId, answer: { ok: 'sure' } } });
+    assert.equal(bad.isError, true, 'a non-answer is refused, and the run keeps waiting');
+
+    shop.set({ approved: true }); // the person does it
+    const done = JSON.parse(text(await client.callTool({ name: 'understudy_answer', arguments: { runId: ran.runId, answer: { done: true } } })));
+    assert.equal(done.status, 'passed', JSON.stringify(done));
+    assert.equal(done.doneByAPerson.length, 1);
+    assert.deepEqual(done.nowProven, ['have-the-provider-accept-the-visit'], 'a full pass proves the rest');
+  } finally {
+    shop.set({ approved: false });
     await rm(dir, { recursive: true, force: true });
   }
 });

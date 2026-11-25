@@ -381,6 +381,59 @@ function readArgument(arg: ts.Expression | undefined): { value?: string; valueRe
   return { valueRef: arg.getText().slice(0, 80) };
 }
 
+/**
+ * Actions whose FIRST argument is the value (`fill('x')`, `press('Enter')`).
+ * Every other action's first argument is its options object.
+ */
+const VALUE_FIRST = new Set(['fill', 'type', 'press', 'selectOption', 'setInputFiles']);
+
+/**
+ * Options that change nothing replay needs to know: it has its own timeouts
+ * and settles the page after every step.
+ */
+const IGNORABLE_OPTIONS = new Set(['timeout', 'noWaitAfter', 'delay', 'trial', 'strict']);
+
+/**
+ * Read an action's options — `click({ force: true })`, `fill(x, { force: true })`.
+ *
+ * THIS USED TO BE READ AS A VALUE. `check({ force: true })` became
+ * `valueRef: '{ force: true }'`, so replay never forced the click (it can't
+ * reach a checkbox hidden under its styled label without it) and every run
+ * demanded a login value called "{ force: true }". `force` is kept; an option
+ * the IR can't express (a right click, a modifier key) is reported.
+ */
+function readActionOptions(arg: ts.Expression | undefined, method: string): { force?: true; unsupported: string[] } {
+  if (!arg) return { unsupported: [] };
+  if (!ts.isObjectLiteralExpression(arg)) return { unsupported: [`${method}() options that aren't written inline`] };
+  const out: { force?: true; unsupported: string[] } = { unsupported: [] };
+  for (const prop of arg.properties) {
+    const key = prop.name && (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name)) ? prop.name.text : undefined;
+    if (!key || !ts.isPropertyAssignment(prop)) {
+      out.unsupported.push(`${method}() options that aren't plain properties`);
+      continue;
+    }
+    if (key === 'force') {
+      if (prop.initializer.kind === ts.SyntaxKind.TrueKeyword) out.force = true;
+      else if (prop.initializer.kind !== ts.SyntaxKind.FalseKeyword) out.unsupported.push(`${method}({ force }) with a non-literal value`);
+    } else if (!IGNORABLE_OPTIONS.has(key)) {
+      out.unsupported.push(`${method}({ ${key} })`);
+    }
+  }
+  return out;
+}
+
+/**
+ * `selectOption({ label: 'Large' })` / `({ value: 'l' })` → 'Large' / 'l'.
+ * Replay's selectOption(string) matches an option's value or its label.
+ */
+function selectedOption(arg: ts.Expression | undefined): string | undefined {
+  if (!arg || !ts.isObjectLiteralExpression(arg) || arg.properties.length !== 1) return undefined;
+  const prop = arg.properties[0]!;
+  if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) return undefined;
+  if (prop.name.text !== 'label' && prop.name.text !== 'value') return undefined;
+  return text(prop.initializer);
+}
+
 /** `process.env.X`, `process.env.X!`, `process.env['X']`, `process.env.X ?? ''` → 'X'. */
 function envVariable(arg: ts.Expression): string | undefined {
   let e: ts.Expression = arg;
@@ -569,8 +622,10 @@ export async function parseScript(
   const warnings: string[] = [];
   const dropped: string[] = [];
 
-  // A static read cannot know which page it is on, so the last goto stands in.
-  // Anything before the first goto is attributed to the fallback URL.
+  // A static read cannot know which page it is on, so the last goto (or literal
+  // URL wait) stands in. Anything before the first goto is attributed to the
+  // fallback URL. It is a guess: the first replay that passes replaces it with
+  // the page each step actually ran on (flows/save.ts, stepsFrom).
   let currentUrl = fallbackUrl ?? '';
   let startUrl = fallbackUrl ?? '';
 
@@ -590,7 +645,30 @@ export async function parseScript(
       resolution: 'script-literal',
       ...(match.regex ? { hints: { urlRegex: true, urlFlags: match.flags } } : {}),
     });
+    // A wait for a plain address says which page the steps after it are on —
+    // the best a static read can do. A regex or a glob names no single page.
+    // Only an address that is one: a bare word like 'dashboard' is a substring
+    // replay looks for, not a path to resolve.
+    const plain = !match.regex && !match.source.includes('*');
+    if (plain && /^https?:\/\//.test(match.source)) currentUrl = match.source;
+    else if (plain && match.source.startsWith('/') && fallbackUrl) currentUrl = absolute(match.source, fallbackUrl);
   };
+
+  /** A `wait_response` step from what waitForResponse() was given. */
+  const pushWaitResponse = (arg: ts.Expression | undefined, node: ts.Node) => {
+    const { check, why } = responseWaitFrom(arg);
+    if (!check) return drop(`${why ?? 'waitForResponse()'}, not kept`, node);
+    const { url, ...rest } = check;
+    events.push({
+      seq: events.length, ts: events.length, action: 'wait_response', value: url,
+      url: currentUrl, resolution: 'script-literal', ...(Object.keys(rest).length ? { hints: rest } : {}),
+    });
+  };
+
+  // `const answer = page.waitForResponse(...)`, the click, then `await answer`:
+  // Playwright's way of not missing a fast response. The wait belongs where it
+  // is AWAITED — after the click — not where it was set up.
+  const deferred = new Map<string, ts.CallExpression>();
 
   /** An `assert` step on an element (or, for `title`, the page). */
   const pushAssert = (t: Target, kind: AssertKind, arg: ts.Expression | undefined, node: ts.Node) => {
@@ -661,6 +739,18 @@ export async function parseScript(
   };
 
   const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && ts.isCallExpression(node.initializer)
+      && ts.isPropertyAccessExpression(node.initializer.expression) && node.initializer.expression.name.text === 'waitForResponse') {
+      deferred.set(node.name.text, node.initializer);
+      return;
+    }
+    if (ts.isAwaitExpression(node) && ts.isIdentifier(node.expression) && deferred.has(node.expression.text)) {
+      const call = deferred.get(node.expression.text)!;
+      deferred.delete(node.expression.text);
+      pushWaitResponse(call.arguments[0], call);
+      return;
+    }
+
     // `Promise.all([page.waitForURL(x), page.click(y)])` — the wait is written
     // first but happens after the click it waits on. Replay is sequential, so
     // the actions go first and the waits after them.
@@ -688,6 +778,32 @@ export async function parseScript(
         : ts.isIdentifier(node.expression)
           ? node.expression.text
           : undefined;
+
+      // A PERSON'S STEP: `human('Approve the visit in the provider portal',
+      // { untilText: 'Visit accepted' })`. Not Playwright — a marker an agent
+      // writes where it had to ask someone. Read, never run.
+      if (callee === 'human' && ts.isIdentifier(node.expression)) {
+        const instruction = node.arguments[0] ? text(node.arguments[0]) : undefined;
+        if (!instruction) {
+          warnings.push(`human() needs what the person must do, as a literal string: ${snippet(node)}`);
+        } else {
+          const until = readUntil(node.arguments[1]);
+          for (const u of until.unsupported) warnings.push(`human({ ${u} }) cannot be represented: ${snippet(node)}`);
+          events.push({
+            seq: events.length,
+            ts: events.length,
+            action: 'human',
+            value: instruction,
+            url: currentUrl,
+            resolution: 'script-literal',
+            ...(until.url || until.text || until.response
+              ? { hints: { ...(until.url ? { untilUrl: until.url } : {}), ...(until.text ? { untilText: until.text } : {}), ...(until.response ? { untilResponse: until.response } : {}) } }
+              : {}),
+          });
+          if (until.url?.startsWith('/') && fallbackUrl && !until.url.includes('*')) currentUrl = absolute(until.url, fallbackUrl);
+        }
+        return;
+      }
 
       if (callee && SNAPSHOT_CALLS.has(callee)) {
         // The label is the first string literal in the arguments, wherever it
@@ -755,6 +871,8 @@ export async function parseScript(
             const kind: AssertKind = state === 'hidden' || state === 'detached' ? 'hidden' : 'visible';
             pushAssert({ rooted: true, bare: false, merged: { css } }, kind, undefined, node);
           }
+        } else if (method === 'waitForResponse') {
+          pushWaitResponse(node.arguments[0], node);
         } else if (!SETTLING_WAITS.has(method)) {
           drop(`${method}() is not kept (replay can't wait on network events)`, node);
         }
@@ -795,7 +913,19 @@ export async function parseScript(
           } else if (!addresses(merged)) {
             warnings.push(`unaddressable ${action}: ${snippet(node)}`);
           } else {
-            const raw = readArgument(node.arguments[0]);
+            const takesValue = VALUE_FIRST.has(method);
+            const options = readActionOptions(node.arguments[takesValue ? 1 : 0], method);
+            for (const o of options.unsupported) warnings.push(`${o} cannot be represented, ignored: ${snippet(node)}`);
+
+            let raw: { value?: string; valueRef?: string } = {};
+            if (takesValue) {
+              const first = node.arguments[0];
+              const option = method === 'selectOption' ? selectedOption(first) : undefined;
+              if (option !== undefined) raw = { value: option };
+              else if (first && (ts.isObjectLiteralExpression(first) || ts.isArrayLiteralExpression(first))) {
+                warnings.push(`${method}() with ${ts.isArrayLiteralExpression(first) ? 'several values' : 'an options object'} cannot be represented: ${snippet(node)}`);
+              } else raw = readArgument(first);
+            }
             const fieldHint = merged.name?.source || merged.testId || merged.css || 'field';
             const secretSignal = [merged.name?.source, merged.css, merged.testId].filter(Boolean).join(' ');
 
@@ -819,7 +949,7 @@ export async function parseScript(
               ...where(merged),
               url: currentUrl,
               resolution: 'script-literal',
-              ...hintsOf(t),
+              ...hintsOf(t, options.force ? { force: true } : {}),
             });
           }
         }
@@ -829,6 +959,7 @@ export async function parseScript(
   };
 
   visit(sourceFile);
+  for (const [name, call] of deferred) drop(`waitForResponse() kept in "${name}" but never awaited, not kept`, call);
 
   return {
     recording: buildRecording(
@@ -838,6 +969,53 @@ export async function parseScript(
     warnings,
     dropped,
   };
+}
+
+/**
+ * What `waitForResponse(x)` waits for. A string or glob is the address; a
+ * predicate is read for the three things it usually tests —
+ * `r.url().includes('/api/visits') && r.status() === 201 && r.request().method() === 'POST'`.
+ * Read from source text, so anything cleverer is reported rather than guessed.
+ */
+function responseWaitFrom(arg: ts.Expression | undefined): { check?: Record<string, unknown> & { url: string }; why?: string } {
+  if (!arg) return { why: 'waitForResponse() with nothing to wait for' };
+  const literal = text(arg);
+  if (literal) return { check: { url: literal } };
+  if (ts.isRegularExpressionLiteral(arg)) return { why: 'waitForResponse(/regex/) — write the address as a string or glob' };
+  if (!ts.isArrowFunction(arg) && !ts.isFunctionExpression(arg)) return { why: 'waitForResponse() with a predicate held in a variable' };
+  const body = arg.body.getText();
+  const url = body.match(/\.url\(\)\s*(?:\.(?:includes|endsWith|startsWith)\(\s*|===?\s*)['"`]([^'"`]+)['"`]/)?.[1];
+  if (!url) return { why: 'waitForResponse() predicate with no literal address in it (r.url().includes(\'…\'))' };
+  const status = body.match(/\.status\(\)\s*===?\s*(\d{3})/)?.[1];
+  const method = body.match(/\.method\(\)\s*===?\s*['"`]([A-Za-z]+)['"`]/)?.[1];
+  return { check: { url, ...(status ? { status: Number(status) } : {}), ...(method ? { method: method.toUpperCase() } : {}) } };
+}
+
+/** `{ untilUrl: '/done', untilText: 'Accepted' }`, literals only. */
+function readUntil(node: ts.Node | undefined): { url?: string; text?: string; response?: unknown; unsupported: string[] } {
+  const out: { url?: string; text?: string; response?: unknown; unsupported: string[] } = { unsupported: [] };
+  if (!node) return out;
+  if (!ts.isObjectLiteralExpression(node)) return { unsupported: ['options not written inline'] };
+  for (const prop of node.properties) {
+    const key = prop.name && ts.isIdentifier(prop.name) ? prop.name.text : '?';
+    const value = ts.isPropertyAssignment(prop) ? text(prop.initializer) : undefined;
+    if (key === 'untilUrl' && value) out.url = value;
+    else if (key === 'untilText' && value) out.text = value;
+    else if (key === 'untilResponse' && value) out.response = value;
+    else if (key === 'untilResponse' && ts.isPropertyAssignment(prop) && ts.isObjectLiteralExpression(prop.initializer)) {
+      // { url, method, status, field, equals | above } — literal values only.
+      const o: Record<string, unknown> = {};
+      for (const q of prop.initializer.properties) {
+        if (!ts.isPropertyAssignment(q) || !ts.isIdentifier(q.name)) continue;
+        const v = q.initializer;
+        o[q.name.text] = ts.isNumericLiteral(v) ? Number(v.text)
+          : v.kind === ts.SyntaxKind.TrueKeyword ? true : v.kind === ts.SyntaxKind.FalseKeyword ? false : text(v);
+      }
+      if (typeof o.url === 'string') out.response = o;
+      else out.unsupported.push('untilResponse without a literal url');
+    } else out.unsupported.push(key);
+  }
+  return out;
 }
 
 /** `{ state: 'hidden' }` → 'hidden'. */

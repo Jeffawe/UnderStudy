@@ -44,11 +44,38 @@ export function destructiveReason(step: Pick<Step, 'action' | 'name' | 'url'>): 
   return null;
 }
 
-/** The first reason any step in the flow is destructive, or null. */
-export function flowDestructiveReason(steps: Pick<Step, 'action' | 'name' | 'url'>[]): string | null {
-  for (const [i, s] of steps.entries()) {
+/** A step that commits something real, and why. */
+export interface CommitStep {
+  index: number;
+  reason: string;
+}
+
+/**
+ * EVERY step that commits something, in order — not just the first.
+ *
+ * A booking flow often has two: "Confirm & Submit" creates the visit, "Pay
+ * Now" charges for it. Naming only the first hid the payment, and proving a
+ * flow up to its commit needs the first one exactly (flows/save.ts).
+ *
+ * `controls` are names a fact says commit something (notes.destructiveControls),
+ * matched the same way the run's safety gate matches them.
+ */
+export function commitSteps(
+  steps: Pick<Step, 'action' | 'name' | 'url'>[],
+  controls: ReadonlyMap<string, string> = new Map(),
+): CommitStep[] {
+  const out: CommitStep[] = [];
+  for (const [index, s] of steps.entries()) {
     const why = destructiveReason(s);
-    if (why) return `step ${i}: ${why}`;
+    const fact = s.name && COMMITTING_ACTIONS.has(s.action) ? controls.get(s.name.toLowerCase()) : undefined;
+    if (why) out.push({ index, reason: why });
+    else if (fact) out.push({ index, reason: `"${s.name}" — a fact says it commits something: ${fact}` });
   }
-  return null;
+  return out;
+}
+
+/** Why the flow is destructive — every step that makes it so — or null. */
+export function flowDestructiveReason(steps: Pick<Step, 'action' | 'name' | 'url'>[]): string | null {
+  const found = commitSteps(steps);
+  return found.length ? found.map((c) => `step ${c.index}: ${c.reason}`).join('; ') : null;
 }

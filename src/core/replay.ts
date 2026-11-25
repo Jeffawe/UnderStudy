@@ -22,11 +22,11 @@
  * first half of the thing that runs tests.
  */
 
-import { type Frame, type Locator, type Page } from 'playwright';
+import { type Frame, type Locator, type Page, type Response } from 'playwright';
 import { openLease, type BrowserLease } from './browser.js';
 import { computeSig, urlPattern, waitForAriaStable } from './sig.js';
 import { acceptBaseline, captureCheckpoint, worthJudging, VISUAL_SEVERE, type VisualCheck } from './visual.js';
-import type { RawEvent, RawRecording } from './recording.js';
+import { describeResponse, forced, humanUntil, responseCheckOf, type HumanUntil, type ResponseCheck, type RawEvent, type RawRecording } from './recording.js';
 import type { StorageState } from './auth-cache.js';
 import type { PendingDecision } from './types.js';
 
@@ -60,6 +60,8 @@ export interface StepOutcome {
   attempts?: number;
   /** Set when a human took this step over rather than the executor running it. */
   viaHandoff?: boolean;
+  /** A `human` step: how it was finished — a person said so, or the page showed it. */
+  viaHuman?: 'answered' | 'page';
   /**
    * Set when role+name matched several elements and something more specific
    * had to disambiguate. Feeds `selectors.fragility` — a name that is not
@@ -76,6 +78,16 @@ export interface StepOutcome {
   roleHadNoMatch?: { fellBackTo: string };
   /** A failed assertion: what it actually found, e.g. the visible text near where the expected text should be. */
   saw?: string;
+  /**
+   * The page this step ran on (its address just before acting). What a step's
+   * `url` should have been all along — a script read statically can only guess.
+   */
+  at?: string;
+  /**
+   * Found but deliberately NOT done: the step a `stopBefore` replay stopped at.
+   * Its control was there, visible and enabled; it was never clicked.
+   */
+  held?: true;
 }
 
 /** An assertion that failed, carrying what it actually saw. */
@@ -162,6 +174,8 @@ export interface ReplayResult {
    * elsewhere. Callers surface this alongside the verdict.
    */
   handoffs: HandoffRecord[];
+  /** Set when the replay stopped, as asked, before this step (see `stopBefore`). */
+  stoppedBefore?: number;
 }
 
 export interface ReplayOptions {
@@ -243,6 +257,26 @@ export interface ReplayOptions {
    */
   onDecision?: (decision: PendingDecision) => Promise<Record<string, unknown>>;
   /**
+   * Stop before this step (by `seq`): find its control and check it is visible
+   * and enabled, then end the replay without doing it.
+   *
+   * This is how a flow that ends in a real purchase gets proven. Everything up
+   * to the commit is replayed for real; the commit itself is only looked at.
+   * A run that stops here is `ok` when every step before it passed and the
+   * control was ready — and says so in `stoppedBefore`.
+   */
+  stopBefore?: number;
+  /**
+   * Ask a person to do a `human` step, and wait for them.
+   *
+   * Aborted (`signal`) when the page shows the step is done before anyone
+   * answers — the run then carries on without them, and whoever asked should
+   * stop waiting. Omitted means a human step fails: nobody is there to ask.
+   */
+  onHuman?: (request: HumanRequest, signal: AbortSignal) => Promise<HumanAnswer>;
+  /** How long a human step waits, in ms. Default 15 minutes. */
+  humanTimeoutMs?: number;
+  /**
    * Turn visual checkpoints on. Opt-in because it only means something when
    * the reasoner can actually look at an image — Bedrock's adapter answers
    * from text alone, so capturing for it would produce files nobody reads.
@@ -259,6 +293,19 @@ export interface ReplayOptions {
     url_pattern?: string; action?: string; role?: string; name?: string;
   }) => Promise<Array<{ lessonId: string; kind: string; title: string; body: string }>>;
 }
+
+/** What a person is asked to do at a `human` step. */
+export interface HumanRequest {
+  seq: number;
+  /** What to do, in words to read to them. */
+  instruction: string;
+  /** The page the run is on. */
+  url: string;
+  until?: HumanUntil;
+}
+
+/** done: they did it (the page is still checked, if the step says how). */
+export type HumanAnswer = { action: 'done' } | { action: 'abort'; reason?: string };
 
 /** What a decision may tell the executor to do. */
 export type DecisionAction = 'continue' | 'abort' | 'retry';
@@ -309,6 +356,11 @@ export type HandoffOutcome =
       storageState?: StorageState;
       recordingHash?: string;
     }
+  /**
+   * A person did the step in THIS run's own browser (it was headed), so there
+   * is nothing to adopt or reload: carry on from the page they left it on.
+   */
+  | { action: 'continue' }
   | { action: 'skip' }
   | { action: 'abort'; reason?: string };
 
@@ -464,6 +516,91 @@ export function urlGlob(glob: string): RegExp {
   return new RegExp(`${/^[a-z]+:/i.test(glob) || glob.startsWith('*') ? '^' : ''}${re}$`);
 }
 
+/** Steps that only look, so a response wait still counts what came before them. */
+const WAITS = new Set(['wait_url', 'wait_text', 'wait_response', 'assert', 'snapshot']);
+
+/** A substring of the address, or a glob over it. */
+function urlMatches(pattern: string, href: string): boolean {
+  return pattern.includes('*') ? urlGlob(pattern).test(href) : href.includes(pattern);
+}
+
+/** `items.0.id` of a parsed JSON body. */
+function fieldAt(body: unknown, path: string): unknown {
+  let at: unknown = body;
+  for (const key of path.split('.')) {
+    if (at === null || typeof at !== 'object') return undefined;
+    at = (at as Record<string, unknown>)[key];
+  }
+  return at;
+}
+
+/** Every response the page got, by step, for `wait_response` and human steps to look through. */
+class ResponseLog {
+  private seen: Array<{ step: number; method: string; url: string; status: number; body?: Promise<unknown>; used?: boolean }> = [];
+  constructor(private readonly keepBody: (url: string) => boolean) {}
+
+  add(step: number, res: Response) {
+    const url = res.url();
+    if (this.seen.length >= 1000) this.seen.shift();
+    // Read now, while it exists: after the page moves on the body may be gone.
+    const body = this.keepBody(url) ? res.json().catch(() => undefined) : undefined;
+    this.seen.push({ step, method: res.request().method(), url, status: res.status(), ...(body ? { body } : {}) });
+  }
+
+  /**
+   * The first unused answer since `since` that matches, waiting up to
+   * `timeoutMs` for one. A wait step uses it up, so two waits for the same
+   * address need two answers; a human step only looks — it checks the same
+   * answer twice (while waiting, and after they say done).
+   */
+  async wait(check: ResponseCheck, since: number, timeoutMs: number, consume = true): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    const near = new Set<string>();
+    for (;;) {
+      for (const r of this.seen) {
+        if (r.used || r.step < since || !urlMatches(check.url, r.url)) continue;
+        const said = `${r.method} ${new URL(r.url).pathname} → ${r.status}`;
+        if ((check.method && r.method !== check.method) || (check.status !== undefined && r.status !== check.status)) {
+          near.add(said);
+          continue;
+        }
+        if (check.field) {
+          const value = fieldAt(await r.body, check.field);
+          const fits = check.equals !== undefined ? value === check.equals
+            : check.above !== undefined ? typeof value === 'number' && value > check.above
+            : value !== undefined;
+          if (!fits) {
+            near.add(`${said} with ${check.field} = ${JSON.stringify(value) ?? 'missing'}`);
+            continue;
+          }
+        }
+        if (consume) r.used = true;
+        return;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`no response matched ${describeResponse(check)}${near.size ? ` — saw ${[...near].slice(-3).join('; ')}` : ''}`);
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+}
+
+/** Wait until the page — or the server — shows a human step is done. */
+async function pageShows(page: Page, until: HumanUntil, timeoutMs: number, responses: ResponseLog, since: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  if (until.response) await responses.wait(until.response, since, timeoutMs, false);
+  if (until.url) {
+    const glob = until.url.includes('*') ? urlGlob(until.url) : undefined;
+    await page.waitForURL((u) => (glob ? glob.test(u.href) : u.href.includes(until.url!)), { timeout: timeoutMs });
+  }
+  if (until.text) {
+    await page.getByText(until.text).first().waitFor({ state: 'visible', timeout: Math.max(1, deadline - Date.now()) });
+  }
+}
+
+const describeUntil = (u: HumanUntil) =>
+  [u.url && `an address with "${u.url}"`, u.text && `the text "${u.text}"`, u.response && `a response ${describeResponse(u.response)}`].filter(Boolean).join(' and ');
+
 /** Whitespace-normalised, as Playwright's text assertions compare. */
 const squash = (s: string) => s.replace(/\s+/g, ' ').trim();
 
@@ -610,8 +747,9 @@ export async function replay(
 ): Promise<ReplayResult> {
   const {
     values = {}, headless = true, timeoutMs = 10_000, captureBodies = true, visualCheck,
-    onDecision, lessonsFor, storageState, prelude, onHandoff, budget,
+    onDecision, lessonsFor, storageState, prelude, onHandoff, budget, stopBefore, onHuman,
   } = opts;
+  let stoppedBefore: number | undefined;
   const maxAttempts = Math.max(1, budget?.stepAttempts ?? 1);
   const handoffs: HandoffRecord[] = [];
   const escalations: Escalation[] = [];
@@ -634,6 +772,18 @@ export async function replay(
   // the correlation between a signal and the intent that was executing when it
   // fired. A 500 is interesting; a 500 *during checkout* is a finding.
   let currentStep = -1;
+  /** The last step that did something, so a wait only counts what came after it. */
+  let lastActionSeq = -1;
+
+  // EVERY RESPONSE IS LOGGED, not just the ones a wait is waiting on now. The
+  // click that triggers `POST /api/visits` usually gets its answer before the
+  // wait step after it even starts; a wait that only listened from then on
+  // would miss it every time.
+  const checks = [
+    ...recording.events.filter((e) => e.action === 'wait_response').map((e) => responseCheckOf(e.value, e.hints)),
+    ...recording.events.filter((e) => e.action === 'human').map((e) => humanUntil(e)?.response),
+  ].filter((c): c is ResponseCheck => Boolean(c?.field));
+  const responses = new ResponseLog((url) => checks.some((c) => urlMatches(c.url, url)));
   /** Route of the page we are on, so a lesson can be scoped to one page. */
   let lastPattern: string | undefined;
 
@@ -656,6 +806,7 @@ export async function replay(
   });
 
   page.on('response', async (res) => {
+    responses.add(currentStep, res);
     const status = res.status();
     const contentType = res.headers()['content-type'] ?? '';
     const interesting = status >= 400 || contentType.includes('application/json');
@@ -698,7 +849,22 @@ export async function replay(
     /** Set the instant an action goes out, so a retry cannot double-submit. */
     let dispatched = false;
     const stepStart = Date.now();
-    const outcome: StepOutcome = { seq: event.seq, action: event.action, ok: false, durationMs: 0 };
+    if (!WAITS.has(event.action)) lastActionSeq = event.seq;
+    const here = page.url();
+    const outcome: StepOutcome = {
+      seq: event.seq, action: event.action, ok: false, durationMs: 0,
+      ...(/^https?:\/\//.test(here) ? { at: here } : {}),
+    };
+    // THE COMMIT STEP OF A stopBefore REPLAY. A control is looked at below,
+    // just before it would be dispatched; a step with no control (a goto to the
+    // payment site, a wait) is simply not done.
+    const holding = !isPrelude && stopBefore === event.seq;
+    const holdsWithoutLooking = holding && ['goto', 'wait_url', 'wait_text', 'assert', 'snapshot', 'human'].includes(event.action);
+    if (holdsWithoutLooking) {
+      outcome.ok = true;
+      outcome.held = true;
+    }
+    const attemptsHere = holdsWithoutLooking ? 0 : maxAttempts;
 
     // WHAT HAVE WE LEARNED ABOUT THIS STEP? Consulted BEFORE acting, because a
     // lesson's whole purpose is "do Y first".
@@ -739,7 +905,7 @@ export async function replay(
     // THE ATTEMPT LOOP IS PURE CONTROL FLOW, not a reasoner round trip.
     // Retrying by asking would make every retry human-speed, which is the
     // opposite of the point — the budget exists to REDUCE escalations.
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    for (let attempt = 1; attempt <= attemptsHere; attempt++) {
       outcome.ok = false;
       delete outcome.error;
 
@@ -786,6 +952,48 @@ export async function replay(
               });
           } else {
             await page.getByText(expected).first().waitFor({ state: 'visible', timeout: timeoutMs });
+          }
+          outcome.ok = true;
+        } else if (event.action === 'wait_response') {
+          // A check, not an action: it looks at answers already logged since
+          // the last step that did something, then waits for more.
+          const check = responseCheckOf(event.value, event.hints);
+          if (!check) throw new Error('wait_response has no address to wait for');
+          await responses.wait(check, lastActionSeq, timeoutMs);
+          outcome.ok = true;
+        } else if (event.action === 'human') {
+          // A PERSON'S STEP. Nothing here may try it: it exists because the run
+          // can't. Marked dispatched first, so a failure is never "retried" by
+          // asking the person twice.
+          dispatched = true;
+          const instruction = event.value ?? 'a step only a person can do';
+          if (!onHuman) throw new Error(`needs a person: ${instruction} — nobody is here to ask`);
+          const until = humanUntil(event);
+          const waitMs = opts.humanTimeoutMs ?? 15 * 60_000;
+          const stop = new AbortController();
+          const shown = until ? pageShows(page, until, waitMs, responses, event.seq).then(() => 'page' as const) : new Promise<never>(() => {});
+          shown.catch(() => {});
+          const asked = onHuman({ seq: event.seq, instruction, url: page.url(), ...(until ? { until } : {}) }, stop.signal);
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timedOut = new Promise<'timeout'>((r) => { timer = setTimeout(() => r('timeout'), waitMs); });
+          const first = await Promise.race([asked, shown, timedOut]).finally(() => clearTimeout(timer));
+          if (first === 'timeout') {
+            stop.abort();
+            throw new Error(`waited ${Math.round(waitMs / 60_000)} min for a person to: ${instruction}`);
+          }
+          if (first === 'page') {
+            stop.abort();
+            outcome.viaHuman = 'page';
+          } else if (first.action === 'abort') {
+            throw new Error(`stopped at a person's step: ${first.reason ?? 'they declined'}`);
+          } else {
+            // They say it's done; when the step says how to tell, check.
+            if (until) {
+              await pageShows(page, until, timeoutMs, responses, event.seq).catch(() => {
+                throw new Error(`a person said "${instruction}" was done, but the page never showed it (${describeUntil(until)})`);
+              });
+            }
+            outcome.viaHuman = 'answered';
           }
           outcome.ok = true;
         } else if (event.action === 'assert') {
@@ -938,13 +1146,29 @@ export async function replay(
           if (outcome.matched === 0) throw new Error(`locator ${describeLocator(event)} matched no elements`);
           const target = outcome.matched > 1 ? locator.first() : locator;
 
+          // LOOK, DON'T TOUCH. The control exists — is it one a person could
+          // press right now? Then stop: nothing below this line runs for it.
+          if (holding) {
+            if (!forced(event)) {
+              await target.waitFor({ state: 'visible', timeout: timeoutMs }).catch(() => {
+                throw new Error(`the step it stops before, ${describeLocator(event)}, is there but not visible`);
+              });
+            }
+            if (!(await target.isEnabled({ timeout: timeoutMs }).catch(() => false))) {
+              throw new Error(`the step it stops before, ${describeLocator(event)}, is there but not enabled`);
+            }
+            outcome.ok = true;
+            outcome.held = true;
+            break;
+          }
+
           // Past this line the app may have been changed. Everything above is
           // addressing, which is safe to try again; nothing below is.
           dispatched = true;
 
           switch (event.action) {
             case 'click':
-              await target.click({ timeout: timeoutMs });
+              await target.click({ timeout: timeoutMs, ...(forced(event) ? { force: true } : {}) });
               break;
             case 'fill': {
               const value = valueFor(event, values);
@@ -969,10 +1193,10 @@ export async function replay(
               await target.press(valueFor(event, values) ?? 'Enter', { timeout: timeoutMs });
               break;
             case 'check':
-              await target.check({ timeout: timeoutMs });
+              await target.check({ timeout: timeoutMs, ...(forced(event) ? { force: true } : {}) });
               break;
             case 'uncheck':
-              await target.uncheck({ timeout: timeoutMs });
+              await target.uncheck({ timeout: timeoutMs, ...(forced(event) ? { force: true } : {}) });
               break;
             case 'select': {
               const value = valueFor(event, values);
@@ -1112,7 +1336,7 @@ export async function replay(
         if (err instanceof AssertionFailed && err.saw) outcome.saw = err.saw;
       }
 
-      if (outcome.ok || attempt === maxAttempts) break;
+      if (outcome.ok || attempt === attemptsHere) break;
 
       // A RETRY IS ONLY SAFE BEFORE THE ACTION WENT OUT. Re-clicking a button
       // that navigated and then failed its fingerprint check submits twice.
@@ -1152,7 +1376,7 @@ export async function replay(
     // asks a human to do the piece it cannot and carries on from wherever they
     // got to. A prelude step is excluded: the prelude is how we reached the
     // starting line, and a human patching it would be patching the wrong thing.
-    if (!outcome.ok && onHandoff && !isPrelude) {
+    if (!outcome.ok && onHandoff && !isPrelude && event.action !== 'human') {
       const trigger: HandoffTrigger = outcome.error?.includes('does not implement action')
         ? 'unimplemented_action'
         : event.hints?.seamGapBefore
@@ -1182,7 +1406,24 @@ export async function replay(
 
       const handed = await onHandoff(request);
 
-      if (handed.action === 'adopt') {
+      if (handed.action === 'continue') {
+        // Done by hand in this very browser: the page they left is the state.
+        await waitForUrlSettled(page, { mayNavigate: true });
+        await waitForAriaStable(page, 1500);
+        const landed = await computeSig(page);
+        outcome.ok = true;
+        outcome.viaHandoff = true;
+        delete outcome.error;
+        if (sigSequence[sigSequence.length - 1] !== landed.sig) sigSequence.push(landed.sig);
+        outcome.sig = landed.sig;
+        lastPattern = landed.urlPattern;
+        handoffs.push({ seq: event.seq, trigger, reason: request.reason, steps: 0, url: page.url() });
+        if (trigger === 'unresolved_seam') {
+          delete (event.hints as Record<string, unknown>).seamGapBefore;
+          i--;
+          continue;
+        }
+      } else if (handed.action === 'adopt') {
         // ADOPT, DO NOT RE-DRIVE. The handoff window shared this run's
         // server-side session, so the work is already done over there. Replaying
         // the captured steps here would walk a flow that has already moved on —
@@ -1245,6 +1486,10 @@ export async function replay(
       preludeFailed = isPrelude;
       break;
     }
+    if (outcome.held) {
+      stoppedBefore = event.seq;
+      break;
+    }
   }
 
   // THE VISUAL VERDICT, ONCE, AT THE END.
@@ -1303,13 +1548,18 @@ export async function replay(
   // Calling that `needsReview` would quarantine a recording nothing was learned
   // about, so it is reported as its own condition and `ok` is simply false.
   const preludeOk = !preludeFailed;
+  // Every step should have run — or, when it stopped as asked, every step up to
+  // and including the one it stopped at.
+  const expected = stoppedBefore === undefined
+    ? recording.events.length
+    : recording.events.findIndex((e) => e.seq === stoppedBefore) + 1;
   return {
     hash: recording.hash,
     ...(prelude?.length ? { preludeSteps, preludeOk } : {}),
-    ok: preludeOk && failed.length === 0 && steps.length === recording.events.length,
+    ok: preludeOk && failed.length === 0 && steps.length === expected,
     // The gate. Anything that did not fully reproduce is quarantined from
     // memory rather than partially ingested.
-    needsReview: preludeOk && (failed.length > 0 || steps.length !== recording.events.length),
+    needsReview: preludeOk && (failed.length > 0 || steps.length !== expected),
     steps,
     sigSequence,
     signals,
@@ -1317,5 +1567,6 @@ export async function replay(
     escalations,
     visualChecks,
     handoffs,
+    ...(stoppedBefore !== undefined ? { stoppedBefore } : {}),
   };
 }

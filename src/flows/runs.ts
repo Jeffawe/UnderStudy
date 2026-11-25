@@ -59,15 +59,18 @@ export async function recordRun(opts: {
   // 1. Drift, against the most recent passed runs of this flow — however it
   // was started, it walked the same steps.
   const history = await c.runs
-    .find({ app, plan, mode: { $in: ['replay', 'run'] }, status: 'passed', ...(opts.runId ? { _id: { $ne: opts.runId } } : {}) }, { projection: { sigSequence: 1 } })
+    .find({ app, plan, mode: { $in: ['replay', 'run'] }, status: 'passed', stoppedBefore: { $exists: false }, ...(opts.runId ? { _id: { $ne: opts.runId } } : {}) }, { projection: { sigSequence: 1 } })
     .sort({ startedAt: -1 })
     .limit(LOOKBACK)
     .toArray();
   // A failed run stops early; comparing its short path would report every
   // page it never reached as "gone", which is noise, not drift.
-  const drift: Drift = result.ok
-    ? compareToHistory(result.sigSequence, history.map((h) => h.sigSequence))
-    : { ...compareToHistory([], []), firstRun: false, notCompared: 'the run failed, so its path is incomplete' };
+  // A run that stopped before its commit step is just as short, on purpose.
+  const drift: Drift = !result.ok
+    ? { ...compareToHistory([], []), firstRun: false, notCompared: 'the run failed, so its path is incomplete' }
+    : result.stoppedBefore !== undefined
+      ? { ...compareToHistory([], []), firstRun: false, notCompared: `it stopped before step ${result.stoppedBefore}, its commit, so its path is incomplete` }
+      : compareToHistory(result.sigSequence, history.map((h) => h.sigSequence));
 
   // 2. Findings.
   const name = plan.join(' + ');
@@ -116,6 +119,7 @@ export async function recordRun(opts: {
       };
     }),
     sigSequence: result.sigSequence,
+    ...(result.stoppedBefore !== undefined ? { stoppedBefore: result.stoppedBefore } : {}),
     events: result.signals.slice(0, 200).map((s) => ({ ...s })),
     findings: drafts.map((d) => d.fingerprint),
     durationMs: result.durationMs,
