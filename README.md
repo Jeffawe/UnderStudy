@@ -30,19 +30,42 @@ record  →  save  →  replay / run  →  findings
   are never stored: a password field is kept as
   a reference like `SECRET.password`, and you supply the value when replaying.
 - **save** — the recording is replayed headless first. It is kept only if every
-  step passes, so memory only holds flows known to work.
+  step passes, so memory only holds flows known to work. A flow that buys or
+  submits something is replayed only up to that step: the button is checked,
+  never pressed. Don't want a replay at all? `--no-verify` keeps it as
+  unproven until a run passes.
 - **replay / run** — `replay` runs a flow by name; `run` finds the flow that
   does a goal you describe ("go to my basket") and runs it. Matching is by
   meaning if you configure an embedding model, by name if you don't.
 - **findings** — every run checks for console errors, failed requests, error
   responses, values that didn't stick, and whether the flow took a different
   path through the app than last time. Each problem is reported once, with a
-  count, not once per run.
+  count, not once per run. A run that passes on a changed path is flagged until
+  you say the change is meant to be there — then that path is the normal one.
 
 With an agent attached it also splits recordings into reusable segments (a
 login cut out of a checkout, say), plans a goal across segments of different
 recordings, and writes down what it learns as facts and lessons that apply to
 every future run.
+
+## More than clicks
+
+A flow is a list of steps. Besides clicking and typing, a step can:
+
+- **wait for a person** — something only you can do, like accepting a visit in
+  another system or typing a code from your phone. The run pauses, asks, and
+  carries on when you say it's done (or when the page shows it).
+- **wait for the server** — a response, its status, and one field of its JSON:
+  "`POST /api/visits` returned 201 and `commission.amount` is above 0".
+- **check how it ended** — after a save, Understudy offers what the last page
+  showed (headings, ticked boxes, status messages) as checks. You choose which
+  mean "it ended right".
+- **need an app state** — "member has an active bundle". A plan runs the flow
+  that makes it true first, or takes your word that it already is.
+
+These come from a Playwright script (`page.waitForResponse`,
+`human('what to do', { untilText: '…' })`), or can be added to a flow you've
+already saved with `understudy edit`.
 
 ## Set up (about five minutes)
 
@@ -117,16 +140,21 @@ understudy flows myapp                      # what it knows how to do
 understudy replay myapp log-in-as-a-member  # run one flow
 understudy run myapp "sign in"              # find the flow for a goal, and run it
 understudy import myapp login.spec.ts       # turn a Playwright script into a recording, then save it
+understudy prove myapp book-a-visit         # prove a saved flow without buying anything
+understudy edit myapp book-a-visit --before 3 --step '{"action":"human","value":"Accept the visit"}'
+                                            # add a person's step, a wait or a check to a saved flow
 understudy findings myapp                   # what looked broken, most severe first
+understudy findings myapp --triage <id>=expected
+                                            # a changed path is meant to be there: make it the normal one
 understudy emit myapp log-in-as-a-member    # print it as a Playwright (or Cypress) test
 understudy app myapp --placeholder email    # keep email addresses out of memory (moves them to your env file)
 ```
 
 An unproven flow is marked as such in `flows` and recall; the first run of
-it that passes proves it. `understudy --help` lists everything, and
-`understudy --version` says which one you have. A flow that commits something real — a
-purchase, a deletion — is marked destructive and refused unless you pass
-`--allow-purchases`.
+it that passes proves it. A flow that commits something real — a purchase, a
+deletion — is marked destructive: saving and `prove` stop just before that
+step, and a full run needs `--allow-purchases`. `understudy --help` lists
+everything, and `understudy --version` says which one you have.
 
 ## Where your data goes
 
@@ -166,10 +194,15 @@ claude mcp add understudy -- npx -y -p @jeffawe/understudy understudy-mcp --env-
 ```
 
 Ten tools: `recall`, `run`, `answer`, `record`, `save`, `distill`,
-`save_distilled`, `remember`, `findings`, `app`. The server tells the agent how to use
-them when it connects; [REASONER.md](REASONER.md) is the full version — how to
-split a goal, when to answer a question and when to say "I don't know", and
-what to write down.
+`save_distilled`, `remember`, `findings`, `app`. Each tool says how to use it,
+and a run's questions say how to answer them, so the server's own instructions
+are one line — an agent pays only for the tools it uses.
+[REASONER.md](REASONER.md) is the long version — how to split a goal, when to
+answer a question and when to say "I don't know", and what to write down.
+
+Mid-run, the agent may ask you to do a step only a person can do, or whether a
+changed path in your app is meant to be there. Answer it in the chat; it
+records your answer.
 
 ## Learn more
 
